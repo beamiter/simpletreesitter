@@ -1,0 +1,43 @@
+[package]
+name = "simpletreesitter"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ts-hl-daemon"
+path = "src/simpletreesitter/simpletreesitter_daemon.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+arboard = "3.6.1"
+bincode = { version = "2.0.1", features = ["serde"] }
+chrono = "0.4.42"
+ctrlc = "3.5.0"
+ignore = "0.4.23"
+lazy_static = "1.5.0"
+libc = "0.2.176"
+listenfd = "1.0.2"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.47.1", features = ["full", "io-std", "io-util", "macros", "rt-multi-thread", "sync"] }
+tokio-stream = "0.1.17"
+tokio-util = "0.7.16"
+tower = { version = "0.5.2", features = ["buffer", "limit", "timeout", "util"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+tree-sitter = "0.25.10"
+tree-sitter-c = "0.24.1"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-rust = "0.24.0"
+[dependencies.tree-sitter-vim9]
+git = "https://github.com/beamiter/tree-sitter-vim9"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
