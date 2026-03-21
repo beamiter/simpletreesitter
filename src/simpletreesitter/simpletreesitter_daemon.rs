@@ -577,107 +577,249 @@ fn run_symbols_cached(
         });
     }
 
-    // 2) 额外：Vim 语言补充顶层 g: 全局变量（scoped_identifier，名字以 "g:" 开头）
+    // 2) 额外：Vim 语言从 command 节点中补充提取符号
     if cache.lang == "vim" && symbols.len() < limit {
-        // 迭代整棵树（简单栈遍历）
         let mut stack = Vec::<tree_sitter::Node>::with_capacity(1024);
         stack.push(root);
         while let Some(n) = stack.pop() {
-            // 只抓 scoped_identifier，且名字以 g: 开头
-            if n.kind() == "scoped_identifier" {
-                let name = node_text(n, bytes);
-                if name.starts_with("g:") {
+            if symbols.len() >= limit {
+                break;
+            }
+            if n.kind() == "command" {
+                let cmd_name_text = {
+                    let mut cursor = n.walk();
+                    n.children(&mut cursor)
+                        .find(|c| c.kind() == "command_name")
+                        .map(|c| node_text(c, bytes))
+                };
+                if let Some(ref cmd) = cmd_name_text {
                     let sp = n.start_position();
                     let lnum = sp.row as u32 + 1;
                     let col = sp.column as u32 + 1;
 
-                    // 范围限制
                     if let Some((ls, le)) = lrange {
                         if lnum < ls || lnum > le {
-                            // 不在请求范围内
-                        } else {
-                            // 顶层约束：不在函数体内
-                            let mut cur = n;
-                            let mut in_func = false;
-                            while let Some(parent) = cur.parent() {
-                                let pk = parent.kind();
-                                if pk == "function_definition" || pk == "vim9_function_definition" {
-                                    in_func = true;
-                                    break;
-                                }
-                                cur = parent;
+                            // 压入子节点继续遍历
+                            let mut child_cursor = n.walk();
+                            for ch in n.children(&mut child_cursor) {
+                                stack.push(ch);
                             }
-                            if !in_func {
-                                // 作为 variable 符号加入（无容器）
-                                let kind = "variable".to_string();
-                                let key = (
-                                    kind.clone(),
-                                    name.clone(),
-                                    lnum,
-                                    col,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                );
-                                if !seen.contains(&key) {
-                                    seen.insert(key);
-                                    symbols.push(Symbol {
-                                        name,
-                                        kind,
-                                        lnum,
-                                        col,
-                                        container_kind: None,
-                                        container_name: None,
-                                        container_lnum: None,
-                                        container_col: None,
-                                    });
-                                    if symbols.len() >= limit {
+                            continue;
+                        }
+                    }
+
+                    let cmd_lower = cmd.trim().to_lowercase();
+                    let (sym_kind, sym_name) = match cmd_lower.as_str() {
+                        // 映射命令
+                        "nnoremap" | "vnoremap" | "inoremap" | "tnoremap"
+                        | "cnoremap" | "xnoremap" | "onoremap" | "snoremap"
+                        | "noremap" | "nmap" | "vmap" | "imap" | "tmap"
+                        | "cmap" | "xmap" | "omap" | "smap" | "map" => {
+                            // 从源码行中提取 lhs
+                            let line_text = {
+                                let start_byte = n.start_byte();
+                                let end_byte = n.end_byte();
+                                let s = &bytes[start_byte..end_byte];
+                                String::from_utf8_lossy(s).to_string()
+                            };
+                            // 解析：cmd [modifiers...] lhs rhs
+                            let mut parts = line_text.split_whitespace();
+                            let _cmd_part = parts.next(); // skip command name
+                            let mut lhs = String::new();
+                            for part in parts {
+                                let pl = part.to_lowercase();
+                                // 跳过独立修饰词
+                                if pl == "<silent>" || pl == "<buffer>" || pl == "<expr>"
+                                    || pl == "<nowait>" || pl == "<unique>"
+                                    || pl == "<silent><expr>" {
+                                    continue;
+                                }
+                                // 第一个非修饰词就是 lhs
+                                // 但可能以修饰词为前缀：<silent><leader>gk → 去掉 <silent>
+                                let mut s = part.to_string();
+                                loop {
+                                    let sl = s.to_lowercase();
+                                    if sl.starts_with("<silent>") {
+                                        s = s[8..].to_string();
+                                    } else if sl.starts_with("<buffer>") {
+                                        s = s[8..].to_string();
+                                    } else if sl.starts_with("<expr>") {
+                                        s = s[6..].to_string();
+                                    } else if sl.starts_with("<nowait>") {
+                                        s = s[8..].to_string();
+                                    } else if sl.starts_with("<unique>") {
+                                        s = s[8..].to_string();
+                                    } else {
                                         break;
                                     }
                                 }
-                            }
-                        }
-                    } else {
-                        // 无范围限制时同样按顶层约束加入
-                        let mut cur = n;
-                        let mut in_func = false;
-                        while let Some(parent) = cur.parent() {
-                            let pk = parent.kind();
-                            if pk == "function_definition" || pk == "vim9_function_definition" {
-                                in_func = true;
+                                if s.is_empty() {
+                                    continue;
+                                }
+                                lhs = s;
                                 break;
                             }
-                            cur = parent;
+                            if lhs.is_empty() {
+                                (None, None)
+                            } else {
+                                (
+                                    Some("mapping".to_string()),
+                                    Some(format!("{} {}", cmd.trim(), lhs)),
+                                )
+                            }
                         }
-                        if !in_func {
-                            let kind = "variable".to_string();
-                            let key = (
-                                kind.clone(),
-                                name.clone(),
+                        // Plug 插件
+                        "plug" => {
+                            let mut cursor = n.walk();
+                            let plug_name = n.children(&mut cursor)
+                                .find(|c| c.kind() == "safe_arg")
+                                .map(|c| {
+                                    let t = node_text(c, bytes).trim().to_string();
+                                    // 'user/repo' -> repo
+                                    let unquoted = t.trim_matches('\'').trim_matches('"');
+                                    if let Some(slash) = unquoted.rfind('/') {
+                                        unquoted[slash + 1..].to_string()
+                                    } else {
+                                        unquoted.to_string()
+                                    }
+                                });
+                            match plug_name {
+                                Some(name) => (Some("module".to_string()), Some(format!("Plug: {}", name))),
+                                None => (None, None),
+                            }
+                        }
+                        // Set 选项
+                        "set" | "setlocal" | "setglobal" => {
+                            let mut cursor = n.walk();
+                            let opts: Vec<String> = n.children(&mut cursor)
+                                .filter(|c| c.kind() == "safe_arg" || c.kind() == "raw_text")
+                                .map(|c| node_text(c, bytes).trim().to_string())
+                                .collect();
+                            let opts_str = opts.join(" ");
+                            if opts_str.is_empty() {
+                                (None, None)
+                            } else {
+                                (Some("property".to_string()), Some(format!("{} {}", cmd.trim(), opts_str)))
+                            }
+                        }
+                        // Augroup
+                        "augroup" => {
+                            let mut cursor = n.walk();
+                            let group = n.children(&mut cursor)
+                                .find(|c| c.kind() == "safe_arg")
+                                .map(|c| node_text(c, bytes).trim().to_string());
+                            match group {
+                                Some(g) if g != "END" => (Some("namespace".to_string()), Some(format!("augroup {}", g))),
+                                _ => (None, None),
+                            }
+                        }
+                        // Autocmd
+                        "autocmd" | "autocmd!" => {
+                            let mut cursor = n.walk();
+                            let args: Vec<String> = n.children(&mut cursor)
+                                .filter(|c| c.kind() == "safe_arg")
+                                .take(2)
+                                .map(|c| node_text(c, bytes).trim().to_string())
+                                .collect();
+                            if args.is_empty() {
+                                (None, None)
+                            } else {
+                                (Some("event".to_string()), Some(format!("autocmd {}", args.join(" "))))
+                            }
+                        }
+                        // Colorscheme
+                        "colorscheme" => {
+                            let mut cursor = n.walk();
+                            let scheme = n.children(&mut cursor)
+                                .find(|c| c.kind() == "safe_arg")
+                                .map(|c| node_text(c, bytes).trim().to_string());
+                            match scheme {
+                                Some(s) => (Some("property".to_string()), Some(format!("colorscheme {}", s))),
+                                None => (None, None),
+                            }
+                        }
+                        // 传统函数声明 function!
+                        "function!" => {
+                            let mut cursor = n.walk();
+                            let fname = n.children(&mut cursor)
+                                .find(|c| c.kind() == "safe_arg")
+                                .map(|c| node_text(c, bytes).trim().to_string());
+                            match fname {
+                                Some(f) => (Some("function".to_string()), Some(f)),
+                                None => (None, None),
+                            }
+                        }
+                        // 用户自定义命令 command!
+                        "command!" => {
+                            let raw = {
+                                let mut cursor = n.walk();
+                                n.children(&mut cursor)
+                                    .find(|c| c.kind() == "raw_text")
+                                    .map(|c| node_text(c, bytes).trim().to_string())
+                            };
+                            match raw {
+                                Some(r) => {
+                                    // 跳过 -nargs=X 之类的选项，找到命令名
+                                    let cmd_def_name = r.split_whitespace()
+                                        .find(|w| !w.starts_with('-'))
+                                        .unwrap_or(&r);
+                                    (Some("method".to_string()), Some(format!("command! {}", cmd_def_name)))
+                                }
+                                None => (None, None),
+                            }
+                        }
+                        // plug#begin / plug#end
+                        s if s.contains('#') => {
+                            (Some("namespace".to_string()), Some(cmd.trim().to_string()))
+                        }
+                        // filetype, syntax
+                        "filetype" | "syntax" => {
+                            let mut cursor = n.walk();
+                            let args: Vec<String> = n.children(&mut cursor)
+                                .filter(|c| c.kind() == "safe_arg")
+                                .map(|c| node_text(c, bytes).trim().to_string())
+                                .collect();
+                            (Some("property".to_string()), Some(format!("{} {}", cmd.trim(), args.join(" "))))
+                        }
+                        // highlight / hi
+                        "highlight" | "hi" => {
+                            let mut cursor = n.walk();
+                            let args: Vec<String> = n.children(&mut cursor)
+                                .filter(|c| c.kind() == "safe_arg")
+                                .take(1)
+                                .map(|c| node_text(c, bytes).trim().to_string())
+                                .collect();
+                            if args.is_empty() {
+                                (None, None)
+                            } else {
+                                (Some("property".to_string()), Some(format!("{} {}", cmd.trim(), args.join(" "))))
+                            }
+                        }
+                        _ => (None, None),
+                    };
+                    if let (Some(kind), Some(name)) = (sym_kind, sym_name) {
+                        let key = (
+                            kind.clone(),
+                            name.clone(),
+                            lnum,
+                            col,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        if !seen.contains(&key) {
+                            seen.insert(key);
+                            symbols.push(Symbol {
+                                name,
+                                kind,
                                 lnum,
                                 col,
-                                None,
-                                None,
-                                None,
-                                None,
-                            );
-                            if !seen.contains(&key) {
-                                seen.insert(key);
-                                symbols.push(Symbol {
-                                    name,
-                                    kind,
-                                    lnum,
-                                    col,
-                                    container_kind: None,
-                                    container_name: None,
-                                    container_lnum: None,
-                                    container_col: None,
-                                });
-                                if symbols.len() >= limit {
-                                    break;
-                                }
-                            }
+                                container_kind: None,
+                                container_name: None,
+                                container_lnum: None,
+                                container_col: None,
+                            });
                         }
                     }
                 }

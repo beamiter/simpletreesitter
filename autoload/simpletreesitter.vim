@@ -915,6 +915,12 @@ def KindIcon(kind: string): string
     return 'p'
   elseif kind ==# 'variant'
     return 'v'
+  elseif kind ==# 'mapping'
+    return 'k'
+  elseif kind ==# 'module'
+    return 'P'
+  elseif kind ==# 'event'
+    return 'a'
   else
     return '?'
   endif
@@ -940,6 +946,9 @@ def FancyIcon(kind: string): string
     if kind ==# 'property'     | return '' | endif
     if kind ==# 'field'        | return '' | endif
     if kind ==# 'variant'      | return '' | endif
+    if kind ==# 'mapping'      | return '⌨' | endif
+    if kind ==# 'module'       | return '📦' | endif
+    if kind ==# 'event'        | return '⚡' | endif
   endif
   if kind ==# 'function'     | return 'f' | endif
   if kind ==# 'method'       | return 'm' | endif
@@ -954,6 +963,9 @@ def FancyIcon(kind: string): string
   if kind ==# 'property'     | return 'p' | endif
   if kind ==# 'field'        | return 'p' | endif
   if kind ==# 'variant'      | return 'v' | endif
+  if kind ==# 'mapping'      | return 'k' | endif
+  if kind ==# 'module'       | return 'P' | endif
+  if kind ==# 'event'        | return 'a' | endif
   return ''
 enddef
 

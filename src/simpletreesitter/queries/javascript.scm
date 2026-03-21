@@ -40,7 +40,7 @@
 "throw" @keyword
 "class" @keyword
 "extends" @keyword
-"super" @keyword
+(super) @keyword
 "import" @keyword
 "from" @keyword
 "export" @keyword
@@ -107,7 +107,7 @@
 
 ; ----- functions / methods / classes -----
 (function_declaration name: (identifier) @function)
-(function name: (identifier) @function)
+(function_expression name: (identifier) @function)
 (method_definition name: (property_identifier) @method)
 (class_declaration name: (identifier) @type)
 
