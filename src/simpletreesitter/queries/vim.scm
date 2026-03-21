@@ -33,9 +33,8 @@
 (dict_key (identifier) @property)
 (dict_key (string)     @property)
 
-; 特殊按键与管道（均为命名节点）
+; 特殊按键（命名节点）
 (special_key) @string.special
-(pipe)        @operator
 
 ; 括号
 [
@@ -59,4 +58,5 @@
   "&&" "||"
   "="
   "?"
+  "|"
 ] @operator
