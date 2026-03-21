@@ -85,7 +85,15 @@ struct BufCache {
     lang: String,
     text: String,
     tree: tree_sitter::Tree,
+    #[allow(dead_code)]
     language: tree_sitter::Language,
+}
+
+// 预编译的查询缓存
+struct LangQueries {
+    language: tree_sitter::Language,
+    hl_query: tree_sitter::Query,
+    sym_query: tree_sitter::Query,
 }
 
 struct Server {
@@ -93,6 +101,8 @@ struct Server {
     cache: HashMap<i64, BufCache>,
     // 复用 parser（按语言）
     parsers: HashMap<String, tree_sitter::Parser>,
+    // 预编译查询缓存（按语言）
+    queries: HashMap<String, LangQueries>,
 }
 
 impl Server {
@@ -100,13 +110,11 @@ impl Server {
         Server {
             cache: HashMap::new(),
             parsers: HashMap::new(),
+            queries: HashMap::new(),
         }
     }
 
-    fn language_and_queries(
-        &self,
-        lang: &str,
-    ) -> Result<(tree_sitter::Language, &'static str, &'static str)> {
+    fn lang_info(lang: &str) -> Result<(tree_sitter::Language, &'static str, &'static str)> {
         let (language, hl_query, sym_query) = match lang {
             "rust" => (
                 tree_sitter_rust::LANGUAGE.into(),
@@ -128,6 +136,21 @@ impl Server {
                 queries::CPP_QUERY,
                 queries::CPP_SYM_QUERY,
             ),
+            "python" => (
+                tree_sitter_python::LANGUAGE.into(),
+                queries::PYTHON_QUERY,
+                queries::PYTHON_SYM_QUERY,
+            ),
+            "go" => (
+                tree_sitter_go::LANGUAGE.into(),
+                queries::GO_QUERY,
+                queries::GO_SYM_QUERY,
+            ),
+            "bash" | "sh" => (
+                tree_sitter_bash::LANGUAGE.into(),
+                queries::BASH_QUERY,
+                queries::BASH_SYM_QUERY,
+            ),
             "vim" => (
                 tree_sitter_vim9::LANGUAGE.into(),
                 queries::VIM_QUERY,
@@ -136,6 +159,16 @@ impl Server {
             _ => return Err(anyhow!("unsupported language: {lang}")),
         };
         Ok((language, hl_query, sym_query))
+    }
+
+    fn ensure_queries(&mut self, lang: &str) -> Result<()> {
+        if !self.queries.contains_key(lang) {
+            let (language, hl_src, sym_src) = Self::lang_info(lang)?;
+            let hl_query = tree_sitter::Query::new(&language, hl_src)?;
+            let sym_query = tree_sitter::Query::new(&language, sym_src)?;
+            self.queries.insert(lang.to_string(), LangQueries { language, hl_query, sym_query });
+        }
+        Ok(())
     }
 
     fn parser_for(
@@ -147,7 +180,6 @@ impl Server {
         Ok(match self.parsers.entry(lang.to_string()) {
             Entry::Occupied(e) => {
                 let p = e.into_mut();
-                // 确保语言设置正确
                 p.set_language(&language)?;
                 p
             }
@@ -160,11 +192,15 @@ impl Server {
     }
 
     fn set_text(&mut self, buf: i64, lang: &str, text: String) -> Result<()> {
-        let (language, _, _) = self.language_and_queries(lang)?;
+        self.ensure_queries(lang)?;
+        let language = self.queries.get(lang).unwrap().language.clone();
+        // 增量解析：如果缓存中有旧 tree 且语言相同，clone 后传给 parser
+        let old_tree = self.cache.get(&buf)
+            .filter(|c| c.lang == lang)
+            .map(|c| c.tree.clone());
         let p = self.parser_for(lang, language.clone())?;
-        // 这里为简单起见不做增量编辑，直接全量 parse
         let tree = p
-            .parse(&text, None)
+            .parse(&text, old_tree.as_ref())
             .ok_or_else(|| anyhow!("parse failed"))?;
         self.cache.insert(
             buf,
@@ -330,11 +366,11 @@ fn run_highlight_cached(
     lang: &str,
     lrange: Option<(u32, u32)>,
 ) -> Result<Vec<Span>> {
+    server.ensure_queries(lang)?;
     let cache = server.get_cache(buf, lang)?;
-    let (_, hl_query_src, _) = server.language_and_queries(&cache.lang)?;
     let bytes = cache.text.as_bytes();
     let root = cache.tree.root_node();
-    let query = tree_sitter::Query::new(&cache.language, hl_query_src)?;
+    let query = &server.queries.get(&cache.lang).unwrap().hl_query;
     let mut cursor = tree_sitter::QueryCursor::new();
 
     if let Some((ls, le)) = lrange {
@@ -383,11 +419,11 @@ fn run_symbols_cached(
     lrange: Option<(u32, u32)>,
     max_items: Option<usize>,
 ) -> Result<Vec<Symbol>> {
+    server.ensure_queries(lang)?;
     let cache = server.get_cache(buf, lang)?;
-    let (_, _, sym_query_src) = server.language_and_queries(&cache.lang)?;
     let bytes = cache.text.as_bytes();
     let root = cache.tree.root_node();
-    let query = tree_sitter::Query::new(&cache.language, sym_query_src)?;
+    let query = &server.queries.get(&cache.lang).unwrap().sym_query;
     let mut cursor = tree_sitter::QueryCursor::new();
 
     if let Some((ls, le)) = lrange {
@@ -504,6 +540,65 @@ fn run_symbols_cached(
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // JavaScript 容器推断：method → class
+        if cache.lang == "javascript" && kind == "method" {
+            if let Some(cls) = ancestor_kind(node, "class_declaration") {
+                if let Some(cls_name) = child_text_by_kind(cls, "identifier", bytes) {
+                    if let Some((ln, co)) = child_pos_by_kind(cls, "identifier") {
+                        ckind = Some("class".to_string());
+                        cname_opt = Some(cls_name);
+                        clnum = Some(ln);
+                        ccol = Some(co);
+                    }
+                }
+            }
+        }
+
+        // Python 容器推断：method → class
+        if cache.lang == "python" {
+            if kind == "method" {
+                if let Some(cls) = ancestor_kind(node, "class_definition") {
+                    if let Some(cls_name) = child_text_by_kind(cls, "identifier", bytes) {
+                        if let Some((ln, co)) = child_pos_by_kind(cls, "identifier") {
+                            ckind = Some("class".to_string());
+                            cname_opt = Some(cls_name);
+                            clnum = Some(ln);
+                            ccol = Some(co);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Go 容器推断：method → receiver type, field → struct
+        if cache.lang == "go" {
+            if kind == "method" {
+                // method_declaration 的 receiver 有 parameter_declaration → type_identifier
+                if let Some(mdecl) = node.parent().and_then(|p| {
+                    if p.kind() == "method_declaration" { Some(p) } else { None }
+                }) {
+                    let mut c = mdecl.walk();
+                    for ch in mdecl.children(&mut c) {
+                        if ch.kind() == "parameter_list" {
+                            let mut c2 = ch.walk();
+                            for pd in ch.children(&mut c2) {
+                                if pd.kind() == "parameter_declaration" {
+                                    if let Some(tname) = child_text_by_kind(pd, "type_identifier", bytes) {
+                                        let sp = pd.start_position();
+                                        ckind = Some("type".to_string());
+                                        cname_opt = Some(tname);
+                                        clnum = Some(sp.row as u32 + 1);
+                                        ccol = Some(sp.column as u32 + 1);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         }
 

@@ -9,7 +9,7 @@ g:loaded_simpletreesitter = 1
 g:simpletreesitter_daemon_path = get(g:, 'simpletreesitter_daemon_path', '')
 g:simpletreesitter_debounce = get(g:, 'simpletreesitter_debounce', 120)
 g:simpletreesitter_auto_enable_filetypes = get(g:, 'simpletreesitter_auto_enable_filetypes',
-  ['rust', 'c', 'cpp', 'javascript' ])
+  ['rust', 'c', 'cpp', 'javascript', 'python', 'go', 'sh' ])
 g:simpletreesitter_auto_stop = get(g:, 'simpletreesitter_auto_stop', 1)
 
 g:simpletreesitter_debug = get(g:, 'simpletreesitter_debug', 0)

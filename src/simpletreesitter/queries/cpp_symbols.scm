@@ -33,6 +33,24 @@
 (namespace_definition
   name: (namespace_identifier) @symbol.namespace)
 
+; 模板声明（提取内部的函数/类名）
+(template_declaration
+  (function_definition
+    declarator: (function_declarator
+      declarator: (identifier) @symbol.function)))
+
+(template_declaration
+  (class_specifier
+    name: (type_identifier) @symbol.class))
+
+(template_declaration
+  (struct_specifier
+    name: (type_identifier) @symbol.struct))
+
+; 类型别名 using X = ...
+(alias_declaration
+  name: (type_identifier) @symbol.type)
+
 ; 变量声明（只抓 identifier）
 (declaration
   declarator: (init_declarator

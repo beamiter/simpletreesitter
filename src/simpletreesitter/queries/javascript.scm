@@ -129,7 +129,7 @@
 ; ----- parameters -----
 (formal_parameters (identifier) @variable.parameter)
 (formal_parameters (rest_pattern (identifier) @variable.parameter))
-(arrow_function parameters: (identifier) @variable.parameter)
+(arrow_function parameter: (identifier) @variable.parameter)
 
 ; ----- properties / fields -----
 (pair key: (property_identifier) @property)

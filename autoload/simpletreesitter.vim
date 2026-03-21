@@ -65,6 +65,12 @@ def DetectLang(buf: number): string
     return 'c'
   elseif ft ==# 'cpp' || ft ==# 'cc'
     return 'cpp'
+  elseif ft ==# 'python'
+    return 'python'
+  elseif ft ==# 'go'
+    return 'go'
+  elseif ft ==# 'sh' || ft ==# 'bash' || ft ==# 'zsh'
+    return 'bash'
   elseif ft ==# 'vim' || ft ==# 'vimrc'
     return 'vim'
   else
@@ -76,6 +82,7 @@ def IsSupportedLang(buf: number): bool
   var ft = getbufvar(buf, '&filetype')
   var supported = [
     'rust', 'javascript', 'javascriptreact', 'jsx', 'c', 'cpp', 'cc',
+    'python', 'go', 'sh', 'bash', 'zsh',
     'vim', 'vimrc'
     ]
   return index(supported, ft) >= 0
