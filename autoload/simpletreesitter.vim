@@ -41,6 +41,25 @@ const s_groups = [
   ]
 
 # =============== 工具 ===============
+
+# 只清除 simpletreesitter 自己的 text properties，不影响其它插件（如 coc.nvim 虚拟文本）
+def ClearOwnProps(start_lnum: number, end_lnum: number, buf: number)
+  for g in s_groups
+    try
+      prop_remove({type: g, bufnr: buf, all: true}, start_lnum, end_lnum)
+    catch
+    endtry
+  endfor
+  try
+    prop_remove({type: 'TsHlOutlineGuide', bufnr: buf, all: true}, start_lnum, end_lnum)
+  catch
+  endtry
+  try
+    prop_remove({type: 'TsHlOutlinePos', bufnr: buf, all: true}, start_lnum, end_lnum)
+  catch
+  endtry
+enddef
+
 def Log(msg: string)
   if get(g:, 'simpletreesitter_debug', 0)
     var lf = get(g:, 'simpletreesitter_log_file', '')
@@ -236,10 +255,7 @@ def ApplyHighlights(buf: number, spans: list<dict<any>>)
   if has_key(s_last_ranges, buf)
     var prev = s_last_ranges[buf]
     if len(prev) == 2 && prev[1] >= prev[0]
-      try
-        call prop_clear(prev[0], prev[1], {bufnr: buf})
-      catch
-      endtry
+      ClearOwnProps(prev[0], prev[1], buf)
     endif
   endif
 
@@ -413,16 +429,13 @@ def ClearPropsForBuf(buf: number)
   if getbufvar(buf, '&filetype') ==# 'simpletreesitter_outline'
     return
   endif
-  try
-    if get(g:, 'simpletreesitter_clear_scope_on_suspend', 'visible') ==# 'buffer'
-      var last = BufLineCount(buf)
-      call prop_clear(1, last, {bufnr: buf})
-    else
-      var [vs, ve] = VisibleRangeForBuf(buf)
-      call prop_clear(vs, ve, {bufnr: buf})
-    endif
-  catch
-  endtry
+  if get(g:, 'simpletreesitter_clear_scope_on_suspend', 'visible') ==# 'buffer'
+    var last = BufLineCount(buf)
+    ClearOwnProps(1, last, buf)
+  else
+    var [vs, ve] = VisibleRangeForBuf(buf)
+    ClearOwnProps(vs, ve, buf)
+  endif
 enddef
 
 def ClearAllVisiblePropsOnSuspend()
@@ -617,10 +630,7 @@ def ClearAllProps()
       continue
     endif
     seen[b] = true
-    try
-      call prop_clear(1, BufLineCount(b), {bufnr: b})
-    catch
-    endtry
+    ClearOwnProps(1, BufLineCount(b), b)
   endfor
   # 清空范围缓存，避免误判
   s_last_ranges = {}
