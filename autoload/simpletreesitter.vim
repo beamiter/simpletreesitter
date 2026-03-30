@@ -37,8 +37,23 @@ const s_groups = [
   'TSVariable', 'TSVariableParameter', 'TSVariableBuiltin',
   'TSProperty', 'TSField',
   'TSMacro', 'TSAttribute',
-  'TSVariant'
+  'TSVariant',
+  'TSRainbow1', 'TSRainbow2', 'TSRainbow3',
+  'TSRainbow4', 'TSRainbow5', 'TSRainbow6'
   ]
+
+# =============== 面包屑状态 ===============
+var s_bc_items: list<dict<any>> = []
+var s_bc_buf: number = 0
+var s_bc_timer: number = 0
+var s_breadcrumb_cache: string = ''
+# =============== Outline 跟随状态 ===============
+var s_outline_cursor_line: number = 0
+# =============== Outline 折叠状态 ===============
+var s_outline_collapsed: dict<bool> = {}
+# =============== 缩进参考线状态 ===============
+var s_indent_guides_active: bool = false
+var s_indent_guides_saved_lcs: string = ''
 
 # =============== 工具 ===============
 
@@ -151,8 +166,18 @@ def EnsureHlGroupsAndProps()
   highlight default link TSAttribute PreProc
   highlight default link TSVariant Constant
 
+  # Rainbow brackets
+  highlight default TSRainbow1 ctermfg=168 guifg=#e06c75
+  highlight default TSRainbow2 ctermfg=180 guifg=#e5c07b
+  highlight default TSRainbow3 ctermfg=75  guifg=#61afef
+  highlight default TSRainbow4 ctermfg=176 guifg=#c678dd
+  highlight default TSRainbow5 ctermfg=73  guifg=#56b6c2
+  highlight default TSRainbow6 ctermfg=114 guifg=#98c379
+
   highlight default link TsHlOutlineGuide Comment
   highlight default link TsHlOutlinePos LineNr
+  # Outline cursor follow
+  highlight default TsHlOutlineCursor ctermbg=238 guibg=#2c323c
 
   for g in s_groups
     try
@@ -166,6 +191,10 @@ def EnsureHlGroupsAndProps()
   endtry
   try
     call prop_type_add('TsHlOutlinePos', {highlight: 'TsHlOutlinePos', combine: v:true, priority: 12})
+  catch
+  endtry
+  try
+    call prop_type_add('TsHlOutlineCursor', {highlight: 'TsHlOutlineCursor', combine: v:true, priority: 13})
   catch
   endtry
 enddef
@@ -264,6 +293,13 @@ def ApplyHighlights(buf: number, spans: list<dict<any>>)
     var c1 = max([1, get(s, 'col', 1)])
     var c2 = max([1, get(s, 'end_col', c1)])
     var tp = get(s, 'group', 'TSVariable')
+    # Rainbow brackets: 用深度对应的彩虹颜色替换 TSPunctBracket
+    if tp ==# 'TSPunctBracket' && get(g:, 'simpletreesitter_rainbow_brackets', 1)
+      var depth = get(s, 'depth', 0)
+      if depth > 0
+        tp = 'TSRainbow' .. string(((depth - 1) % 6) + 1)
+      endif
+    endif
     if l1 <= 0 || l2 <= 0
       continue
     endif
@@ -304,6 +340,11 @@ def OnDaemonEvent(line: string)
   elseif ev.type ==# 'symbols'
     var buf = get(ev, 'buf', 0)
     var syms = get(ev, 'symbols', [])
+    # 面包屑：保存符号数据
+    if buf == s_bc_buf && get(g:, 'simpletreesitter_breadcrumb', 0)
+      s_bc_items = syms
+      ScheduleBreadcrumbUpdate()
+    endif
     ApplySymbols(buf, syms)
     if has_key(s_inflight_syms, buf) | s_inflight_syms[buf] = false | endif
   elseif ev.type ==# 'ast'
@@ -629,6 +670,203 @@ def ClearAllProps()
   s_last_ranges = {}
 enddef
 
+# =============== 缩进参考线 ===============
+def EnableIndentGuides()
+  if s_indent_guides_active
+    return
+  endif
+  var sw = &shiftwidth > 0 ? &shiftwidth : (&tabstop > 0 ? &tabstop : 4)
+  if sw < 2
+    return
+  endif
+  var ch = get(g:, 'simpletreesitter_indent_guide_char', '│')
+  var filler = repeat(' ', sw - 1)
+  s_indent_guides_saved_lcs = &l:listchars
+  &l:list = true
+  execute 'setlocal listchars+=' .. 'leadmultispace:' .. ch .. filler
+enddef
+
+def DisableIndentGuides()
+  if !s_indent_guides_active
+    return
+  endif
+  s_indent_guides_active = false
+  try
+    &l:listchars = s_indent_guides_saved_lcs
+  catch
+  endtry
+enddef
+
+def ApplyIndentGuidesForBuf()
+  if !get(g:, 'simpletreesitter_indent_guides', 0)
+    return
+  endif
+  if s_indent_guides_active
+    return
+  endif
+  var sw = &shiftwidth > 0 ? &shiftwidth : (&tabstop > 0 ? &tabstop : 4)
+  if sw < 2
+    return
+  endif
+  var ch = get(g:, 'simpletreesitter_indent_guide_char', '│')
+  var filler = repeat(' ', sw - 1)
+  s_indent_guides_saved_lcs = &l:listchars
+  s_indent_guides_active = true
+  &l:list = true
+  execute 'setlocal listchars+=' .. 'leadmultispace:' .. ch .. filler
+enddef
+
+# =============== 面包屑导航 ===============
+def BreadcrumbIcon(kind: string): string
+  if !get(g:, 'simpletreesitter_outline_fancy', 1)
+    return kind[0]
+  endif
+  var icons = {
+    'function': '󰡱',
+    'method': '󰆧',
+    'class': '',
+    'struct': '',
+    'enum': '',
+    'namespace': '',
+    'type': '',
+    'module': '📦',
+  }
+  return get(icons, kind, '')
+enddef
+
+def SetWinbar(text: string)
+  if !exists('+winbar')
+    return
+  endif
+  try
+    execute 'setlocal winbar=' .. escape(text, ' \|"')
+  catch
+  endtry
+enddef
+
+def UpdateBreadcrumb()
+  if !get(g:, 'simpletreesitter_breadcrumb', 0) || !exists('+winbar')
+    return
+  endif
+  var buf = bufnr('%')
+  if buf != s_bc_buf || empty(s_bc_items)
+    if s_breadcrumb_cache !=# ''
+      s_breadcrumb_cache = ''
+      SetWinbar('')
+    endif
+    return
+  endif
+  var cur_line = line('.')
+  # 找出包含当前行的所有符号
+  var enclosing: list<dict<any>> = []
+  var container_kinds = ['function', 'method', 'class', 'struct', 'enum', 'namespace', 'type', 'module']
+  for item in s_bc_items
+    var slnum = get(item, 'lnum', 0)
+    var elnum = get(item, 'end_lnum', 0)
+    var skind = get(item, 'kind', '')
+    if index(container_kinds, skind) < 0
+      continue
+    endif
+    if slnum <= cur_line && elnum >= cur_line
+      enclosing->add(item)
+    endif
+  endfor
+  # 按范围从大到小排序（外层在前）
+  sort(enclosing, (a, b) => {
+    var ra = get(a, 'end_lnum', 0) - get(a, 'lnum', 0)
+    var rb = get(b, 'end_lnum', 0) - get(b, 'lnum', 0)
+    return rb < ra ? -1 : (rb > ra ? 1 : 0)
+  })
+  var sep = get(g:, 'simpletreesitter_breadcrumb_separator', ' > ')
+  var parts: list<string> = []
+  for item in enclosing
+    var icon = BreadcrumbIcon(item.kind)
+    parts->add(icon .. ' ' .. item.name)
+  endfor
+  var text = join(parts, sep)
+  if text ==# s_breadcrumb_cache
+    return
+  endif
+  s_breadcrumb_cache = text
+  SetWinbar(text)
+enddef
+
+def ScheduleBreadcrumbUpdate()
+  if !get(g:, 'simpletreesitter_breadcrumb', 0)
+    return
+  endif
+  if s_bc_timer != 0
+    try | timer_stop(s_bc_timer) | catch | endtry
+    s_bc_timer = 0
+  endif
+  s_bc_timer = timer_start(200, (_) => {
+    s_bc_timer = 0
+    UpdateBreadcrumb()
+  })
+enddef
+
+# =============== Outline 光标跟随 ===============
+def UpdateOutlineCursor()
+  if s_outline_win == 0 || s_outline_buf == 0
+    return
+  endif
+  if !get(g:, 'simpletreesitter_outline_follow_cursor', 1)
+    return
+  endif
+  if !bufexists(s_outline_buf)
+    return
+  endif
+  var cur_line = line('.')
+  # 找出包含当前行的最内层符号
+  var best_idx = -1
+  var best_range = 999999
+  for i in range(len(s_outline_items))
+    var item = s_outline_items[i]
+    var slnum = get(item, 'lnum', 0)
+    var elnum = get(item, 'end_lnum', 0)
+    if elnum == 0
+      # 没有 end_lnum 时用 lnum 最接近的
+      if slnum <= cur_line && (best_idx < 0 || slnum > get(s_outline_items[best_idx], 'lnum', 0))
+        best_idx = i
+      endif
+      continue
+    endif
+    if slnum <= cur_line && elnum >= cur_line
+      var rng = elnum - slnum
+      if rng < best_range
+        best_range = rng
+        best_idx = i
+      endif
+    endif
+  endfor
+  if best_idx < 0
+    # 清除旧高亮
+    if s_outline_cursor_line > 0
+      try | prop_remove({type: 'TsHlOutlineCursor', bufnr: s_outline_buf, all: true}) | catch | endtry
+      s_outline_cursor_line = 0
+    endif
+    return
+  endif
+  # 通过 linemap 映射到 outline 行号
+  var outline_lnum = -1
+  for i in range(len(s_outline_linemap))
+    if s_outline_linemap[i] == best_idx
+      outline_lnum = i + 1
+      break
+    endif
+  endfor
+  if outline_lnum < 0 || outline_lnum == s_outline_cursor_line
+    return
+  endif
+  # 更新高亮
+  try | prop_remove({type: 'TsHlOutlineCursor', bufnr: s_outline_buf, all: true}) | catch | endtry
+  try
+    prop_add(outline_lnum, 1, {type: 'TsHlOutlineCursor', bufnr: s_outline_buf, end_lnum: outline_lnum, end_col: strlen(getbufline(s_outline_buf, outline_lnum)[0]) + 1})
+  catch
+  endtry
+  s_outline_cursor_line = outline_lnum
+enddef
+
 # =============== 导出 API ===============
 export def Enable()
   if s_enabled
@@ -686,6 +924,16 @@ export def Disable()
     catch
     endtry
   endif
+  # 清理缩进参考线
+  DisableIndentGuides()
+  # 清理面包屑
+  s_bc_items = []
+  s_breadcrumb_cache = ''
+  if s_bc_timer != 0
+    try | timer_stop(s_bc_timer) | catch | endtry
+    s_bc_timer = 0
+  endif
+  SetWinbar('')
   echo '[ts-hl] disabled'
 enddef
 
@@ -727,6 +975,10 @@ export def OnBufEvent(buf: number)
 
   ScheduleRequest(buf, 'edit')
   ScheduleSymbols(buf)
+  # 缩进参考线
+  if IsSupportedLang(buf)
+    ApplyIndentGuidesForBuf()
+  endif
 enddef
 
 export def OnScroll(buf: number)
@@ -735,6 +987,10 @@ export def OnScroll(buf: number)
   endif
   # AutoEnableForBuffer(buf)
   ScheduleRequest(buf, 'scroll')
+  # 面包屑导航更新
+  ScheduleBreadcrumbUpdate()
+  # Outline 光标跟随
+  UpdateOutlineCursor()
 enddef
 
 export def OnBufClose(buf: number)
@@ -828,30 +1084,50 @@ def BuildTreePrefix(ancestor_last: list<bool>, is_last: bool): string
   return pref
 enddef
 
+def OutlineCollapseKey(n: dict<any>): string
+  return n.kind .. '::' .. n.name .. '@' .. n.lnum
+enddef
+
 def RenderTree(nodes: list<dict<any>>, show_pos: bool): dict<any>
   var lines: list<string> = []
   var linemap: list<number> = []
   var meta: list<dict<any>> = []
+  var foldable = get(g:, 'simpletreesitter_outline_foldable', 1)
+  var spacing = get(g:, 'simpletreesitter_outline_spacing', 1)
 
   def Walk(ns: list<dict<any>>, ancestors: list<bool>)
     for i in range(len(ns))
       var n = ns[i]
       var last = (i == len(ns) - 1)
+      var is_top = len(ancestors) == 0
+
+      # 顶层分组间距：非首项前插入空行
+      if is_top && spacing && len(lines) > 0
+        lines->add('')
+        linemap->add(-1)
+        meta->add({prefix_len: 0, icon_col: 0, icon_w: 0, name_start: 0, name_end: 0, pos_start: 0, pos_end: 0, kind: ''})
+      endif
+
       var prefix = BuildTreePrefix(ancestors, last)
       var icon = FancyIcon(n.kind)
       var name = n.name
+      var has_children = len(n.children) > 0
+      var ckey = OutlineCollapseKey(n)
+      var collapsed = foldable && has_children && get(s_outline_collapsed, ckey, false)
+      var fold_indicator = collapsed ? ' [+' .. len(n.children) .. ']' : ''
       var pos_str = show_pos && n.idx >= 0 ? (' (' .. n.lnum .. ':' .. n.col .. ')') : ''
 
-      var line = prefix .. icon .. ' ' .. name .. pos_str
+      var line = prefix .. icon .. ' ' .. name .. fold_indicator .. pos_str
 
       var pref_bytes = strlen(prefix)
       var icon_bytes = strlen(icon)
       var name_bytes = strlen(name)
+      var fold_bytes = strlen(fold_indicator)
       var pos_bytes  = strlen(pos_str)
 
       var icon_col   = pref_bytes + 1
       var name_start = pref_bytes + icon_bytes + 2
-      var name_end   = name_start + name_bytes
+      var name_end   = name_start + name_bytes + fold_bytes
       var pos_start  = pos_bytes == 0 ? 0 : name_end
       var pos_end    = pos_bytes == 0 ? 0 : (pos_start + pos_bytes)
 
@@ -868,7 +1144,7 @@ def RenderTree(nodes: list<dict<any>>, show_pos: bool): dict<any>
       kind: n.kind
       })
 
-      if len(n.children) > 0
+      if has_children && !collapsed
         Walk(n.children, ancestors + [last])
       endif
     endfor
@@ -1005,8 +1281,14 @@ def RequestSymbolsNow(buf: number)
 enddef
 
 def ScheduleSymbols(buf: number)
-  if s_outline_win == 0 || s_outline_src_buf != buf
+  var need_outline = (s_outline_win != 0 && s_outline_src_buf == buf)
+  var need_bc = get(g:, 'simpletreesitter_breadcrumb', 0) && IsSupportedLang(buf)
+  if !need_outline && !need_bc
     return
+  endif
+  # 面包屑模式下也跟踪当前 buffer
+  if need_bc
+    s_bc_buf = buf
   endif
   if s_sym_timer != 0 && exists('*timer_stop')
     try
@@ -1294,6 +1576,8 @@ export def OutlineOpen()
       setlocal winfixwidth
       nnoremap <silent><buffer> <CR> :call simpletreesitter#OutlineJump()<CR>
       nnoremap <silent><buffer> q :call simpletreesitter#OutlineClose()<CR>
+      nnoremap <silent><buffer> o :call simpletreesitter#OutlineToggleFold()<CR>
+      nnoremap <silent><buffer> za :call simpletreesitter#OutlineToggleFold()<CR>
     endif
 
     s_outline_win = win_getid()
@@ -1377,6 +1661,27 @@ export def OutlineJump()
   endif
   call cursor(lnum, col)
   normal! zv
+enddef
+
+export def OutlineToggleFold()
+  if s_outline_win == 0 || s_outline_buf == 0
+    return
+  endif
+  var idx_line = line('.') - 1
+  if idx_line < 0 || idx_line >= len(s_outline_linemap)
+    return
+  endif
+  var sym_idx = s_outline_linemap[idx_line]
+  if sym_idx < 0 || sym_idx >= len(s_outline_items)
+    return
+  endif
+  var it = s_outline_items[sym_idx]
+  var ckey = it.kind .. '::' .. it.name .. '@' .. it.lnum
+  s_outline_collapsed[ckey] = !get(s_outline_collapsed, ckey, false)
+  # 用缓存的 items 重新渲染
+  var save_cursor = line('.')
+  ApplySymbols(s_outline_src_buf, s_outline_items)
+  cursor(min([save_cursor, line('$')]), 1)
 enddef
 
 # 新增：WinClosed 事件回调（导出），用于判断关闭的是否为 outline 窗口

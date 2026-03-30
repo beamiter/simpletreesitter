@@ -66,6 +66,8 @@ struct Span {
     end_lnum: u32,
     end_col: u32,
     group: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -74,6 +76,10 @@ struct Symbol {
     kind: String,
     lnum: u32,
     col: u32,
+    #[serde(default)]
+    end_lnum: u32,
+    #[serde(default)]
+    end_col: u32,
     container_kind: Option<String>,
     container_name: Option<String>,
     container_lnum: Option<u32>,
@@ -411,12 +417,19 @@ fn run_highlight_cached(
 
         let cname = query.capture_names()[cap.index as usize];
         let group = map_capture_to_group(cname).to_string();
+        let depth = if cname == "punctuation.bracket" {
+            let d = bracket_depth(node);
+            if d > 0 { Some(d) } else { None }
+        } else {
+            None
+        };
         spans.push(Span {
             lnum,
             col,
             end_lnum,
             end_col,
             group,
+            depth,
         });
     }
 
@@ -480,6 +493,10 @@ fn run_symbols_cached(
         let sp = node.start_position();
         let lnum = sp.row as u32 + 1;
         let col = sp.column as u32 + 1;
+        // 定义节点的结束位置（取 parent 的 end，因为 capture 的是 identifier）
+        let def_end = node.parent().unwrap_or(node).end_position();
+        let sym_end_lnum = def_end.row as u32 + 1;
+        let sym_end_col = def_end.column as u32 + 1;
 
         if let Some((ls, le)) = lrange {
             if lnum < ls || lnum > le {
@@ -677,6 +694,8 @@ fn run_symbols_cached(
             kind,
             lnum,
             col,
+            end_lnum: sym_end_lnum,
+            end_col: sym_end_col,
             container_kind: ckind,
             container_name: cname_opt,
             container_lnum: clnum,
@@ -917,11 +936,14 @@ fn run_symbols_cached(
                         );
                         if !seen.contains(&key) {
                             seen.insert(key);
+                            let ep = n.end_position();
                             symbols.push(Symbol {
                                 name,
                                 kind,
                                 lnum,
                                 col,
+                                end_lnum: ep.row as u32 + 1,
+                                end_col: ep.column as u32 + 1,
                                 container_kind: None,
                                 container_name: None,
                                 container_lnum: None,
@@ -969,6 +991,23 @@ fn dump_ast_cached(server: &mut Server, buf: i64, lang: &str) -> Result<Vec<Stri
     }
     walk(root, 0, &mut lines);
     Ok(lines)
+}
+
+fn bracket_depth(node: tree_sitter::Node) -> u32 {
+    let mut depth: u32 = 0;
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        let mut walker = p.walk();
+        let has_brackets = p.children(&mut walker).any(|ch| {
+            !ch.is_named()
+                && matches!(ch.kind(), "(" | ")" | "{" | "}" | "[" | "]")
+        });
+        if has_brackets {
+            depth += 1;
+        }
+        cur = p.parent();
+    }
+    depth
 }
 
 fn map_capture_to_group(name: &str) -> &'static str {

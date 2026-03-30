@@ -37,6 +37,22 @@ g:simpletreesitter_symbols_view_margin = get(g:, 'simpletreesitter_symbols_view_
 g:simpletreesitter_scroll_debounce = get(g:, 'simpletreesitter_scroll_debounce', 300)
 g:simpletreesitter_max_props = get(g:, 'simpletreesitter_max_props', 20000)
 
+# =============== 缩进参考线 ===============
+g:simpletreesitter_indent_guides = get(g:, 'simpletreesitter_indent_guides', 0)
+g:simpletreesitter_indent_guide_char = get(g:, 'simpletreesitter_indent_guide_char', '│')
+
+# =============== 彩虹括号 ===============
+g:simpletreesitter_rainbow_brackets = get(g:, 'simpletreesitter_rainbow_brackets', 1)
+
+# =============== 面包屑导航 ===============
+g:simpletreesitter_breadcrumb = get(g:, 'simpletreesitter_breadcrumb', 0)
+g:simpletreesitter_breadcrumb_separator = get(g:, 'simpletreesitter_breadcrumb_separator', ' > ')
+
+# =============== Outline 增强 ===============
+g:simpletreesitter_outline_follow_cursor = get(g:, 'simpletreesitter_outline_follow_cursor', 1)
+g:simpletreesitter_outline_foldable = get(g:, 'simpletreesitter_outline_foldable', 1)
+g:simpletreesitter_outline_spacing = get(g:, 'simpletreesitter_outline_spacing', 1)
+
 # =============== Outline 打开时全局暂停高亮 ===============
 g:simpletreesitter_suspend_highlight_on_outline = get(g:, 'simpletreesitter_suspend_highlight_on_outline', 0)
 g:simpletreesitter_clear_props_on_suspend = get(g:, 'simpletreesitter_clear_props_on_suspend', 1)
