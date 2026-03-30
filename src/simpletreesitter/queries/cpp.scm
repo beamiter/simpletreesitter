@@ -6,7 +6,7 @@
 (comment) @comment
 
 ; ----- Preprocessor -----
-(preproc_include) @macro
+(preproc_include "#include" @macro)
 (preproc_def) @macro
 (preproc_function_def) @macro
 (preproc_call) @macro

@@ -3,7 +3,9 @@
 
 ; ----- preprocessor -----
 (preproc_directive) @macro
-(preproc_include) @macro
+(preproc_include "#include" @macro)
+(preproc_include (string_literal) @string)
+(preproc_include (system_lib_string) @string)
 (preproc_def) @macro
 (preproc_function_def) @macro
 
