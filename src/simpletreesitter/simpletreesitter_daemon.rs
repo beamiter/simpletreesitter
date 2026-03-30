@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::ops;
 use tree_sitter::StreamingIterator;
@@ -379,6 +379,10 @@ fn run_highlight_cached(
     }
 
     let mut spans = Vec::with_capacity(4096);
+    // Dedup: keep only the first (most specific) capture for each text range.
+    // Tree-sitter returns captures in query pattern order, so specific patterns
+    // (e.g. @field, @type) come before the generic fallback (identifier) @variable.
+    let mut seen: HashSet<(u32, u32, u32, u32)> = HashSet::new();
     let mut it = cursor.captures(&query, root, bytes);
     while let Some((m, cap_ix)) = it.next() {
         let cap = m.captures[*cap_ix];
@@ -389,21 +393,29 @@ fn run_highlight_cached(
         let sp = node.start_position();
         let ep = node.end_position();
 
+        let lnum = sp.row as u32 + 1;
+        let col = sp.column as u32 + 1;
+        let end_lnum = ep.row as u32 + 1;
+        let end_col = ep.column as u32 + 1;
+
         if let Some((ls, le)) = lrange {
-            let nl1 = sp.row as u32 + 1;
-            let nl2 = ep.row as u32 + 1;
-            if nl2 < ls || nl1 > le {
+            if end_lnum < ls || lnum > le {
                 continue;
             }
+        }
+
+        let key = (lnum, col, end_lnum, end_col);
+        if !seen.insert(key) {
+            continue; // duplicate range — skip the less specific capture
         }
 
         let cname = query.capture_names()[cap.index as usize];
         let group = map_capture_to_group(cname).to_string();
         spans.push(Span {
-            lnum: sp.row as u32 + 1,
-            col: sp.column as u32 + 1,
-            end_lnum: ep.row as u32 + 1,
-            end_col: ep.column as u32 + 1,
+            lnum,
+            col,
+            end_lnum,
+            end_col,
             group,
         });
     }

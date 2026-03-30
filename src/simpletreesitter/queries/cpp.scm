@@ -45,6 +45,9 @@
 (qualified_identifier (type_identifier) @type)
 (template_type (type_identifier) @type)
 
+; Template parameters
+(type_parameter_declaration (type_identifier) @type)
+
 ; ----- Namespaces -----
 (namespace_identifier) @namespace
 ; 说明：不同版本的 grammar 中 namespace_definition 的名称子节点常被别名为 namespace_identifier，
@@ -173,7 +176,11 @@
 ((identifier) @constant
   (#match? @constant "^[A-Z][A-Z0-9_]*$"))
 
-(enumerator (identifier) @constant)
+(enumerator name: (identifier) @constant)
+
+; Scoped enum values (e.g., SolverName::ALTRO)
+(qualified_identifier (identifier) @constant
+  (#match? @constant "^[A-Z][A-Z0-9_]*$"))
 
 ; ----- Operators -----
 

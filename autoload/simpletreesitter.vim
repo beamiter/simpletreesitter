@@ -130,28 +130,12 @@ def EnsureHlGroupsAndProps()
 
   highlight default link TSType Type
   highlight default link TSTypeBuiltin Type
-  highlight default link TSNamespace Identifier
+  highlight default link TSNamespace Include
 
-  if !hlexists('TSVariable')
-    highlight default TSVariable ctermfg=109 guifg=#56b6c2
-  else
-    highlight default link TSVariable Identifier
-  endif
-  if !hlexists('TSVariableParameter')
-    highlight default TSVariableParameter ctermfg=180 guifg=#d19a66
-  else
-    highlight default link TSVariableParameter Identifier
-  endif
-  if !hlexists('TSProperty')
-    highlight default TSProperty ctermfg=139 guifg=#c678dd
-  else
-    highlight default link TSProperty Identifier
-  endif
-  if !hlexists('TSField')
-    highlight default TSField ctermfg=139 guifg=#c678dd
-  else
-    highlight default link TSField Identifier
-  endif
+  highlight default TSVariable ctermfg=109 guifg=#56b6c2
+  highlight default TSVariableParameter ctermfg=180 guifg=#d19a66
+  highlight default TSProperty ctermfg=139 guifg=#c678dd
+  highlight default TSField ctermfg=139 guifg=#c678dd
   highlight default link TSVariableBuiltin Constant
 
   highlight default link TSMacro Macro
@@ -163,7 +147,7 @@ def EnsureHlGroupsAndProps()
 
   for g in s_groups
     try
-      call prop_type_add(g, {highlight: g, combine: v:true, priority: 11})
+      call prop_type_add(g, {highlight: g, combine: v:false, priority: 11, override: v:true})
     catch
     endtry
   endfor

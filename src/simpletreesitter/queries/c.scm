@@ -59,6 +59,8 @@
 ; ----- fields / members -----
 (field_identifier) @field
 (field_expression field: (field_identifier) @field)
+; ----- enumerator members -----
+(enumerator (identifier) @constant)
 
 ; ----- constants -----
 ((identifier) @constant
