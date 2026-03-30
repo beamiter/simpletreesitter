@@ -10,7 +10,14 @@
 (preproc_def) @macro
 (preproc_function_def) @macro
 (preproc_call) @macro
-(preproc_ifdef) @macro
+(preproc_ifdef
+  "#ifndef" @macro)
+(preproc_ifdef
+  "#ifdef" @macro)
+(preproc_ifdef
+  name: (identifier) @constant)
+(preproc_ifdef
+  "#endif" @macro)
 (preproc_directive) @macro
 
 ; Preprocessor include paths (不使用 path 字段)

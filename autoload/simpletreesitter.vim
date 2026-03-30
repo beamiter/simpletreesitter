@@ -81,6 +81,15 @@ def DetectLang(buf: number): string
   elseif ft ==# 'javascript' || ft ==# 'javascriptreact' || ft ==# 'jsx'
     return 'javascript'
   elseif ft ==# 'c'
+    # .h files may contain C++ code; detect C++ features and use cpp parser
+    var ext = fnamemodify(bufname(buf), ':e')
+    if ext =~? '^h$\|^hh$\|^hpp$\|^hxx$'
+      var lines = getbufline(buf, 1, 200)
+      var text = join(lines, "\n")
+      if text =~# '\<enum\s\+class\>\|\<class\s\+\w\+\s*[:{]\|\<namespace\s\+\w\|\<template\s*<\|\<using\s\+namespace\>\|\<public\s*:\|\<private\s*:\|\<protected\s*:'
+        return 'cpp'
+      endif
+    endif
     return 'c'
   elseif ft ==# 'cpp' || ft ==# 'cc'
     return 'cpp'
