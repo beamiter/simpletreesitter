@@ -200,13 +200,9 @@ impl Server {
     fn set_text(&mut self, buf: i64, lang: &str, text: String) -> Result<()> {
         self.ensure_queries(lang)?;
         let language = self.queries.get(lang).unwrap().language.clone();
-        // 增量解析：如果缓存中有旧 tree 且语言相同，clone 后传给 parser
-        let old_tree = self.cache.get(&buf)
-            .filter(|c| c.lang == lang)
-            .map(|c| c.tree.clone());
         let p = self.parser_for(lang, language.clone())?;
         let tree = p
-            .parse(&text, old_tree.as_ref())
+            .parse(&text, None)
             .ok_or_else(|| anyhow!("parse failed"))?;
         self.cache.insert(
             buf,
