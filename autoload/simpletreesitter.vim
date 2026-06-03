@@ -15,12 +15,17 @@ var s_inflight_sync: dict<bool> = {}
 var s_sent_changedtick: dict<number> = {}
 # 上次应用的可见范围缓存 {bufnr: [start_lnum, end_lnum]}
 var s_last_ranges: dict<list<number>> = {}
+# 上次实际写入的高亮类型 {bufnr: [type, ...]}，用于增量清除（只清自己用过的类型）
+var s_applied_types: dict<list<string>> = {}
 # =============== 侧边栏状态 ===============
 var s_outline_win: number = 0
 var s_outline_buf: number = 0
 var s_outline_src_buf: number = 0
 var s_outline_items: list<dict<any>> = []
 var s_outline_linemap: list<number> = []  # 每一可见行对应 s_outline_items 的下标，-1 表示不可跳转
+var s_outline_idx_to_lnum: dict<number> = {}  # s_outline_items 下标 -> outline 行号（光标跟随 O(1) 反查）
+var s_last_outline_sig: string = ''  # 上次渲染的符号签名，未变则跳过整树重建
+var s_outline_cursor_timer: number = 0  # 光标跟随防抖定时器
 var s_sym_timer: number = 0
 var s_inflight_syms: dict<bool> = {}
 var s_inflight_hl: dict<bool> = {}
@@ -58,8 +63,11 @@ var s_indent_guides_saved_lcs: string = ''
 # =============== 工具 ===============
 
 # 只清除 simpletreesitter 自己的 text properties，不影响其它插件（如 coc.nvim 虚拟文本）
-def ClearOwnProps(start_lnum: number, end_lnum: number, buf: number)
-  for g in s_groups
+# types 为空时清除全部高亮组；否则只清除指定的类型（增量清除，避免对 33 个组逐一
+# 调用 prop_remove）。
+def ClearOwnProps(start_lnum: number, end_lnum: number, buf: number, types: list<string> = [])
+  var groups = empty(types) ? s_groups : types
+  for g in groups
     try
       prop_remove({type: g, bufnr: buf, all: true}, start_lnum, end_lnum)
     catch
@@ -277,17 +285,23 @@ def ApplyHighlights(buf: number, spans: list<dict<any>>)
   if has_key(s_last_ranges, buf)
     var prev = s_last_ranges[buf]
     if len(prev) == 2 && prev[1] >= prev[0]
-      ClearOwnProps(prev[0], prev[1], buf)
+      # 只清除上轮真正写入过的类型，而不是全部 33 个组。
+      ClearOwnProps(prev[0], prev[1], buf, get(s_applied_types, buf, []))
     endif
   endif
 
   var applied = 0
   var max_props = get(g:, 'simpletreesitter_max_props', 20000)
 
+  # 按类型分桶，最后用 prop_add_list 一次性提交，省去逐 span 调用 prop_add 的开销。
+  var by_type: dict<list<list<number>>> = {}
   for s in spans
     var l1 = get(s, 'lnum', 1)
     var l2 = get(s, 'end_lnum', l1)
     if l2 < vstart || l1 > vend
+      continue
+    endif
+    if l1 <= 0 || l2 <= 0
       continue
     endif
     var c1 = max([1, get(s, 'col', 1)])
@@ -300,19 +314,25 @@ def ApplyHighlights(buf: number, spans: list<dict<any>>)
         tp = 'TSRainbow' .. string(((depth - 1) % 6) + 1)
       endif
     endif
-    if l1 <= 0 || l2 <= 0
-      continue
+    if !has_key(by_type, tp)
+      by_type[tp] = []
     endif
-    try
-      call prop_add(l1, c1, {type: tp, bufnr: buf, end_lnum: l2, end_col: c2})
-    catch
-    endtry
+    by_type[tp]->add([l1, c1, l2, c2])
     applied += 1
     if applied >= max_props
       break
     endif
   endfor
+
+  for [tp, positions] in items(by_type)
+    try
+      call prop_add_list({type: tp, bufnr: buf}, positions)
+    catch
+    endtry
+  endfor
+
   s_last_ranges[buf] = [vstart, vend]
+  s_applied_types[buf] = keys(by_type)
 enddef
 
 def OnDaemonEvent(line: string)
@@ -668,6 +688,7 @@ def ClearAllProps()
   endfor
   # 清空范围缓存，避免误判
   s_last_ranges = {}
+  s_applied_types = {}
 enddef
 
 # =============== 缩进参考线 ===============
@@ -806,6 +827,24 @@ def ScheduleBreadcrumbUpdate()
 enddef
 
 # =============== Outline 光标跟随 ===============
+# CursorMoved 每次按键都会触发，UpdateOutlineCursor 又是 O(符号数) 扫描，故防抖。
+def ScheduleOutlineCursorUpdate()
+  if s_outline_win == 0 || s_outline_buf == 0
+    return
+  endif
+  if !get(g:, 'simpletreesitter_outline_follow_cursor', 1)
+    return
+  endif
+  if s_outline_cursor_timer != 0
+    try | timer_stop(s_outline_cursor_timer) | catch | endtry
+    s_outline_cursor_timer = 0
+  endif
+  s_outline_cursor_timer = timer_start(100, (_) => {
+    s_outline_cursor_timer = 0
+    UpdateOutlineCursor()
+  })
+enddef
+
 def UpdateOutlineCursor()
   if s_outline_win == 0 || s_outline_buf == 0
     return
@@ -847,14 +886,8 @@ def UpdateOutlineCursor()
     endif
     return
   endif
-  # 通过 linemap 映射到 outline 行号
-  var outline_lnum = -1
-  for i in range(len(s_outline_linemap))
-    if s_outline_linemap[i] == best_idx
-      outline_lnum = i + 1
-      break
-    endif
-  endfor
+  # 通过预建的反查表映射到 outline 行号（O(1)，免去逐行扫描 linemap）
+  var outline_lnum = get(s_outline_idx_to_lnum, string(best_idx), -1)
   if outline_lnum < 0 || outline_lnum == s_outline_cursor_line
     return
   endif
@@ -989,8 +1022,8 @@ export def OnScroll(buf: number)
   ScheduleRequest(buf, 'scroll')
   # 面包屑导航更新
   ScheduleBreadcrumbUpdate()
-  # Outline 光标跟随
-  UpdateOutlineCursor()
+  # Outline 光标跟随（防抖）
+  ScheduleOutlineCursorUpdate()
 enddef
 
 export def OnBufClose(buf: number)
@@ -1353,6 +1386,34 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
     return
   endif
 
+  # 符号 + 折叠状态 + 影响渲染的配置都没变时，跳过整树重建/setline/逐行 prop。
+  # symbols 事件常以相同内容重复触发，这一步避免无谓的全量重绘。
+  var sig_parts: list<string> = [string(len(syms))]
+  for s in syms
+    sig_parts->add(get(s, 'kind', '') .. ':' .. get(s, 'name', '')
+      .. ':' .. string(get(s, 'lnum', 0)) .. ':' .. string(get(s, 'end_lnum', 0))
+      .. ':' .. get(s, 'container_kind', ''))
+  endfor
+  var collapse_parts: list<string> = []
+  for ck in keys(s_outline_collapsed)
+    collapse_parts->add(ck .. '=' .. (s_outline_collapsed[ck] ? '1' : '0'))
+  endfor
+  sig_parts->add('C=' .. join(sort(collapse_parts), ','))
+  sig_parts->add('cfg=' .. string([
+    get(g:, 'simpletreesitter_outline_hide_inner_functions', 1),
+    get(g:, 'simpletreesitter_outline_hide_fields', 1),
+    get(g:, 'simpletreesitter_outline_hide_variants', 0),
+    get(g:, 'simpletreesitter_outline_show_position', 1),
+    get(g:, 'simpletreesitter_outline_max_items', 300),
+    get(g:, 'simpletreesitter_outline_exclude_patterns', []),
+    get(g:, 'simpletreesitter_outline_disable_props', 1),
+  ]))
+  var sig = join(sig_parts, '|')
+  if sig ==# s_last_outline_sig
+    return
+  endif
+  s_last_outline_sig = sig
+
   var items: list<dict<any>> = syms
 
   var hide_inner = get(g:, 'simpletreesitter_outline_hide_inner_functions', 1) ? true : false
@@ -1543,6 +1604,15 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
       call win_gotoid(curwin)
     endif
   endtry
+
+  # 重建 下标 -> outline 行号 的反查表，供光标跟随 O(1) 使用。
+  s_outline_idx_to_lnum = {}
+  for i in range(len(s_outline_linemap))
+    var sidx = s_outline_linemap[i]
+    if sidx >= 0 && !has_key(s_outline_idx_to_lnum, string(sidx))
+      s_outline_idx_to_lnum[string(sidx)] = i + 1
+    endif
+  endfor
 enddef
 
 # =============== 侧边栏窗口管理 ===============
@@ -1555,6 +1625,8 @@ export def OutlineOpen()
   if !EnsureDaemon()
     return
   endif
+  # 新开/重开 outline 时清空签名，确保首帧一定渲染（不被上一个缓冲的签名误判跳过）。
+  s_last_outline_sig = ''
 
   var curwin = win_getid()
   try
@@ -1613,6 +1685,8 @@ export def OutlineClose()
   s_outline_buf = 0
   s_outline_items = []
   s_outline_linemap = []
+  s_outline_idx_to_lnum = {}
+  s_last_outline_sig = ''
   s_outline_src_buf = 0
   Log('[ts-hl] outline closed')
 
