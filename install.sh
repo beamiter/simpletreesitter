@@ -1,11 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cargo build --release
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd -- "$repo_dir"
 
-# 将产物复制到当前仓库的 lib/ 目录，由插件在 runtimepath 中查找
-rm lib -rf
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "error: cargo was not found; install Rust 1.85+ first" >&2
+  exit 1
+fi
+
+cargo build --release --locked
+
+binary="target/release/ts-hl-daemon"
+if [[ -f "${binary}.exe" ]]; then
+  binary="${binary}.exe"
+fi
+if [[ ! -f "$binary" ]]; then
+  echo "error: build completed but $binary was not produced" >&2
+  exit 1
+fi
+
+# 只原子替换 daemon，保留 lib/ 中可能存在的其它文件。
 mkdir -p lib
-cp target/release/ts-hl-daemon lib/
+destination="lib/$(basename -- "$binary")"
+temporary="${destination}.tmp.$$"
+trap 'rm -f -- "$temporary"' EXIT
+install -m 0755 -- "$binary" "$temporary"
+mv -f -- "$temporary" "$destination"
+trap - EXIT
 
-echo "Installed to ./lib. Ensure this plugin directory is on 'runtimepath'."
+echo "Installed $destination"

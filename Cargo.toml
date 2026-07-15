@@ -1,7 +1,15 @@
 [package]
 name = "simpletreesitter"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Tree-sitter powered syntax highlighting and code outline daemon for Vim9"
+license = "MIT"
+repository = "https://github.com/beamiter/simpletreesitter"
+readme = "README.md"
+keywords = ["vim", "tree-sitter", "syntax-highlighting", "outline"]
+categories = ["command-line-utilities", "text-editors"]
+publish = false
 
 [[bin]]
 name = "ts-hl-daemon"
@@ -11,16 +19,17 @@ path = "src/simpletreesitter/simpletreesitter_daemon.rs"
 anyhow = "1.0.100"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.145"
-tree-sitter = "0.25.10"
+tree-sitter = "0.26.11"
 tree-sitter-bash = "0.25.1"
-tree-sitter-c = "0.24.1"
+tree-sitter-c = "0.24.2"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-go = "0.25.0"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
-tree-sitter-rust = "0.24.0"
+tree-sitter-rust = "0.24.2"
 [dependencies.tree-sitter-vim9]
 git = "https://github.com/beamiter/tree-sitter-vim9"
+rev = "fc891a2a5d6a0fde65a256d508c9e5406aba4464"
 
 [profile.release]
 opt-level = 3

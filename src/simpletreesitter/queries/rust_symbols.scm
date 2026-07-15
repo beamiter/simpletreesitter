@@ -1,9 +1,9 @@
 ; functions (free functions)
 (function_item name: (identifier) @symbol.function)
 
-; methods: any function_item that has an impl ancestor
-((function_item name: (identifier) @symbol.method)
-  (#has-ancestor? @symbol.method impl_item))
+; Methods are reclassified in Rust code when the function_item has an impl_item
+; ancestor. Keeping that logic out of a general query predicate is important:
+; QueryCursor does not evaluate arbitrary predicates automatically.
 
 ; struct / enum / trait / type alias
 (struct_item name: (type_identifier) @symbol.struct)

@@ -8,6 +8,6 @@
 (let_statement   (identifier) @symbol.variable)
 (const_statement (identifier) @symbol.const)
 
-; 作用域/选项变量（例如 v:true、&opt）
-(scope_var)  @symbol.variable
-(option_var) @symbol.variable
+; Scope/option references are intentionally not outline symbols. Declarations
+; that the grammar currently treats as generic commands are recovered by the
+; daemon's Vim declaration fallback.

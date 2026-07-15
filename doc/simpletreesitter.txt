@@ -1,0 +1,134 @@
+*simpletreesitter.txt*  Tree-sitter highlighting and Outline for Vim9
+
+===============================================================================
+CONTENTS                                                *simpletreesitter*
+
+1. Introduction.............................|simpletreesitter-introduction|
+2. Requirements.............................|simpletreesitter-requirements|
+3. Commands.................................|simpletreesitter-commands|
+4. Mappings.................................|simpletreesitter-mappings|
+5. Options..................................|simpletreesitter-options|
+6. Troubleshooting..........................|simpletreesitter-troubleshooting|
+
+===============================================================================
+1. INTRODUCTION                              *simpletreesitter-introduction*
+
+simpletreesitter uses an asynchronous Rust daemon for Tree-sitter parsing,
+highlight queries, symbol extraction and incremental syntax-tree updates.  Vim
+renders namespaced text properties and an optional code Outline.
+
+Supported filetypes: rust, c, cpp, cc, javascript, javascriptreact, jsx,
+python, go, sh, bash, zsh, vim and vimrc.
+
+===============================================================================
+2. REQUIREMENTS                              *simpletreesitter-requirements*
+
+Vim 9.0+ with +vim9script, +job, +channel, +textprop and +timers; UTF-8; and
+Rust 1.85+ when building the daemon.  Neovim is not supported.
+
+Build or update the daemon from the plugin directory: >
+
+  ./install.sh
+<
+===============================================================================
+3. COMMANDS                                  *simpletreesitter-commands*
+
+                                                *:TsHlEnable*
+:TsHlEnable             Enable highlighting and automatic synchronization.
+
+                                                *:TsHlDisable*
+:TsHlDisable            Disable, clear owned properties and stop the daemon.
+
+                                                *:TsHlToggle*
+:TsHlToggle             Toggle the plugin.
+
+                                                *:TsHlOutlineOpen*
+:TsHlOutlineOpen        Open or retarget the code Outline.
+
+                                                *:TsHlOutlineClose*
+:TsHlOutlineClose       Close the Outline.
+
+                                                *:TsHlOutlineToggle*
+:TsHlOutlineToggle      Toggle the Outline.
+
+                                                *:TsHlOutlineRefresh*
+:TsHlOutlineRefresh     Refresh symbols for the current Outline source.
+
+                                                *:TsHlDumpAST*
+:TsHlDumpAST            Show the AST for the current buffer revision.
+
+                                                *:TsHlStatus*
+:TsHlStatus             Show protocol, cache and parse statistics.  This
+                        command does not start a stopped daemon.
+
+===============================================================================
+4. MAPPINGS                                  *simpletreesitter-mappings*
+
+Default normal mappings are <Leader>th and <Leader>to.  Existing user mappings
+are never replaced.  For custom mappings use: >
+
+  nmap <Leader>x <Plug>(simpletreesitter-toggle)
+  nmap <Leader>s <Plug>(simpletreesitter-outline-toggle)
+<
+Inside the Outline, <CR> jumps, o and za toggle a node, and q closes it.
+
+===============================================================================
+5. OPTIONS                                   *simpletreesitter-options*
+
+Set global options before loading the plugin.  Defaults are shown below.
+
+g:simpletreesitter_auto_enable_filetypes     List of auto-start filetypes.
+g:simpletreesitter_auto_stop                 1
+g:simpletreesitter_daemon_path               ''
+g:simpletreesitter_debounce                  120
+g:simpletreesitter_scroll_debounce           300
+g:simpletreesitter_max_buffer_bytes          5242880 (0 means unlimited)
+g:simpletreesitter_clear_props_on_disable    1
+
+g:simpletreesitter_view_margin               120
+g:simpletreesitter_symbols_view_margin       10000
+g:simpletreesitter_max_props                 20000
+g:simpletreesitter_rainbow_brackets          1
+
+g:simpletreesitter_outline_width             40
+g:simpletreesitter_outline_fancy             1
+g:simpletreesitter_outline_ascii             0
+g:simpletreesitter_outline_hide_icon         0
+g:simpletreesitter_outline_show_position     1
+g:simpletreesitter_outline_disable_props     0
+g:simpletreesitter_outline_max_items         1000
+g:simpletreesitter_outline_scan_max_items    5000
+g:simpletreesitter_outline_follow_cursor     1
+g:simpletreesitter_outline_foldable          1
+g:simpletreesitter_outline_spacing           1
+g:simpletreesitter_outline_hide_inner_functions  1
+g:simpletreesitter_outline_hide_fields       0
+g:simpletreesitter_outline_hide_variants     0
+g:simpletreesitter_outline_exclude_patterns  []
+
+g:simpletreesitter_indent_guides             0
+g:simpletreesitter_indent_guide_char         '│'
+g:simpletreesitter_breadcrumb                0
+g:simpletreesitter_breadcrumb_separator      ' > '
+
+Use this expression in 'statusline' when Vim has no 'winbar': >
+
+  %{simpletreesitter#Breadcrumb()}
+<
+Disable one buffer with: >
+
+  let b:simpletreesitter_disable = 1
+  let b:simpletreesitter_max_buffer_bytes = 0
+<
+===============================================================================
+6. TROUBLESHOOTING                           *simpletreesitter-troubleshooting*
+
+"daemon not found"          Run ./install.sh or set the daemon path.
+"protocol is outdated"      Rebuild the daemon after updating the plugin.
+Large buffer is skipped      Raise max_buffer_bytes or set it to zero.
+Icons look incorrect         Disable outline_fancy or enable outline_ascii.
+
+Enable g:simpletreesitter_debug and inspect g:simpletreesitter_log_file for
+daemon stderr and scheduling diagnostics.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

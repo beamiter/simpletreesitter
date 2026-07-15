@@ -11,3 +11,7 @@
 (program
   (variable_declaration
     (variable_declarator name: (identifier) @symbol.variable)))
+
+(program
+  (lexical_declaration
+    (variable_declarator name: (identifier) @symbol.variable)))

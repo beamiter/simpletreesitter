@@ -5,12 +5,28 @@ if exists('g:loaded_simpletreesitter')
 endif
 g:loaded_simpletreesitter = 1
 
+if !has('job') || !has('channel') || !has('textprop') || !has('timers')
+  echohl ErrorMsg
+  echom '[ts-hl] requires Vim with +job, +channel, +textprop and +timers'
+  echohl None
+  finish
+endif
+if &encoding !=# 'utf-8'
+  echohl ErrorMsg
+  echom '[ts-hl] requires :set encoding=utf-8'
+  echohl None
+  finish
+endif
+
 # =============== 配置项 ===============
 g:simpletreesitter_daemon_path = get(g:, 'simpletreesitter_daemon_path', '')
 g:simpletreesitter_debounce = get(g:, 'simpletreesitter_debounce', 120)
 g:simpletreesitter_auto_enable_filetypes = get(g:, 'simpletreesitter_auto_enable_filetypes',
-  ['rust', 'c', 'cpp', 'javascript', 'python', 'go', 'sh' ])
+  ['rust', 'c', 'cpp', 'cc', 'javascript', 'javascriptreact', 'jsx',
+   'python', 'go', 'sh', 'bash', 'zsh', 'vim', 'vimrc'])
 g:simpletreesitter_auto_stop = get(g:, 'simpletreesitter_auto_stop', 1)
+g:simpletreesitter_max_buffer_bytes = get(g:, 'simpletreesitter_max_buffer_bytes', 5 * 1024 * 1024)
+g:simpletreesitter_clear_props_on_disable = get(g:, 'simpletreesitter_clear_props_on_disable', 1)
 
 g:simpletreesitter_debug = get(g:, 'simpletreesitter_debug', 0)
 g:simpletreesitter_log_file = get(g:, 'simpletreesitter_log_file', '/tmp/ts-hl.log')
@@ -24,6 +40,7 @@ g:simpletreesitter_outline_hide_icon = get(g:, 'simpletreesitter_outline_hide_ic
 g:simpletreesitter_outline_ascii = get(g:, 'simpletreesitter_outline_ascii', 0)
 g:simpletreesitter_outline_show_position = get(g:, 'simpletreesitter_outline_show_position', 1)
 g:simpletreesitter_outline_max_items = get(g:, 'simpletreesitter_outline_max_items', 1000)
+g:simpletreesitter_outline_scan_max_items = get(g:, 'simpletreesitter_outline_scan_max_items', 5000)
 
 # Outline 过滤配置
 g:simpletreesitter_outline_hide_inner_functions = get(g:, 'simpletreesitter_outline_hide_inner_functions', 1)
@@ -68,13 +85,17 @@ command! TsHlOutlineClose   call simpletreesitter#OutlineClose()
 command! TsHlOutlineToggle  call simpletreesitter#OutlineToggle()
 command! TsHlOutlineRefresh call simpletreesitter#OutlineRefresh()
 command! TsHlDumpAST        call simpletreesitter#DumpAST()
+command! TsHlStatus         call simpletreesitter#Status()
 
 # =============== 快捷键 ===============
-if !hasmapto('<Plug>TsHlToggle')
-  nnoremap <silent> <leader>th <Cmd>TsHlToggle<CR>
+nnoremap <silent> <Plug>(simpletreesitter-toggle) <Cmd>TsHlToggle<CR>
+nnoremap <silent> <Plug>(simpletreesitter-outline-toggle) <Cmd>TsHlOutlineToggle<CR>
+
+if maparg('<leader>th', 'n') ==# '' && !hasmapto('<Plug>(simpletreesitter-toggle)', 'n')
+  nmap <silent> <leader>th <Plug>(simpletreesitter-toggle)
 endif
-if !hasmapto('<Plug>TsHlOutlineToggle')
-  nnoremap <silent> <leader>to <Cmd>TsHlOutlineToggle<CR>
+if maparg('<leader>to', 'n') ==# '' && !hasmapto('<Plug>(simpletreesitter-outline-toggle)', 'n')
+  nmap <silent> <leader>to <Plug>(simpletreesitter-outline-toggle)
 endif
 
 # =============== 自动启动逻辑 ===============

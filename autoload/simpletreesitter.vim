@@ -4,6 +4,9 @@ vim9script
 var s_job: any = v:null
 var s_running: bool = false
 var s_enabled: bool = false
+var s_daemon_generation: number = 0
+var s_protocol_version: number = 0
+var s_protocol_notice_shown: bool = false
 var s_active_bufs: dict<bool> = {}
 # 每个缓冲的请求定时器
 var s_req_timers: dict<number> = {}
@@ -11,8 +14,15 @@ var s_req_timers: dict<number> = {}
 var s_sync_timers: dict<number> = {}
 # 正在同步（等待 daemon ok）
 var s_inflight_sync: dict<bool> = {}
-# 已发送的 changedtick（避免重复 set_text）
+# 正在同步的精确 changedtick；daemon 必须在 OK 中原样回传
+var s_inflight_revision: dict<number> = {}
+# daemon 已确认的 changedtick（避免重复 set_text）
 var s_sent_changedtick: dict<number> = {}
+# 因体积限制跳过的 changedtick；变化后会自动重新评估
+var s_skipped_changedtick: dict<number> = {}
+var s_oversized_notified: dict<bool> = {}
+# AST 请求需要等待对应 revision 同步完成
+var s_pending_ast: dict<bool> = {}
 # 上次应用的可见范围缓存 {bufnr: [start_lnum, end_lnum]}
 var s_last_ranges: dict<list<number>> = {}
 # 上次实际写入的高亮类型 {bufnr: [type, ...]}，用于增量清除（只清自己用过的类型）
@@ -21,6 +31,7 @@ var s_applied_types: dict<list<string>> = {}
 var s_outline_win: number = 0
 var s_outline_buf: number = 0
 var s_outline_src_buf: number = 0
+var s_outline_src_win: number = 0
 var s_outline_items: list<dict<any>> = []
 var s_outline_linemap: list<number> = []  # 每一可见行对应 s_outline_items 的下标，-1 表示不可跳转
 var s_outline_idx_to_lnum: dict<number> = {}  # s_outline_items 下标 -> outline 行号（光标跟随 O(1) 反查）
@@ -29,6 +40,10 @@ var s_outline_cursor_timer: number = 0  # 光标跟随防抖定时器
 var s_sym_timer: number = 0
 var s_inflight_syms: dict<bool> = {}
 var s_inflight_hl: dict<bool> = {}
+var s_pending_syms: dict<bool> = {}
+var s_pending_hl: dict<bool> = {}
+# BufUnload 后保留 tombstone，阻止同一 daemon 会话中迟到的 ACK/事件复活状态。
+var s_closed_bufs: dict<bool> = {}
 var s_user_disabled: bool = false
 
 # 待用的 TS 高亮组 -> Vim 高亮组 默认链接
@@ -46,6 +61,26 @@ const s_groups = [
   'TSRainbow1', 'TSRainbow2', 'TSRainbow3',
   'TSRainbow4', 'TSRainbow5', 'TSRainbow6'
   ]
+const s_prop_prefix = 'SimpleTreeSitter_'
+const s_outline_guide_prop = 'SimpleTreeSitter_OutlineGuide'
+const s_outline_pos_prop = 'SimpleTreeSitter_OutlinePos'
+const s_outline_cursor_prop = 'SimpleTreeSitter_OutlineCursor'
+const s_language_by_filetype = {
+  rust: 'rust',
+  c: 'c',
+  cpp: 'cpp',
+  cc: 'cpp',
+  javascript: 'javascript',
+  javascriptreact: 'javascript',
+  jsx: 'javascript',
+  python: 'python',
+  go: 'go',
+  sh: 'bash',
+  bash: 'bash',
+  zsh: 'bash',
+  vim: 'vim',
+  vimrc: 'vim',
+}
 
 # =============== 面包屑状态 ===============
 var s_bc_items: list<dict<any>> = []
@@ -56,29 +91,40 @@ var s_breadcrumb_cache: string = ''
 var s_outline_cursor_line: number = 0
 # =============== Outline 折叠状态 ===============
 var s_outline_collapsed: dict<bool> = {}
+var s_outline_state_buf: number = 0
 # =============== 缩进参考线状态 ===============
-var s_indent_guides_active: bool = false
-var s_indent_guides_saved_lcs: string = ''
+# winid -> {list: bool, listchars: string}
+var s_indent_guide_windows: dict<dict<any>> = {}
 
 # =============== 工具 ===============
+
+def HlProp(group: string): string
+  return s_prop_prefix .. group
+enddef
 
 # 只清除 simpletreesitter 自己的 text properties，不影响其它插件（如 coc.nvim 虚拟文本）
 # types 为空时清除全部高亮组；否则只清除指定的类型（增量清除，避免对 33 个组逐一
 # 调用 prop_remove）。
 def ClearOwnProps(start_lnum: number, end_lnum: number, buf: number, types: list<string> = [])
-  var groups = empty(types) ? s_groups : types
-  for g in groups
+  var prop_types = types
+  if empty(prop_types)
+    prop_types = []
+    for group in s_groups
+      prop_types->add(HlProp(group))
+    endfor
+  endif
+  for prop_type in prop_types
     try
-      prop_remove({type: g, bufnr: buf, all: true}, start_lnum, end_lnum)
+      prop_remove({type: prop_type, bufnr: buf, all: true}, start_lnum, end_lnum)
     catch
     endtry
   endfor
   try
-    prop_remove({type: 'TsHlOutlineGuide', bufnr: buf, all: true}, start_lnum, end_lnum)
+    prop_remove({type: s_outline_guide_prop, bufnr: buf, all: true}, start_lnum, end_lnum)
   catch
   endtry
   try
-    prop_remove({type: 'TsHlOutlinePos', bufnr: buf, all: true}, start_lnum, end_lnum)
+    prop_remove({type: s_outline_pos_prop, bufnr: buf, all: true}, start_lnum, end_lnum)
   catch
   endtry
 enddef
@@ -99,11 +145,7 @@ enddef
 
 def DetectLang(buf: number): string
   var ft = getbufvar(buf, '&filetype')
-  if ft ==# 'rust'
-    return 'rust'
-  elseif ft ==# 'javascript' || ft ==# 'javascriptreact' || ft ==# 'jsx'
-    return 'javascript'
-  elseif ft ==# 'c'
+  if ft ==# 'c'
     # .h files may contain C++ code; detect C++ features and use cpp parser
     var ext = fnamemodify(bufname(buf), ':e')
     if ext =~? '^h$\|^hh$\|^hpp$\|^hxx$'
@@ -113,30 +155,18 @@ def DetectLang(buf: number): string
         return 'cpp'
       endif
     endif
-    return 'c'
-  elseif ft ==# 'cpp' || ft ==# 'cc'
-    return 'cpp'
-  elseif ft ==# 'python'
-    return 'python'
-  elseif ft ==# 'go'
-    return 'go'
-  elseif ft ==# 'sh' || ft ==# 'bash' || ft ==# 'zsh'
-    return 'bash'
-  elseif ft ==# 'vim' || ft ==# 'vimrc'
-    return 'vim'
-  else
-    return ''
   endif
+  return get(s_language_by_filetype, ft, '')
 enddef
 
 def IsSupportedLang(buf: number): bool
-  var ft = getbufvar(buf, '&filetype')
-  var supported = [
-    'rust', 'javascript', 'javascriptreact', 'jsx', 'c', 'cpp', 'cc',
-    'python', 'go', 'sh', 'bash', 'zsh',
-    'vim', 'vimrc'
-    ]
-  return index(supported, ft) >= 0
+  if !bufexists(buf) || !bufloaded(buf) || getbufvar(buf, '&buftype') !=# ''
+    return false
+  endif
+  if getbufvar(buf, 'simpletreesitter_disable', 0)
+    return false
+  endif
+  return has_key(s_language_by_filetype, getbufvar(buf, '&filetype'))
 enddef
 
 def EnsureHlGroupsAndProps()
@@ -164,10 +194,10 @@ def EnsureHlGroupsAndProps()
   highlight default link TSTypeBuiltin Type
   highlight default link TSNamespace Include
 
-  highlight default TSVariable ctermfg=109 guifg=#56b6c2
-  highlight default TSVariableParameter ctermfg=180 guifg=#d19a66
-  highlight default TSProperty ctermfg=139 guifg=#c678dd
-  highlight default TSField ctermfg=139 guifg=#c678dd
+  highlight default link TSVariable Identifier
+  highlight default link TSVariableParameter Identifier
+  highlight default link TSProperty Identifier
+  highlight default link TSField Identifier
   highlight default link TSVariableBuiltin Constant
 
   highlight default link TSMacro Macro
@@ -189,20 +219,20 @@ def EnsureHlGroupsAndProps()
 
   for g in s_groups
     try
-      call prop_type_add(g, {highlight: g, combine: v:false, priority: 11, override: v:true})
+      call prop_type_add(HlProp(g), {highlight: g, combine: v:false, priority: 11, override: v:true})
     catch
     endtry
   endfor
   try
-    call prop_type_add('TsHlOutlineGuide', {highlight: 'TsHlOutlineGuide', combine: v:true, priority: 12})
+    call prop_type_add(s_outline_guide_prop, {highlight: 'TsHlOutlineGuide', combine: v:true, priority: 12})
   catch
   endtry
   try
-    call prop_type_add('TsHlOutlinePos', {highlight: 'TsHlOutlinePos', combine: v:true, priority: 12})
+    call prop_type_add(s_outline_pos_prop, {highlight: 'TsHlOutlinePos', combine: v:true, priority: 12})
   catch
   endtry
   try
-    call prop_type_add('TsHlOutlineCursor', {highlight: 'TsHlOutlineCursor', combine: v:true, priority: 13})
+    call prop_type_add(s_outline_cursor_prop, {highlight: 'TsHlOutlineCursor', combine: v:true, priority: 13})
   catch
   endtry
 enddef
@@ -231,6 +261,62 @@ def BufLineCount(buf: number): number
     return info[0].linecount
   endif
   return len(getbufline(buf, 1, '$'))
+enddef
+
+# 在构造整份文本前做有界字节预检。普通、未修改的 UTF-8/Unix 文件可直接用
+# 磁盘大小；未保存、已修改或经过编码/换行转换的 buffer 按小块精确计数，且一旦
+# 越过阈值立即停止，避免为超大 buffer 分配完整副本。
+def BufferTextExceedsLimit(buf: number, max_bytes: number): bool
+  if max_bytes <= 0
+    return false
+  endif
+
+  var name = bufname(buf)
+  var fileencoding = getbufvar(buf, '&fileencoding')
+  if !getbufvar(buf, '&modified') && name !=# '' && filereadable(name)
+      && (fileencoding ==# '' || fileencoding ==# 'utf-8')
+      && getbufvar(buf, '&fileformat') ==# 'unix'
+      && !getbufvar(buf, '&bomb')
+    var disk_bytes = getfsize(name)
+    if disk_bytes >= 0
+      return disk_bytes > max_bytes
+    endif
+  endif
+
+  # wordcount().bytes 直接遍历当前 buffer 的内部行存储，不构造字符串副本，且会
+  # 固定计入一个末尾换行；按 &endofline 修正后才与发送文本严格一致。
+  if buf == bufnr()
+    var buffer_bytes = get(wordcount(), 'bytes', 0)
+    if !getbufvar(buf, '&endofline') && BufLineCount(buf) > 0
+      buffer_bytes -= 1
+    endif
+    return buffer_bytes > max_bytes
+  endif
+
+  var total = 0
+  var line_count = BufLineCount(buf)
+  var has_eol = getbufvar(buf, '&endofline') ? true : false
+  var start = 1
+  const chunk_size = 256
+  while start <= line_count
+    var chunk = getbufline(buf, start, min([line_count, start + chunk_size - 1]))
+    if empty(chunk)
+      break
+    endif
+    var current = start
+    for text_line in chunk
+      total += strlen(text_line)
+      if current < line_count || has_eol
+        total += 1
+      endif
+      if total > max_bytes
+        return true
+      endif
+      current += 1
+    endfor
+    start += len(chunk)
+  endwhile
+  return false
 enddef
 
 def VisibleViewportRangeForBuf(buf: number): list<number>
@@ -314,10 +400,11 @@ def ApplyHighlights(buf: number, spans: list<dict<any>>)
         tp = 'TSRainbow' .. string(((depth - 1) % 6) + 1)
       endif
     endif
-    if !has_key(by_type, tp)
-      by_type[tp] = []
+    var prop_type = HlProp(tp)
+    if !has_key(by_type, prop_type)
+      by_type[prop_type] = []
     endif
-    by_type[tp]->add([l1, c1, l2, c2])
+    by_type[prop_type]->add([l1, c1, l2, c2])
     applied += 1
     if applied >= max_props
       break
@@ -335,7 +422,39 @@ def ApplyHighlights(buf: number, spans: list<dict<any>>)
   s_applied_types[buf] = keys(by_type)
 enddef
 
-def OnDaemonEvent(line: string)
+def ResetProtocolState()
+  s_inflight_sync = {}
+  s_inflight_revision = {}
+  s_sent_changedtick = {}
+  s_skipped_changedtick = {}
+  s_oversized_notified = {}
+  s_inflight_hl = {}
+  s_inflight_syms = {}
+  s_pending_hl = {}
+  s_pending_syms = {}
+  s_pending_ast = {}
+  s_protocol_version = 0
+enddef
+
+def InvalidateDaemonSession()
+  s_daemon_generation += 1
+  ResetProtocolState()
+enddef
+
+def EventRevisionIsCurrent(ev: dict<any>, buf: number): bool
+  if !bufexists(buf)
+    return false
+  endif
+  var acknowledged = get(s_sent_changedtick, buf, -1)
+  # 缺少 revision 时回退到 acknowledged，兼容旧 daemon。
+  var revision = get(ev, 'revision', acknowledged)
+  return revision == acknowledged && revision == GetChangedTick(buf)
+enddef
+
+def OnDaemonEvent(line: string, generation: number)
+  if generation != s_daemon_generation
+    return
+  endif
   if line ==# ''
     return
   endif
@@ -348,17 +467,39 @@ def OnDaemonEvent(line: string)
   if type(ev) != v:t_dict || !has_key(ev, 'type')
     return
   endif
+  var event_buf = get(ev, 'buf', 0)
+  if event_buf > 0 && get(s_closed_bufs, event_buf, false)
+    Log('Discarded event for closed buffer ' .. event_buf)
+    return
+  endif
   if ev.type ==# 'highlights'
     var buf = get(ev, 'buf', 0)
+    var retry = get(s_pending_hl, buf, false)
+    s_inflight_hl[buf] = false
+    s_pending_hl[buf] = false
     if IsHighlightSuspended(buf)
-      if has_key(s_inflight_hl, buf) | s_inflight_hl[buf] = false | endif
+      return
+    endif
+    if !EventRevisionIsCurrent(ev, buf)
+      Log('Discarded stale highlights for buffer ' .. buf)
+      ScheduleSync(buf)
       return
     endif
     var spans = get(ev, 'spans', [])
     ApplyHighlights(buf, spans)
-    if has_key(s_inflight_hl, buf) | s_inflight_hl[buf] = false | endif
+    if retry
+      ScheduleRequest(buf, 'scroll')
+    endif
   elseif ev.type ==# 'symbols'
     var buf = get(ev, 'buf', 0)
+    var retry = get(s_pending_syms, buf, false)
+    s_inflight_syms[buf] = false
+    s_pending_syms[buf] = false
+    if !EventRevisionIsCurrent(ev, buf)
+      Log('Discarded stale symbols for buffer ' .. buf)
+      ScheduleSync(buf)
+      return
+    endif
     var syms = get(ev, 'symbols', [])
     # 面包屑：保存符号数据
     if buf == s_bc_buf && get(g:, 'simpletreesitter_breadcrumb', 0)
@@ -366,42 +507,111 @@ def OnDaemonEvent(line: string)
       ScheduleBreadcrumbUpdate()
     endif
     ApplySymbols(buf, syms)
-    if has_key(s_inflight_syms, buf) | s_inflight_syms[buf] = false | endif
+    if retry
+      ScheduleSymbols(buf)
+    endif
   elseif ev.type ==# 'ast'
     var buf = get(ev, 'buf', 0)
+    if !EventRevisionIsCurrent(ev, buf)
+      s_pending_ast[buf] = true
+      ScheduleSync(buf)
+      return
+    endif
     var lines = get(ev, 'lines', [])
     ShowAst(buf, lines)
   elseif ev.type ==# 'ok'
     var buf = get(ev, 'buf', 0)
     var op  = get(ev, 'op', '')
     if op ==# 'set_text'
-      if has_key(s_inflight_sync, buf) | s_inflight_sync[buf] = false | endif
-      # 记录最新 changedtick 已同步
-      var ct = GetChangedTick(buf)
-      s_sent_changedtick[buf] = ct
+      # 无对应在途请求的 ACK 必定来自已关闭 buffer 或旧请求，不能复活状态。
+      if !has_key(s_inflight_revision, buf)
+        Log('Ignored set_text ACK without an inflight revision for buffer ' .. buf)
+        return
+      endif
+      var expected = s_inflight_revision[buf]
+      var revision = get(ev, 'revision', expected)
+      if revision != expected
+        Log('Ignored unexpected set_text ACK for buffer ' .. buf)
+        return
+      endif
+      s_inflight_sync[buf] = false
+      if has_key(s_inflight_revision, buf)
+        remove(s_inflight_revision, string(buf))
+      endif
+      s_sent_changedtick[buf] = revision
+      if !bufexists(buf)
+        return
+      endif
+      # ACK 对应发送时的快照，而不是回调时“碰巧”的当前文本。
+      if GetChangedTick(buf) != revision
+        ScheduleSync(buf)
+        return
+      endif
       # 收到 OK 后触发当前缓冲的请求
       if !IsHighlightSuspended(buf)
         ScheduleRequest(buf, 'edit')
       endif
       ScheduleSymbols(buf)
+      if get(s_pending_ast, buf, false)
+        s_pending_ast[buf] = false
+        RequestAstNow(buf)
+      endif
     endif
+  elseif ev.type ==# 'hello'
+    s_protocol_version = get(ev, 'protocol_version', 0)
+    if s_protocol_version < 2 && !s_protocol_notice_shown
+      s_protocol_notice_shown = true
+      echohl WarningMsg
+      echom '[ts-hl] daemon protocol is outdated; run install.sh to rebuild it'
+      echohl None
+    endif
+  elseif ev.type ==# 'status'
+    echom printf('[ts-hl] daemon v%s protocol=%d | cache=%d/%d bytes evicted=%d | parse full=%d incremental=%d unchanged=%d | %s',
+      get(ev, 'version', '?'), get(ev, 'protocol_version', 0), get(ev, 'cached_buffers', 0),
+      get(ev, 'cached_bytes', 0), get(ev, 'cache_evictions', 0), get(ev, 'full_parses', 0),
+      get(ev, 'incremental_parses', 0), get(ev, 'unchanged_syncs', 0),
+      join(get(ev, 'languages', []), ', '))
   elseif ev.type ==# 'error'
     var buf = get(ev, 'buf', 0)
-    echom '[ts-hl] error: ' .. get(ev, 'message', '')
-    # 遇到错误时重置 in-flight，尝试同步文本并重试
+    var message = get(ev, 'message', '')
+    if message =~# 'unknown variant.*hello'
+      s_protocol_version = -1
+      if !s_protocol_notice_shown
+        s_protocol_notice_shown = true
+        echohl WarningMsg
+        echom '[ts-hl] daemon is from an older plugin version; run install.sh to rebuild it'
+        echohl None
+      endif
+      return
+    endif
+    echom '[ts-hl] error: ' .. message
+    # 清掉占用标记；只有 cache 失配才重同步，避免永久错误形成重试风暴。
     if buf > 0
-      if has_key(s_inflight_syms, buf) | s_inflight_syms[buf] = false | endif
-      if has_key(s_inflight_hl, buf)  | s_inflight_hl[buf]  = false | endif
+      s_inflight_syms[buf] = false
+      s_inflight_hl[buf] = false
       s_inflight_sync[buf] = false
-      ScheduleSync(buf)
+      if has_key(s_inflight_revision, buf)
+        remove(s_inflight_revision, string(buf))
+      endif
+      if message =~# 'buffer not cached\|lang mismatch'
+        s_sent_changedtick[buf] = -1
+        ScheduleSync(buf)
+      endif
     endif
   endif
 enddef
 
 def EnsureDaemon(): bool
-  if s_running
-    return true
+  if s_running && s_job != v:null
+    try
+      if job_status(s_job) ==# 'run'
+        return true
+      endif
+    catch
+    endtry
   endif
+  s_running = false
+  s_job = v:null
   var exe = FindDaemon()
   if exe ==# ''
     echohl ErrorMsg
@@ -409,21 +619,33 @@ def EnsureDaemon(): bool
     echohl None
     return false
   endif
+  # 新进程没有任何 buffer cache，必须强制所有 buffer 重新握手。
+  InvalidateDaemonSession()
+  var generation = s_daemon_generation
   try
     s_job = job_start([exe], {
       in_io: 'pipe',
       out_mode: 'nl',
-      out_cb: (ch, l) => OnDaemonEvent(l),
+      out_cb: (ch, l) => OnDaemonEvent(l, generation),
       err_mode: 'nl',
-      err_cb: (ch, l) => Log('daemon stderr: ' .. l),
+      err_cb: (ch, l) => {
+        if generation == s_daemon_generation
+          Log('daemon stderr: ' .. l)
+        endif
+      },
       exit_cb: (ch, code) => {
-        s_running = false
-        s_job = v:null
-        Log('Daemon exited with code ' .. code)
+        if generation == s_daemon_generation
+          s_running = false
+          s_job = v:null
+          InvalidateDaemonSession()
+          Log('Daemon exited with code ' .. code)
+        endif
     },
     stoponexit: 'term'
     })
   catch
+    # job_start() 即使在部分初始化后抛错，也不能留下仍可写入当前状态的 callback。
+    InvalidateDaemonSession()
     s_job = v:null
     s_running = false
     echohl ErrorMsg
@@ -435,19 +657,29 @@ def EnsureDaemon(): bool
   if s_running
     EnsureHlGroupsAndProps()
     Log('Daemon started successfully')
+    Send({type: 'hello', client_protocol: 2})
   endif
   return s_running
 enddef
 
-def Send(req: dict<any>)
+def Send(req: dict<any>): bool
   if !s_running
-    return
+    return false
   endif
   try
     var j = json_encode(req) .. "\n"
     ch_sendraw(s_job, j)
+    return true
   catch
     Log('Failed to send request: ' .. v:exception)
+    var failed_job = s_job
+    s_running = false
+    s_job = v:null
+    InvalidateDaemonSession()
+    if failed_job != v:null
+      try | job_stop(failed_job, 'term') | catch | endtry
+    endif
+    return false
   endtry
 enddef
 
@@ -529,21 +761,63 @@ def GetChangedTick(buf: number): number
 enddef
 
 def SyncBufferNow(buf: number)
+  if !s_enabled || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+    return
+  endif
   if !EnsureDaemon() | return | endif
-  if !bufexists(buf) | return | endif
   var lang = DetectLang(buf)
   if lang ==# '' | return | endif
 
+  # 同一 buffer 只允许一个 set_text 在途；ACK 后会自动发送最新快照。
+  if get(s_inflight_sync, buf, false)
+    return
+  endif
+
   var ct = GetChangedTick(buf)
-  var last_ct = get(s_sent_changedtick, buf, 0)
-  if last_ct == ct && get(s_inflight_sync, buf, false)
+  var last_ct = get(s_sent_changedtick, buf, -1)
+  if last_ct == ct
+    return
+  endif
+
+  var max_bytes = getbufvar(buf, 'simpletreesitter_max_buffer_bytes',
+    get(g:, 'simpletreesitter_max_buffer_bytes', 5242880))
+  if BufferTextExceedsLimit(buf, max_bytes)
+    if get(s_skipped_changedtick, buf, -1) != ct
+      Log('Skipped oversized buffer ' .. buf .. ' (limit=' .. max_bytes .. ' bytes)')
+      ClearOwnProps(1, BufLineCount(buf), buf, get(s_applied_types, buf, []))
+      if has_key(s_last_ranges, buf) | remove(s_last_ranges, string(buf)) | endif
+      if has_key(s_applied_types, buf) | remove(s_applied_types, string(buf)) | endif
+    endif
+    if !get(s_oversized_notified, buf, false)
+      s_oversized_notified[buf] = true
+      echom '[ts-hl] skipped buffer larger than g:simpletreesitter_max_buffer_bytes'
+    endif
+    if last_ct >= 0 && s_protocol_version >= 2
+      Send({type: 'close_buffer', buf: buf})
+    endif
+    if has_key(s_sent_changedtick, buf)
+      remove(s_sent_changedtick, string(buf))
+    endif
+    s_skipped_changedtick[buf] = ct
     return
   endif
 
   var lines = getbufline(buf, 1, '$')
   var text = join(lines, "\n")
+  if getbufvar(buf, '&endofline') && !empty(lines)
+    text ..= "\n"
+  endif
+  if has_key(s_skipped_changedtick, buf)
+    remove(s_skipped_changedtick, string(buf))
+  endif
+  if has_key(s_oversized_notified, buf)
+    remove(s_oversized_notified, string(buf))
+  endif
   s_inflight_sync[buf] = true
-  Send({type: 'set_text', buf: buf, lang: lang, text: text})
+  s_inflight_revision[buf] = ct
+  if !Send({type: 'set_text', buf: buf, lang: lang, text: text, revision: ct})
+    return
+  endif
   Log('Sent set_text for buffer ' .. buf .. ' (changedtick=' .. ct .. ')')
 enddef
 
@@ -552,8 +826,14 @@ def ScheduleSync(buf: number)
   if !IsSupportedLang(buf) | return | endif
 
   var ct = GetChangedTick(buf)
-  var last_ct = get(s_sent_changedtick, buf, 0)
+  if get(s_skipped_changedtick, buf, -1) == ct
+    return
+  endif
+  var last_ct = get(s_sent_changedtick, buf, -1)
   if ct == last_ct && !get(s_inflight_sync, buf, false)
+    return
+  endif
+  if get(s_inflight_sync, buf, false)
     return
   endif
 
@@ -586,7 +866,10 @@ def ScheduleRequest(buf: number, reason: string = 'edit')
 
   # 未同步/正在同步时，先同步文本，跳过这次高亮
   var ct = GetChangedTick(buf)
-  var last_ct = get(s_sent_changedtick, buf, 0)
+  if get(s_skipped_changedtick, buf, -1) == ct
+    return
+  endif
+  var last_ct = get(s_sent_changedtick, buf, -1)
   if ct != last_ct || get(s_inflight_sync, buf, false)
     ScheduleSync(buf)
     return
@@ -628,7 +911,7 @@ def AutoEnableForBuffer(buf: number)
   if index(auto_enable_ft, ft) < 0
     return
   endif
-  if has_key(s_active_bufs, buf) && s_active_bufs[buf]
+  if s_enabled && has_key(s_active_bufs, buf) && s_active_bufs[buf]
     return
   endif
 
@@ -642,9 +925,13 @@ def AutoEnableForBuffer(buf: number)
 enddef
 
 def CheckAndStopDaemon()
+  if s_outline_win != 0 && win_id2win(s_outline_win) != 0
+    return
+  endif
   var has_active = false
   for [bufnr, active] in items(s_active_bufs)
-    if active && bufexists(str2nr(bufnr))
+    var b = str2nr(bufnr)
+    if active && bufexists(b) && len(win_findbuf(b)) > 0
       has_active = true
       break
     endif
@@ -652,6 +939,8 @@ def CheckAndStopDaemon()
   if !has_active && s_enabled && get(g:, 'simpletreesitter_auto_stop', 1)
     Log('No active buffers, stopping daemon')
     Disable()
+    # 自动停机不是用户显式禁用；下一个匹配 buffer 仍可自动启动。
+    s_user_disabled = false
     s_active_bufs = {}
   endif
 enddef
@@ -693,36 +982,33 @@ enddef
 
 # =============== 缩进参考线 ===============
 def EnableIndentGuides()
-  if s_indent_guides_active
-    return
-  endif
-  var sw = &shiftwidth > 0 ? &shiftwidth : (&tabstop > 0 ? &tabstop : 4)
-  if sw < 2
-    return
-  endif
-  var ch = get(g:, 'simpletreesitter_indent_guide_char', '│')
-  var filler = repeat(' ', sw - 1)
-  s_indent_guides_saved_lcs = &l:listchars
-  &l:list = true
-  execute 'setlocal listchars+=' .. 'leadmultispace:' .. ch .. filler
+  ApplyIndentGuidesForBuf()
 enddef
 
 def DisableIndentGuides()
-  if !s_indent_guides_active
-    return
+  var current = win_getid()
+  for [wid_string, saved] in items(s_indent_guide_windows)
+    var wid = str2nr(wid_string)
+    if !empty(getwininfo(wid)) && win_gotoid(wid)
+      try
+        &l:list = get(saved, 'list', false)
+        &l:listchars = get(saved, 'listchars', '')
+      catch
+      endtry
+    endif
+  endfor
+  s_indent_guide_windows = {}
+  if current != 0
+    win_gotoid(current)
   endif
-  s_indent_guides_active = false
-  try
-    &l:listchars = s_indent_guides_saved_lcs
-  catch
-  endtry
 enddef
 
 def ApplyIndentGuidesForBuf()
   if !get(g:, 'simpletreesitter_indent_guides', 0)
     return
   endif
-  if s_indent_guides_active
+  var wid = win_getid()
+  if wid == 0 || has_key(s_indent_guide_windows, wid)
     return
   endif
   var sw = &shiftwidth > 0 ? &shiftwidth : (&tabstop > 0 ? &tabstop : 4)
@@ -731,10 +1017,11 @@ def ApplyIndentGuidesForBuf()
   endif
   var ch = get(g:, 'simpletreesitter_indent_guide_char', '│')
   var filler = repeat(' ', sw - 1)
-  s_indent_guides_saved_lcs = &l:listchars
-  s_indent_guides_active = true
+  s_indent_guide_windows[wid] = {list: &l:list, listchars: &l:listchars}
   &l:list = true
-  execute 'setlocal listchars+=' .. 'leadmultispace:' .. ch .. filler
+  var parts = filter(split(&l:listchars, ','), (_, value) => value !~# '^leadmultispace:')
+  parts->add('leadmultispace:' .. ch .. filler)
+  &l:listchars = join(parts, ',')
 enddef
 
 # =============== 面包屑导航 ===============
@@ -766,7 +1053,7 @@ def SetWinbar(text: string)
 enddef
 
 def UpdateBreadcrumb()
-  if !get(g:, 'simpletreesitter_breadcrumb', 0) || !exists('+winbar')
+  if !get(g:, 'simpletreesitter_breadcrumb', 0)
     return
   endif
   var buf = bufnr('%')
@@ -881,7 +1168,7 @@ def UpdateOutlineCursor()
   if best_idx < 0
     # 清除旧高亮
     if s_outline_cursor_line > 0
-      try | prop_remove({type: 'TsHlOutlineCursor', bufnr: s_outline_buf, all: true}) | catch | endtry
+      try | prop_remove({type: s_outline_cursor_prop, bufnr: s_outline_buf, all: true}) | catch | endtry
       s_outline_cursor_line = 0
     endif
     return
@@ -892,9 +1179,9 @@ def UpdateOutlineCursor()
     return
   endif
   # 更新高亮
-  try | prop_remove({type: 'TsHlOutlineCursor', bufnr: s_outline_buf, all: true}) | catch | endtry
+  try | prop_remove({type: s_outline_cursor_prop, bufnr: s_outline_buf, all: true}) | catch | endtry
   try
-    prop_add(outline_lnum, 1, {type: 'TsHlOutlineCursor', bufnr: s_outline_buf, end_lnum: outline_lnum, end_col: strlen(getbufline(s_outline_buf, outline_lnum)[0]) + 1})
+    prop_add(outline_lnum, 1, {type: s_outline_cursor_prop, bufnr: s_outline_buf, end_lnum: outline_lnum, end_col: strlen(getbufline(s_outline_buf, outline_lnum)[0]) + 1})
   catch
   endtry
   s_outline_cursor_line = outline_lnum
@@ -903,6 +1190,14 @@ enddef
 # =============== 导出 API ===============
 export def Enable()
   if s_enabled
+    if EnsureDaemon()
+      var current = bufnr()
+      if IsSupportedLang(current)
+        s_active_bufs[current] = true
+        ScheduleSync(current)
+        ScheduleRequest(current, 'edit')
+      endif
+    endif
     return
   endif
   if !EnsureDaemon()
@@ -913,23 +1208,47 @@ export def Enable()
 
   augroup TsHl
     autocmd!
-    autocmd BufEnter,BufWinEnter * call simpletreesitter#OnBufEvent(bufnr())
-    autocmd FileType * call simpletreesitter#OnBufEvent(bufnr())
     autocmd TextChanged,TextChangedI * call simpletreesitter#OnBufEvent(bufnr())
     autocmd CursorMoved,CursorMovedI * call simpletreesitter#OnScroll(bufnr())
-    autocmd BufWinLeave,BufDelete * call simpletreesitter#OnBufClose(str2nr(expand('<abuf>')))
+    autocmd BufWinLeave * call simpletreesitter#OnBufWinLeave(str2nr(expand('<abuf>')))
+    autocmd BufUnload,BufDelete,BufWipeout * call simpletreesitter#OnBufClose(str2nr(expand('<abuf>')))
+    autocmd ColorScheme * call simpletreesitter#RefreshHighlightGroups()
   augroup END
+
+  var buf = bufnr()
+  if IsSupportedLang(buf)
+    s_active_bufs[buf] = true
+    ScheduleSync(buf)
+    ScheduleRequest(buf, 'edit')
+  endif
 enddef
 
 export def Disable()
-  if !s_enabled
+  if !s_enabled && !s_running && s_outline_win == 0
+    s_user_disabled = true
     return
   endif
   s_enabled = false
   s_user_disabled = true   # 记录用户主动关闭
+  # 先失效当前会话；随后即使旧 channel 中已有回调排队，也不能重新绘制或调度请求。
+  var job_to_stop = s_job
+  s_running = false
+  s_job = v:null
+  InvalidateDaemonSession()
+  if s_sym_timer != 0
+    try | timer_stop(s_sym_timer) | catch | endtry
+    s_sym_timer = 0
+  endif
+  if s_outline_cursor_timer != 0
+    try | timer_stop(s_outline_cursor_timer) | catch | endtry
+    s_outline_cursor_timer = 0
+  endif
   augroup TsHl
     autocmd!
   augroup END
+  if s_outline_win != 0
+    OutlineClose()
+  endif
   for [k, tid] in items(s_req_timers)
     if tid != 0 && exists('*timer_stop')
       try | call timer_stop(tid) | catch | endtry
@@ -942,17 +1261,14 @@ export def Disable()
     endif
   endfor
   s_sync_timers = {}
-  s_inflight_sync = {}
-  s_sent_changedtick = {}
+  s_active_bufs = {}
   # 新增：关闭时清理所有已绘制的 props（可配置）
   if get(g:, 'simpletreesitter_clear_props_on_disable', 1)
     ClearAllProps()
   endif
-  if s_running && s_job != v:null
+  if job_to_stop != v:null
     try
-      call job_stop(s_job, 'term')
-      s_running = false
-      s_job = v:null
+      call job_stop(job_to_stop, 'term')
       Log('Daemon stopped')
     catch
     endtry
@@ -978,31 +1294,83 @@ export def Toggle()
   endif
 enddef
 
+export def Status()
+  if !s_running
+    echo '[ts-hl] daemon is stopped'
+    return
+  endif
+  if s_protocol_version < 2
+    echo '[ts-hl] daemon protocol is outdated or still negotiating; run install.sh if this persists'
+    return
+  endif
+  if !Send({type: 'status'})
+    echo '[ts-hl] unable to contact daemon'
+  endif
+enddef
+
+# 可用于 Vim 的 statusline：%{simpletreesitter#Breadcrumb()}
+export def Breadcrumb(): string
+  return s_breadcrumb_cache
+enddef
+
+def ShowOutlineMessage(message: string)
+  if s_outline_win == 0 || s_outline_buf == 0 || !bufexists(s_outline_buf)
+    return
+  endif
+  var curwin = win_getid()
+  try
+    if win_gotoid(s_outline_win)
+      setlocal modifiable
+      try | call prop_clear(1, line('$'), {bufnr: s_outline_buf}) | catch | endtry
+      call setline(1, [message])
+      if line('$') > 1
+        try | call deletebufline(s_outline_buf, 2, '$') | catch | endtry
+      endif
+      setlocal nomodifiable
+    endif
+  finally
+    if curwin != 0
+      call win_gotoid(curwin)
+    endif
+  endtry
+enddef
+
 export def OnBufEvent(buf: number)
+  if bufexists(buf) && bufloaded(buf) && has_key(s_closed_bufs, buf)
+    remove(s_closed_bufs, string(buf))
+  endif
   AutoEnableForBuffer(buf)
+  # plugin 级自动命令始终存在；显式禁用或未自动启用时不得偷偷启动 daemon。
+  if !s_enabled
+    return
+  endif
   # 先保证文本同步
+  if IsSupportedLang(buf)
+    s_active_bufs[buf] = true
+    if win_getid() != s_outline_win
+      s_outline_src_win = win_getid()
+    endif
+  endif
   ScheduleSync(buf)
 
   if s_outline_win != 0 && buf != s_outline_buf && getbufvar(buf, '&filetype') !=# 'simpletreesitter_outline'
     if IsSupportedLang(buf)
+      if s_outline_state_buf != buf
+        s_outline_collapsed = {}
+        s_outline_state_buf = buf
+      endif
       s_outline_src_buf = buf
+      s_outline_src_win = win_getid()
+      s_last_outline_sig = ''
       ScheduleSymbols(buf)
     else
-      if s_outline_buf != 0 && bufexists(s_outline_buf)
-        var curwin = win_getid()
-        try
-          if win_gotoid(s_outline_win)
-            setlocal modifiable
-            try | call prop_clear(1, line('$'), {bufnr: s_outline_buf}) | catch | endtry
-            call setline(1, ['<outline unsupported for this filetype>'])
-            setlocal nomodifiable
-          endif
-        finally
-          if curwin != 0
-            call win_gotoid(curwin)
-          endif
-        endtry
-      endif
+      s_outline_src_buf = 0
+      s_outline_src_win = 0
+      s_outline_items = []
+      s_outline_linemap = [-1]
+      s_outline_idx_to_lnum = {}
+      s_last_outline_sig = ''
+      ShowOutlineMessage('<outline unsupported for this filetype>')
     endif
   endif
 
@@ -1011,6 +1379,16 @@ export def OnBufEvent(buf: number)
   # 缩进参考线
   if IsSupportedLang(buf)
     ApplyIndentGuidesForBuf()
+  endif
+enddef
+
+export def RefreshHighlightGroups()
+  EnsureHlGroupsAndProps()
+enddef
+
+export def OnBufWinLeave(buf: number)
+  if exists('*timer_start')
+    timer_start(100, (_) => CheckAndStopDaemon())
   endif
 enddef
 
@@ -1027,11 +1405,43 @@ export def OnScroll(buf: number)
 enddef
 
 export def OnBufClose(buf: number)
+  s_closed_bufs[buf] = true
+  var had_cache = has_key(s_sent_changedtick, buf) || has_key(s_inflight_sync, buf)
   if has_key(s_active_bufs, buf)
     s_active_bufs[buf] = false
   endif
   StopBufTimer(buf)
   StopSyncTimer(buf)
+  if had_cache && s_running && s_protocol_version >= 2
+    Send({type: 'close_buffer', buf: buf})
+  endif
+  for state in [s_inflight_sync, s_pending_ast, s_inflight_syms, s_inflight_hl,
+      s_pending_syms, s_pending_hl, s_oversized_notified]
+    if has_key(state, buf)
+      remove(state, string(buf))
+    endif
+  endfor
+  for state in [s_inflight_revision, s_sent_changedtick, s_skipped_changedtick,
+      s_req_timers, s_sync_timers]
+    if has_key(state, buf)
+      remove(state, string(buf))
+    endif
+  endfor
+  if has_key(s_last_ranges, buf)
+    remove(s_last_ranges, string(buf))
+  endif
+  if has_key(s_applied_types, buf)
+    remove(s_applied_types, string(buf))
+  endif
+  if buf == s_outline_src_buf
+    s_outline_src_buf = 0
+    s_outline_src_win = 0
+    s_outline_items = []
+    s_outline_linemap = [-1]
+    s_outline_idx_to_lnum = {}
+    s_last_outline_sig = ''
+    ShowOutlineMessage('<source buffer closed>')
+  endif
   if exists('*timer_start')
     timer_start(2000, (id) => CheckAndStopDaemon())
   endif
@@ -1040,6 +1450,7 @@ enddef
 def BuildTreeByContainer(syms: list<dict<any>>): list<dict<any>>
   var roots: list<dict<any>> = []
   var containers: dict<any> = {}
+  var nodes: list<dict<any>> = []
   var container_kinds = ['namespace', 'class', 'struct', 'enum', 'type', 'variant', 'function']
 
   def ContainerKey(k: string, n: string, ln: number, co: number): string
@@ -1051,33 +1462,21 @@ def BuildTreeByContainer(syms: list<dict<any>>): list<dict<any>>
   for i in range(len(syms))
     var s = syms[i]
     var kind = get(s, 'kind', '')
+    var name = get(s, 'name', '')
+    var lnum = get(s, 'lnum', 1)
+    var col  = get(s, 'col', 1)
+    var node = {name: name, kind: kind, lnum: lnum, col: col, idx: i, children: []}
+    nodes->add(node)
     if index(container_kinds, kind) >= 0
-      var name = get(s, 'name', '')
-      var lnum = get(s, 'lnum', 1)
-      var col  = get(s, 'col', 1)
-      var node = {name: name, kind: kind, lnum: lnum, col: col, idx: i, children: []}
       var key = ContainerKey(kind, name, lnum, col)
       containers[key] = node
-      roots->add(node)
     endif
   endfor
 
   for i in range(len(syms))
     var s = syms[i]
     var kind = get(s, 'kind', '')
-    var is_container = index(container_kinds, kind) >= 0
-    if is_container
-      continue
-    endif
-
-    var node = {
-      name: get(s, 'name', ''),
-      kind: kind,
-      lnum: get(s, 'lnum', 1),
-      col:  get(s, 'col', 1),
-      idx:  i,
-      children: []
-    }
+    var node = nodes[i]
 
     var ck = get(s, 'container_kind', '')
     var cn = get(s, 'container_name', '')
@@ -1086,16 +1485,18 @@ def BuildTreeByContainer(syms: list<dict<any>>): list<dict<any>>
 
     if type(ck) == v:t_string && ck !=# '' && type(cn) == v:t_string && cn !=# ''
       var pkey = ContainerKey(ck, cn, cl, cc)
-      if has_key(containers, pkey)
+      var ownkey = ContainerKey(kind, get(s, 'name', ''), get(s, 'lnum', 1), get(s, 'col', 1))
+      if pkey !=# ownkey
+        if !has_key(containers, pkey)
+          var parent = {name: cn, kind: ck, lnum: cl, col: cc, idx: -1, children: []}
+          containers[pkey] = parent
+          roots->add(parent)
+        endif
         containers[pkey].children->add(node)
-      else
-        var parent = {name: cn, kind: ck, lnum: cl, col: cc, idx: -1, children: [node]}
-        containers[pkey] = parent
-        roots->add(parent)
+        continue
       endif
-    else
-      roots->add(node)
     endif
+    roots->add(node)
   endfor
 
   return roots
@@ -1290,30 +1691,42 @@ enddef
 
 # =============== 符号请求 ===============
 def RequestSymbolsNow(buf: number)
+  if !s_enabled || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+    return
+  endif
   if !EnsureDaemon() | return | endif
   var lang = DetectLang(buf)
-  if lang ==# '' || !bufexists(buf) | return | endif
+  if lang ==# '' | return | endif
 
   # 未同步/正在同步时先同步
   var ct = GetChangedTick(buf)
-  var last_ct = get(s_sent_changedtick, buf, 0)
+  if get(s_skipped_changedtick, buf, -1) == ct
+    return
+  endif
+  var last_ct = get(s_sent_changedtick, buf, -1)
   if ct != last_ct || get(s_inflight_sync, buf, false)
     ScheduleSync(buf)
     return
   endif
 
   if get(s_inflight_syms, buf, false)
+    s_pending_syms[buf] = true
     return
   endif
   s_inflight_syms[buf] = true
+  s_pending_syms[buf] = false
 
   var [vstart, vend] = VisibleRangeForBufSymbols(buf)
-  var max_items = get(g:, 'simpletreesitter_outline_max_items', 300)
-  Send({type: 'symbols', buf: buf, lang: lang, lstart: vstart, lend: vend, max_items: max_items})
+  var render_limit = get(g:, 'simpletreesitter_outline_max_items', 1000)
+  var scan_limit = max([render_limit, get(g:, 'simpletreesitter_outline_scan_max_items', 5000)])
+  Send({type: 'symbols', buf: buf, lang: lang, lstart: vstart, lend: vend, max_items: scan_limit})
   Log('Requested symbols (range-only) for buffer ' .. buf .. ' ...')
 enddef
 
 def ScheduleSymbols(buf: number)
+  if !s_enabled
+    return
+  endif
   var need_outline = (s_outline_win != 0 && s_outline_src_buf == buf)
   var need_bc = get(g:, 'simpletreesitter_breadcrumb', 0) && IsSupportedLang(buf)
   if !need_outline && !need_bc
@@ -1361,7 +1774,33 @@ def ShowAst(src_buf: number, lines: list<string>)
   endtry
 enddef
 
-# DumpAST 使用缓存
+def RequestAstNow(buf: number)
+  if !s_enabled || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+    return
+  endif
+  if !EnsureDaemon()
+    return
+  endif
+  var lang = DetectLang(buf)
+  if lang ==# ''
+    return
+  endif
+  var ct = GetChangedTick(buf)
+  if get(s_skipped_changedtick, buf, -1) == ct
+    echo '[ts-hl] buffer exceeds g:simpletreesitter_max_buffer_bytes'
+    s_pending_ast[buf] = false
+    return
+  endif
+  if ct != get(s_sent_changedtick, buf, -1) || get(s_inflight_sync, buf, false)
+    s_pending_ast[buf] = true
+    ScheduleSync(buf)
+    return
+  endif
+  s_pending_ast[buf] = false
+  Send({type: 'dump_ast', buf: buf, lang: lang})
+enddef
+
+# DumpAST 使用与当前 changedtick 一致的缓存
 export def DumpAST()
   var buf = bufnr()
   if !bufexists(buf)
@@ -1372,9 +1811,13 @@ export def DumpAST()
     echo '[ts-hl] unsupported filetype for AST'
     return
   endif
-  # 保证先同步
-  ScheduleSync(buf)
-  Send({type: 'dump_ast', buf: buf, lang: lang})
+  if !s_enabled
+    Enable()
+  endif
+  if !s_enabled
+    return
+  endif
+  RequestAstNow(buf)
 enddef
 
 # =============== 渲染符号侧边栏（树形 + 高亮） ===============
@@ -1388,11 +1831,14 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
 
   # 符号 + 折叠状态 + 影响渲染的配置都没变时，跳过整树重建/setline/逐行 prop。
   # symbols 事件常以相同内容重复触发，这一步避免无谓的全量重绘。
-  var sig_parts: list<string> = [string(len(syms))]
+  var sig_parts: list<string> = ['buf=' .. buf, string(len(syms))]
   for s in syms
     sig_parts->add(get(s, 'kind', '') .. ':' .. get(s, 'name', '')
-      .. ':' .. string(get(s, 'lnum', 0)) .. ':' .. string(get(s, 'end_lnum', 0))
-      .. ':' .. get(s, 'container_kind', ''))
+      .. ':' .. string(get(s, 'lnum', 0)) .. ':' .. string(get(s, 'col', 0))
+      .. ':' .. string(get(s, 'end_lnum', 0)) .. ':' .. string(get(s, 'end_col', 0))
+      .. ':' .. get(s, 'container_kind', '') .. ':' .. get(s, 'container_name', '')
+      .. ':' .. string(get(s, 'container_lnum', 0))
+      .. ':' .. string(get(s, 'container_col', 0)))
   endfor
   var collapse_parts: list<string> = []
   for ck in keys(s_outline_collapsed)
@@ -1582,17 +2028,17 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
           endif
           var m = out.meta[i]
           if m.prefix_len > 0
-            try | call prop_add(lnum, 1, {type: 'TsHlOutlineGuide', bufnr: s_outline_buf, end_lnum: lnum, end_col: m.prefix_len + 1}) | catch | endtry
+            try | call prop_add(lnum, 1, {type: s_outline_guide_prop, bufnr: s_outline_buf, end_lnum: lnum, end_col: m.prefix_len + 1}) | catch | endtry
           endif
           var grp = KindToTSGroup(m.kind)
           if m.icon_w > 0
-            try | call prop_add(lnum, m.icon_col, {type: grp, bufnr: s_outline_buf, end_lnum: lnum, end_col: m.icon_col + m.icon_w}) | catch | endtry
+            try | call prop_add(lnum, m.icon_col, {type: HlProp(grp), bufnr: s_outline_buf, end_lnum: lnum, end_col: m.icon_col + m.icon_w}) | catch | endtry
           endif
           if m.name_end > m.name_start
-            try | call prop_add(lnum, m.name_start, {type: grp, bufnr: s_outline_buf, end_lnum: lnum, end_col: m.name_end}) | catch | endtry
+            try | call prop_add(lnum, m.name_start, {type: HlProp(grp), bufnr: s_outline_buf, end_lnum: lnum, end_col: m.name_end}) | catch | endtry
           endif
           if m.pos_start > 0 && m.pos_end > m.pos_start
-            try | call prop_add(lnum, m.pos_start, {type: 'TsHlOutlinePos', bufnr: s_outline_buf, end_lnum: lnum, end_col: m.pos_end}) | catch | endtry
+            try | call prop_add(lnum, m.pos_start, {type: s_outline_pos_prop, bufnr: s_outline_buf, end_lnum: lnum, end_col: m.pos_end}) | catch | endtry
           endif
         endfor
       endif
@@ -1618,13 +2064,34 @@ enddef
 # =============== 侧边栏窗口管理 ===============
 export def OutlineOpen()
   var src = bufnr()
+  if src == s_outline_buf && s_outline_src_buf != 0
+    src = s_outline_src_buf
+  endif
   if !IsSupportedLang(src)
     echo '[ts-hl] outline unsupported for this &filetype'
     return
   endif
-  if !EnsureDaemon()
+  if !s_enabled
+    Enable()
+  endif
+  if !s_enabled || !EnsureDaemon()
     return
   endif
+  var source_win = win_getid() == s_outline_win ? s_outline_src_win : win_getid()
+  if s_outline_win != 0 && win_id2win(s_outline_win) != 0
+    if s_outline_state_buf != src
+      s_outline_collapsed = {}
+      s_outline_state_buf = src
+    endif
+    s_outline_src_buf = src
+    s_outline_src_win = source_win
+    s_last_outline_sig = ''
+    ScheduleSync(src)
+    OutlineRefresh()
+    return
+  endif
+  s_outline_win = 0
+  s_outline_buf = 0
   # 新开/重开 outline 时清空签名，确保首帧一定渲染（不被上一个缓冲的签名误判跳过）。
   s_last_outline_sig = ''
 
@@ -1654,6 +2121,8 @@ export def OutlineOpen()
 
     s_outline_win = win_getid()
     s_outline_src_buf = src
+    s_outline_src_win = source_win
+    s_outline_state_buf = src
 
     var width = get(g:, 'simpletreesitter_outline_width', 32)
     execute 'vertical resize ' .. width
@@ -1688,6 +2157,9 @@ export def OutlineClose()
   s_outline_idx_to_lnum = {}
   s_last_outline_sig = ''
   s_outline_src_buf = 0
+  s_outline_src_win = 0
+  s_outline_state_buf = 0
+  s_outline_collapsed = {}
   Log('[ts-hl] outline closed')
 
   # 全局暂停 -> 恢复：关闭后主动刷新所有活跃缓冲
@@ -1728,10 +2200,26 @@ export def OutlineJump()
   var col  = get(it, 'col', 1)
 
   var wins = win_findbuf(s_outline_src_buf)
-  if len(wins) > 0
-    call win_gotoid(wins[0])
+  var target = 0
+  if s_outline_src_win != 0 && index(wins, s_outline_src_win) >= 0
+    target = s_outline_src_win
   else
+    for wid in wins
+      if wid != s_outline_win
+        target = wid
+        break
+      endif
+    endfor
+  endif
+  if target != 0
+    call win_gotoid(target)
+  else
+    if s_outline_win == 0 || !win_gotoid(s_outline_win)
+      return
+    endif
+    execute 'keepalt leftabove vsplit'
     execute 'buffer ' .. s_outline_src_buf
+    s_outline_src_win = win_getid()
   endif
   call cursor(lnum, col)
   normal! zv
@@ -1775,19 +2263,41 @@ enddef
 
 # =============== 请求调度 ===============
 def RequestNow(buf: number)
+  if !s_enabled || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+    return
+  endif
   if !EnsureDaemon() | return | endif
   var lang = DetectLang(buf)
-  if lang ==# '' || !bufexists(buf) | return | endif
+  if lang ==# '' | return | endif
   if IsHighlightSuspended(buf)
     return
   endif
 
+  var ct = GetChangedTick(buf)
+  if get(s_skipped_changedtick, buf, -1) == ct
+    return
+  endif
+  if ct != get(s_sent_changedtick, buf, -1) || get(s_inflight_sync, buf, false)
+    ScheduleSync(buf)
+    return
+  endif
+
   if get(s_inflight_hl, buf, false)
+    s_pending_hl[buf] = true
     return
   endif
   s_inflight_hl[buf] = true
+  s_pending_hl[buf] = false
 
   var [hstart, hend] = VisibleRangeForBuf(buf)
-  Send({type: 'highlight', buf: buf, lang: lang, lstart: hstart, lend: hend})
+  Send({
+    type: 'highlight',
+    buf: buf,
+    lang: lang,
+    lstart: hstart,
+    lend: hend,
+    rainbow: get(g:, 'simpletreesitter_rainbow_brackets', 1) ? true : false,
+    max_spans: get(g:, 'simpletreesitter_max_props', 20000),
+  })
   Log('Requested highlight (range-only) for buffer ' .. buf .. ' ...')
 enddef

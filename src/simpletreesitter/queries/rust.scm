@@ -13,8 +13,17 @@
 (boolean_literal) @boolean  ; 正确：这是节点类型
 
 ; ----- keywords -----
-((identifier) @keyword
-  (#match? @keyword "^(let|fn|mod|struct|enum|impl|trait|for|while|loop|if|else|match|return|use|pub|const|static|mut|ref|as|where|in|move|unsafe|async|await|dyn|crate|super|self)$"))
+[
+  "as" "async" "await" "break" "const" "continue" "default" "dyn"
+  "else" "enum" "extern" "fn" "for" "gen" "if" "impl" "in" "let"
+  "loop" "macro_rules!" "match" "mod" "move" "pub" "raw" "ref"
+  "return" "static" "struct" "trait" "type" "union" "unsafe" "use"
+  "where" "while" "yield"
+] @keyword
+(crate) @keyword
+(mutable_specifier) @keyword
+(super) @keyword
+(self) @variable.builtin
 
 ; ----- functions / methods / types -----
 (function_item name: (identifier) @function)
