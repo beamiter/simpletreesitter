@@ -21,7 +21,12 @@ large buffers stay cheap to keep in sync.
 
 Supported filetypes: rust, c, cpp, cc, javascript, javascriptreact, jsx,
 typescript, typescriptreact, python, go, sh, bash, zsh, vim, vimrc, json,
-jsonc, yaml, toml, lua, html and css.
+jsonc, yaml, toml, lua, html, css and markdown.
+
+Markdown uses two grammars: the block grammar drives structure (headings,
+fences, lists, tables) and a second inline tree — parsed only inside the
+block tree's inline ranges — adds emphasis, code spans and links.  The
+Outline shows the heading hierarchy (h1..h6 map to distinct symbol kinds).
 
 ===============================================================================
 2. REQUIREMENTS                              *simpletreesitter-requirements*

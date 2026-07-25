@@ -24,6 +24,7 @@ const SUPPORTED_LANGUAGES: &[&str] = &[
     "lua",
     "html",
     "css",
+    "markdown",
 ];
 const PROTOCOL_VERSION: u32 = 3;
 
@@ -213,6 +214,9 @@ struct BufCache {
     lang: String,
     text: String,
     tree: tree_sitter::Tree,
+    // Markdown 内联语法树：用 included_ranges 限定在块树的 inline 节点上，
+    // 每次同步整体重建（inline 解析本身很快，无需增量）。
+    inline_tree: Option<tree_sitter::Tree>,
     revision: u64,
     line_index: SparseLineIndex,
 }
@@ -236,6 +240,9 @@ struct LangQueries {
     language: tree_sitter::Language,
     hl_query: tree_sitter::Query,
     sym_query: tree_sitter::Query,
+    // 第二语法（目前仅 markdown 的 inline 语法）及其高亮查询。
+    inline_language: Option<tree_sitter::Language>,
+    inline_hl_query: Option<tree_sitter::Query>,
 }
 
 struct Server {
@@ -362,6 +369,11 @@ impl Server {
                 queries::CSS_QUERY,
                 queries::CSS_SYM_QUERY,
             ),
+            "markdown" => (
+                tree_sitter_md::LANGUAGE.into(),
+                queries::MD_QUERY,
+                queries::MD_SYM_QUERY,
+            ),
             _ => return Err(anyhow!("unsupported language: {lang}")),
         };
         Ok((language, hl_query, sym_query))
@@ -372,12 +384,22 @@ impl Server {
             let (language, hl_src, sym_src) = Self::lang_info(lang)?;
             let hl_query = tree_sitter::Query::new(&language, hl_src)?;
             let sym_query = tree_sitter::Query::new(&language, sym_src)?;
+            let (inline_language, inline_hl_query) = if lang == "markdown" {
+                let inline_language: tree_sitter::Language = tree_sitter_md::INLINE_LANGUAGE.into();
+                let inline_hl_query =
+                    tree_sitter::Query::new(&inline_language, queries::MD_INLINE_QUERY)?;
+                (Some(inline_language), Some(inline_hl_query))
+            } else {
+                (None, None)
+            };
             self.queries.insert(
                 lang.to_string(),
                 LangQueries {
                     language,
                     hl_query,
                     sym_query,
+                    inline_language,
+                    inline_hl_query,
                 },
             );
         }
@@ -444,6 +466,7 @@ impl Server {
             self.full_parses += 1;
             ParseMode::Full
         };
+        let inline_tree = self.parse_inline_tree(lang, &tree, &text)?;
         self.reserve_cache_capacity(buf, text.len());
         let line_index = SparseLineIndex::new(&text);
         self.cache.insert(
@@ -452,11 +475,43 @@ impl Server {
                 lang: lang.to_string(),
                 text,
                 tree,
+                inline_tree,
                 revision,
                 line_index,
             },
         );
         Ok(mode)
+    }
+
+    /// Markdown 专用：收集块树里的 inline 节点区间，用 inline 语法在这些
+    /// included_ranges 上整体解析出第二棵树。其他语言返回 None。
+    fn parse_inline_tree(
+        &mut self,
+        lang: &str,
+        block_tree: &tree_sitter::Tree,
+        text: &str,
+    ) -> Result<Option<tree_sitter::Tree>> {
+        let Some(inline_language) = self
+            .queries
+            .get(lang)
+            .and_then(|q| q.inline_language.clone())
+        else {
+            return Ok(None);
+        };
+        let mut ranges: Vec<tree_sitter::Range> = Vec::new();
+        collect_named_ranges(block_tree.root_node(), "inline", &mut ranges);
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let key = format!("{lang}-inline");
+        let p = self.parser_for(&key, inline_language)?;
+        p.set_included_ranges(&ranges)?;
+        let result = p
+            .parse(text, None)
+            .ok_or_else(|| anyhow!("inline parse failed"));
+        // 无条件恢复默认（整篇）解析区间，避免污染复用的 parser。
+        p.set_included_ranges(&[])?;
+        Ok(Some(result?))
     }
 
     /// Apply a line-range splice reported by the editor, then reuse the normal
@@ -975,15 +1030,15 @@ fn run_highlight_cached(
     let cache = server.get_cache(buf, lang)?;
     let bytes = cache.text.as_bytes();
     let root = cache.tree.root_node();
-    let query = &server.queries.get(&cache.lang).unwrap().hl_query;
-    let mut cursor = tree_sitter::QueryCursor::new();
+    let lang_queries = server.queries.get(&cache.lang).unwrap();
 
-    if let Some((ls, le)) = lrange {
-        let b_range = expand_range_for_multiline_token(
-            root,
-            line_range_from_index(&cache.line_index, &cache.text, ls, le),
-        );
-        cursor.set_byte_range(b_range);
+    // 主查询之外，markdown 还有一棵内联树要跑第二遍高亮。
+    let mut passes: Vec<(&tree_sitter::Query, tree_sitter::Node)> =
+        vec![(&lang_queries.hl_query, root)];
+    if let (Some(inline_query), Some(inline_tree)) =
+        (&lang_queries.inline_hl_query, &cache.inline_tree)
+    {
+        passes.push((inline_query, inline_tree.root_node()));
     }
 
     let mut spans = Vec::with_capacity(4096);
@@ -993,60 +1048,70 @@ fn run_highlight_cached(
     // Dedup by an explicit semantic priority. Capture iteration is ordered by
     // source position, but same-range pattern ordering is not an API contract.
     let mut seen = HashMap::<(u32, u32, u32, u32), (usize, u8)>::new();
-    let mut it = cursor.captures(query, root, bytes);
-    while let Some((m, cap_ix)) = it.next() {
-        let cap = m.captures[*cap_ix];
-        let node = cap.node;
-        if node.start_byte() >= node.end_byte() {
-            continue;
-        }
-        let sp = node.start_position();
-        let ep = node.end_position();
-
-        let lnum = sp.row as u32 + 1;
-        let col = sp.column as u32 + 1;
-        let end_lnum = ep.row as u32 + 1;
-        let end_col = ep.column as u32 + 1;
-
+    'passes: for (query, pass_root) in passes {
+        let mut cursor = tree_sitter::QueryCursor::new();
         if let Some((ls, le)) = lrange {
-            if end_lnum < ls || lnum > le {
+            let b_range = expand_range_for_multiline_token(
+                pass_root,
+                line_range_from_index(&cache.line_index, &cache.text, ls, le),
+            );
+            cursor.set_byte_range(b_range);
+        }
+        let mut it = cursor.captures(query, pass_root, bytes);
+        while let Some((m, cap_ix)) = it.next() {
+            let cap = m.captures[*cap_ix];
+            let node = cap.node;
+            if node.start_byte() >= node.end_byte() {
                 continue;
             }
-        }
+            let sp = node.start_position();
+            let ep = node.end_position();
 
-        let key = (lnum, col, end_lnum, end_col);
-        let cname = query.capture_names()[cap.index as usize];
-        let priority = capture_priority(cname);
-        let group = map_capture_to_group(cname).to_string();
-        if group.is_empty() {
-            continue;
-        }
-        let depth = if rainbow && cname == "punctuation.bracket" {
-            let d = bracket_depth(node);
-            if d > 0 { Some(d) } else { None }
-        } else {
-            None
-        };
-        let span = Span {
-            lnum,
-            col,
-            end_lnum,
-            end_col,
-            group,
-            depth,
-        };
-        if let Some((index, old_priority)) = seen.get_mut(&key) {
-            if priority > *old_priority {
-                spans[*index] = span;
-                *old_priority = priority;
+            let lnum = sp.row as u32 + 1;
+            let col = sp.column as u32 + 1;
+            let end_lnum = ep.row as u32 + 1;
+            let end_col = ep.column as u32 + 1;
+
+            if let Some((ls, le)) = lrange {
+                if end_lnum < ls || lnum > le {
+                    continue;
+                }
             }
-            continue;
+
+            let key = (lnum, col, end_lnum, end_col);
+            let cname = query.capture_names()[cap.index as usize];
+            let priority = capture_priority(cname);
+            let group = map_capture_to_group(cname).to_string();
+            if group.is_empty() {
+                continue;
+            }
+            let depth = if rainbow && cname == "punctuation.bracket" {
+                let d = bracket_depth(node);
+                if d > 0 { Some(d) } else { None }
+            } else {
+                None
+            };
+            let span = Span {
+                lnum,
+                col,
+                end_lnum,
+                end_col,
+                group,
+                depth,
+            };
+            if let Some((index, old_priority)) = seen.get_mut(&key) {
+                if priority > *old_priority {
+                    spans[*index] = span;
+                    *old_priority = priority;
+                }
+                continue;
+            }
+            if spans.len() >= limit {
+                break 'passes;
+            }
+            seen.insert(key, (spans.len(), priority));
+            spans.push(span);
         }
-        if spans.len() >= limit {
-            break;
-        }
-        seen.insert(key, (spans.len(), priority));
-        spans.push(span);
     }
 
     Ok((cache.revision, spans))
@@ -2152,6 +2217,14 @@ fn map_capture_to_group(name: &str) -> &'static str {
         "macro" => "TSMacro",
         "attribute" => "TSAttribute",
 
+        "text.title" => "TSTitle",
+        "text.literal" => "TSLiteral",
+        "text.emphasis" => "TSEmphasis",
+        "text.strong" => "TSStrong",
+        "text.strike" => "TSStrike",
+        "text.uri" => "TSURI",
+        "text.reference" => "TSLink",
+
         _ => "",
     }
 }
@@ -2183,6 +2256,18 @@ fn is_ident_char(b: u8) -> bool {
 fn node_text(node: tree_sitter::Node, bytes: &[u8]) -> String {
     let s = &bytes[node.start_byte()..node.end_byte()];
     String::from_utf8_lossy(s).to_string()
+}
+
+/// 收集树中指定 kind 的全部节点区间（不递归进匹配到的节点内部）。
+fn collect_named_ranges(node: tree_sitter::Node, kind: &str, out: &mut Vec<tree_sitter::Range>) {
+    if node.kind() == kind {
+        out.push(node.range());
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_named_ranges(child, kind, out);
+    }
 }
 
 // ---- Rust-specific helpers (保持不变) ----
@@ -2606,8 +2691,82 @@ mod tests {
                     "{lang} symbol query pattern {pattern} has an unhandled general predicate"
                 );
             }
+            if let Some(inline_query) = &queries.inline_hl_query {
+                for capture in inline_query.capture_names() {
+                    assert!(
+                        !map_capture_to_group(capture).is_empty(),
+                        "{lang} has unmapped inline highlight capture @{capture}"
+                    );
+                }
+                for pattern in 0..inline_query.pattern_count() {
+                    assert!(
+                        inline_query.general_predicates(pattern).is_empty(),
+                        "{lang} inline query pattern {pattern} has an unhandled general predicate"
+                    );
+                }
+            }
         }
         assert_eq!(server.queries.len(), SUPPORTED_LANGUAGES.len());
+        assert!(
+            server
+                .queries
+                .get("markdown")
+                .is_some_and(|q| q.inline_hl_query.is_some()),
+            "markdown must compile an inline highlight query"
+        );
+    }
+
+    #[test]
+    fn markdown_highlights_symbols_and_inline_tree() {
+        let mut server = Server::new();
+        let source = "# Top\n\nSome *emphasis*, **strong**, `code span` and \
+                      [a link](https://example.com).\n\n## Second level\n\n\
+                      ```rust\nfn main() {}\n```\n\n- [x] done task\n\n\
+                      Setext Title\n============\n";
+        server
+            .set_text(9, "markdown", source.to_string(), 1)
+            .expect("markdown parse");
+        assert!(
+            server.cache.get(&9).unwrap().inline_tree.is_some(),
+            "inline tree must be built for markdown"
+        );
+
+        let (_, spans) =
+            run_highlight_cached(&mut server, 9, "markdown", None, false, None).unwrap();
+        let groups: Vec<&str> = spans.iter().map(|s| s.group.as_str()).collect();
+        for expected in [
+            "TSTitle",    // headings (block)
+            "TSEmphasis", // *emphasis* (inline)
+            "TSStrong",   // **strong** (inline)
+            "TSLiteral",  // `code span` + fenced content
+            "TSLink",     // [a link]
+            "TSURI",      // (https://example.com)
+            "TSType",     // fence info string "rust"
+            "TSBoolean",  // task list marker
+        ] {
+            assert!(
+                groups.contains(&expected),
+                "missing {expected} in {groups:?}"
+            );
+        }
+
+        let (_, symbols) = run_symbols_cached(&mut server, 9, "markdown", None, None).unwrap();
+        let names: Vec<(&str, &str)> = symbols
+            .iter()
+            .map(|s| (s.kind.as_str(), s.name.as_str()))
+            .collect();
+        assert!(names.contains(&("namespace", "Top")), "{names:?}");
+        assert!(names.contains(&("class", "Second level")), "{names:?}");
+        assert!(names.contains(&("namespace", "Setext Title")), "{names:?}");
+
+        // Plain text without emphasis/links: the inline pass must not panic and
+        // the block-only path still renders. Also exercises the resync path.
+        server
+            .set_text(9, "markdown", "# Only heading\n".to_string(), 2)
+            .expect("markdown reparse");
+        let (_, spans) =
+            run_highlight_cached(&mut server, 9, "markdown", None, false, None).unwrap();
+        assert!(spans.iter().any(|s| s.group == "TSTitle"));
     }
 
     #[test]

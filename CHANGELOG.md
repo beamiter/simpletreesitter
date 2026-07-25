@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 — 2026-07-25
+
+- Added Markdown (GFM) support with a dual-tree pipeline: the block grammar
+  parses structure while an inline grammar parses only the block tree's
+  `inline` ranges (via `included_ranges`), giving emphasis, strong, code
+  spans, links and autolinks without a full injection engine. The inline
+  tree is rebuilt on each sync; the block tree stays incremental.
+- Outline for Markdown shows the heading hierarchy: h1..h6 map to distinct
+  symbol kinds, and setext headings are supported.
+- New prose highlight groups: `TSTitle`, `TSLiteral`, `TSEmphasis`,
+  `TSStrong`, `TSStrike`, `TSURI`, `TSLink` (linked to sensible defaults,
+  overridable like every other `TS*` group).
+
 ## 0.4.0 — 2026-07-25
 
 - Added three languages: Lua, HTML and CSS, each with highlight and symbol

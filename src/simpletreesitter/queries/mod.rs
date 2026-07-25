@@ -36,3 +36,6 @@ pub const HTML_QUERY: &str = include_str!("html.scm");
 pub const HTML_SYM_QUERY: &str = include_str!("html_symbols.scm");
 pub const CSS_QUERY: &str = include_str!("css.scm");
 pub const CSS_SYM_QUERY: &str = include_str!("css_symbols.scm");
+pub const MD_QUERY: &str = include_str!("markdown.scm");
+pub const MD_SYM_QUERY: &str = include_str!("markdown_symbols.scm");
+pub const MD_INLINE_QUERY: &str = include_str!("markdown_inline.scm");

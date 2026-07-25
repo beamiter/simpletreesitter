@@ -74,6 +74,8 @@ const s_groups = [
   'TSProperty', 'TSField',
   'TSMacro', 'TSAttribute',
   'TSVariant',
+  'TSTitle', 'TSLiteral', 'TSEmphasis', 'TSStrong', 'TSStrike',
+  'TSURI', 'TSLink',
   'TSRainbow1', 'TSRainbow2', 'TSRainbow3',
   'TSRainbow4', 'TSRainbow5', 'TSRainbow6'
   ]
@@ -105,6 +107,7 @@ const s_language_by_filetype = {
   lua: 'lua',
   html: 'html',
   css: 'css',
+  markdown: 'markdown',
 }
 
 # =============== 面包屑状态 ===============
@@ -228,6 +231,15 @@ def EnsureHlGroupsAndProps()
   highlight default link TSMacro Macro
   highlight default link TSAttribute PreProc
   highlight default link TSVariant Constant
+
+  # Markdown / prose
+  highlight default link TSTitle Title
+  highlight default link TSLiteral String
+  highlight default TSEmphasis cterm=italic gui=italic
+  highlight default TSStrong cterm=bold gui=bold
+  highlight default TSStrike cterm=strikethrough gui=strikethrough
+  highlight default link TSURI Underlined
+  highlight default link TSLink Identifier
 
   # Rainbow brackets
   highlight default TSRainbow1 ctermfg=168 guifg=#e06c75
