@@ -10,14 +10,19 @@ mod queries;
 const SUPPORTED_LANGUAGES: &[&str] = &[
     "rust",
     "javascript",
+    "typescript",
+    "tsx",
     "c",
     "cpp",
     "python",
     "go",
     "bash",
     "vim",
+    "json",
+    "yaml",
+    "toml",
 ];
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 
 const MAX_AST_NODES: usize = 50_000;
 const MAX_AST_DEPTH: usize = 512;
@@ -27,6 +32,7 @@ const MAX_CACHED_BUFFERS: usize = 128;
 const MAX_CACHED_SOURCE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_HIGHLIGHT_SPANS: usize = 100_000;
 const MAX_SYMBOLS: usize = 100_000;
+const MAX_FOLDS: usize = 50_000;
 const LINE_INDEX_STRIDE: usize = 256;
 
 fn default_true() -> bool {
@@ -43,6 +49,23 @@ enum Request {
         text: String,
         #[serde(default)]
         revision: u64,
+    },
+    #[serde(rename = "edit_lines")]
+    EditLines {
+        buf: i64,
+        lang: String,
+        #[serde(default)]
+        revision: u64,
+        /// 1-based first replaced line.
+        lstart: u32,
+        /// Exclusive 1-based end of the replaced old range.
+        old_lend: u32,
+        #[serde(default)]
+        lines: Vec<String>,
+        /// Expected total line count after the edit; a mismatch forces a full resync.
+        line_count: u64,
+        #[serde(default = "default_true")]
+        eol: bool,
     },
     #[serde(rename = "highlight")]
     Highlight {
@@ -65,6 +88,13 @@ enum Request {
         lstart: Option<u32>,
         #[serde(default)]
         lend: Option<u32>,
+        #[serde(default)]
+        max_items: Option<usize>,
+    },
+    #[serde(rename = "folds")]
+    Folds {
+        buf: i64,
+        lang: String,
         #[serde(default)]
         max_items: Option<usize>,
     },
@@ -101,6 +131,12 @@ enum Event {
         buf: i64,
         revision: u64,
         lines: Vec<String>,
+    },
+    #[serde(rename = "folds")]
+    Folds {
+        buf: i64,
+        revision: u64,
+        folds: Vec<Fold>,
     },
     #[serde(rename = "ok")]
     Ok {
@@ -144,6 +180,13 @@ struct Span {
     group: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     depth: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct Fold {
+    lnum: u32,
+    end_lnum: u32,
+    level: u32,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -205,6 +248,15 @@ struct Server {
     cache_evictions: u64,
 }
 
+/// Line-range replacement payload for `edit_lines`.
+struct LineSplice {
+    lstart: u32,
+    old_lend: u32,
+    lines: Vec<String>,
+    line_count: u64,
+    eol: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParseMode {
     Full,
@@ -236,6 +288,31 @@ impl Server {
                 tree_sitter_javascript::LANGUAGE.into(),
                 queries::JS_QUERY,
                 queries::JS_SYM_QUERY,
+            ),
+            "typescript" => (
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                queries::TS_QUERY,
+                queries::TS_SYM_QUERY,
+            ),
+            "tsx" => (
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                queries::TSX_QUERY,
+                queries::TS_SYM_QUERY,
+            ),
+            "json" => (
+                tree_sitter_json::LANGUAGE.into(),
+                queries::JSON_QUERY,
+                queries::JSON_SYM_QUERY,
+            ),
+            "yaml" => (
+                tree_sitter_yaml::LANGUAGE.into(),
+                queries::YAML_QUERY,
+                queries::YAML_SYM_QUERY,
+            ),
+            "toml" => (
+                tree_sitter_toml_ng::LANGUAGE.into(),
+                queries::TOML_QUERY,
+                queries::TOML_SYM_QUERY,
             ),
             "c" => (
                 tree_sitter_c::LANGUAGE.into(),
@@ -362,6 +439,84 @@ impl Server {
             },
         );
         Ok(mode)
+    }
+
+    /// Apply a line-range splice reported by the editor, then reuse the normal
+    /// `set_text` path for incremental parsing.
+    ///
+    /// `lstart`/`old_lend` are 1-based with an exclusive end, expressed against
+    /// the last synced text. `line_count` is the expected total line count after
+    /// the edit; any mismatch drops the cache so the client falls back to a full
+    /// `set_text` instead of silently diverging from the buffer.
+    fn edit_lines(
+        &mut self,
+        buf: i64,
+        lang: &str,
+        revision: u64,
+        splice: LineSplice,
+    ) -> Result<ParseMode> {
+        let cache = self
+            .cache
+            .get(&buf)
+            .ok_or_else(|| anyhow!("buffer not cached: {buf}"))?;
+        if cache.lang != lang {
+            return Err(anyhow!(
+                "lang mismatch for buf {buf}: cached={}, req={}",
+                cache.lang,
+                lang
+            ));
+        }
+
+        // 还原为逻辑行；缓存文本总是 join(lines, "\n") + (eol ? "\n" : "")。
+        let spliced: Result<String> = {
+            let old_text = cache.text.as_str();
+            let body = old_text.strip_suffix('\n').unwrap_or(old_text);
+            let old_lines: Vec<&str> = body.split('\n').collect();
+
+            let start = splice.lstart.max(1) as usize - 1;
+            let end = splice.old_lend.max(1) as usize - 1;
+            if start > old_lines.len() || end > old_lines.len() || end < start {
+                Err(anyhow!(
+                    "edit_lines mismatch for buf {buf}: splice {}..{} outside {} lines",
+                    splice.lstart,
+                    splice.old_lend,
+                    old_lines.len()
+                ))
+            } else {
+                let new_total = old_lines.len() - (end - start) + splice.lines.len();
+                if new_total as u64 != splice.line_count {
+                    Err(anyhow!(
+                        "edit_lines mismatch for buf {buf}: expected {} lines, spliced {new_total}",
+                        splice.line_count
+                    ))
+                } else {
+                    let added_bytes: usize = splice.lines.iter().map(|line| line.len() + 1).sum();
+                    let mut text = String::with_capacity(old_text.len() + added_bytes + 1);
+                    for line in old_lines[..start]
+                        .iter()
+                        .copied()
+                        .chain(splice.lines.iter().map(String::as_str))
+                        .chain(old_lines[end..].iter().copied())
+                    {
+                        text.push_str(line);
+                        text.push('\n');
+                    }
+                    if !splice.eol {
+                        text.pop();
+                    }
+                    Ok(text)
+                }
+            }
+        };
+
+        match spliced {
+            Ok(text) => self.set_text(buf, lang, text, revision),
+            Err(error) => {
+                // 失配说明客户端与缓存已经分叉；丢掉缓存，强制下一次全量同步。
+                self.cache.remove(&buf);
+                Err(error)
+            }
+        }
     }
 
     fn reserve_cache_capacity(&mut self, current_buf: i64, incoming_bytes: usize) {
@@ -514,6 +669,41 @@ fn main() -> Result<()> {
                     },
                 )?,
             },
+            Request::EditLines {
+                buf,
+                lang,
+                revision,
+                lstart,
+                old_lend,
+                lines,
+                line_count,
+                eol,
+            } => {
+                let splice = LineSplice {
+                    lstart,
+                    old_lend,
+                    lines,
+                    line_count,
+                    eol,
+                };
+                match server.edit_lines(buf, &lang, revision, splice) {
+                    Ok(_) => send(
+                        &mut out,
+                        &Event::Ok {
+                            buf,
+                            op: "edit_lines".to_string(),
+                            revision: Some(revision),
+                        },
+                    )?,
+                    Err(e) => send(
+                        &mut out,
+                        &Event::Error {
+                            message: e.to_string(),
+                            buf: Some(buf),
+                        },
+                    )?,
+                }
+            }
             Request::Highlight {
                 buf,
                 lang,
@@ -567,6 +757,27 @@ fn main() -> Result<()> {
                     )?,
                 }
             }
+            Request::Folds {
+                buf,
+                lang,
+                max_items,
+            } => match run_folds_cached(&server, buf, &lang, max_items) {
+                Ok((revision, folds)) => send(
+                    &mut out,
+                    &Event::Folds {
+                        buf,
+                        revision,
+                        folds,
+                    },
+                )?,
+                Err(e) => send(
+                    &mut out,
+                    &Event::Error {
+                        message: e.to_string(),
+                        buf: Some(buf),
+                    },
+                )?,
+            },
             Request::DumpAst { buf, lang } => match dump_ast_cached(&mut server, buf, &lang) {
                 Ok((revision, lines)) => send(
                     &mut out,
@@ -621,6 +832,8 @@ fn main() -> Result<()> {
                             "close_buffer",
                             "status",
                             "bounded_results",
+                            "edit_lines",
+                            "folds",
                         ],
                     },
                 )?;
@@ -972,6 +1185,82 @@ fn run_symbols_cached(
                         clnum = Some(ln);
                         ccol = Some(co);
                     }
+                }
+            }
+        }
+
+        // TypeScript/TSX 容器推断：method/field → class/interface，variant → enum
+        if cache.lang == "typescript" || cache.lang == "tsx" {
+            if kind == "method" || kind == "field" {
+                for (ancestor, container_kind, name_kind) in [
+                    ("class_declaration", "class", "type_identifier"),
+                    ("abstract_class_declaration", "class", "type_identifier"),
+                    ("interface_declaration", "type", "type_identifier"),
+                ] {
+                    if let Some(cls) = ancestor_kind(node, ancestor)
+                        && let Some(cls_name) = child_text_by_kind(cls, name_kind, bytes)
+                        && let Some((ln, co)) = child_pos_by_kind(cls, name_kind)
+                    {
+                        ckind = Some(container_kind.to_string());
+                        cname_opt = Some(cls_name);
+                        clnum = Some(ln);
+                        ccol = Some(co);
+                        break;
+                    }
+                }
+            } else if kind == "variant"
+                && let Some(en) = ancestor_kind(node, "enum_declaration")
+                && let Some(enum_name) = child_text_by_kind(en, "identifier", bytes)
+                && let Some((ln, co)) = child_pos_by_kind(en, "identifier")
+            {
+                ckind = Some("enum".to_string());
+                cname_opt = Some(enum_name);
+                clnum = Some(ln);
+                ccol = Some(co);
+            }
+        }
+
+        // JSON/YAML 容器推断：二级键 → 顶层键
+        if (cache.lang == "json" || cache.lang == "yaml") && kind == "field" {
+            let pair_kind = if cache.lang == "json" {
+                "pair"
+            } else {
+                "block_mapping_pair"
+            };
+            let key_kind = if cache.lang == "json" {
+                "string_content"
+            } else {
+                "string_scalar"
+            };
+            if let Some(own_pair) = ancestor_kind(node, pair_kind)
+                && let Some(outer_pair) = ancestor_kind(own_pair, pair_kind)
+                && let Some(key_node) = outer_pair
+                    .child_by_field_name("key")
+                    .and_then(|key| descendant_by_kind(key, key_kind))
+            {
+                let sp = key_node.start_position();
+                ckind = Some("property".to_string());
+                cname_opt = Some(node_text(key_node, bytes));
+                clnum = Some(sp.row as u32 + 1);
+                ccol = Some(sp.column as u32 + 1);
+            }
+        }
+
+        // TOML 容器推断：pair → table
+        if cache.lang == "toml"
+            && kind == "property"
+            && let Some(table) =
+                ancestor_kind(node, "table").or_else(|| ancestor_kind(node, "table_array_element"))
+        {
+            for key_kind in ["bare_key", "dotted_key", "quoted_key"] {
+                if let Some(key_name) = child_text_by_kind(table, key_kind, bytes)
+                    && let Some((ln, co)) = child_pos_by_kind(table, key_kind)
+                {
+                    ckind = Some("namespace".to_string());
+                    cname_opt = Some(key_name);
+                    clnum = Some(ln);
+                    ccol = Some(co);
+                    break;
                 }
             }
         }
@@ -1439,6 +1728,132 @@ fn run_symbols_cached(
     Ok((cache.revision, symbols))
 }
 
+/// Node kinds that produce folds per language. Plain string matching keeps
+/// this table cheap and tolerant: a kind absent from a grammar simply never
+/// matches.
+fn foldable_kinds(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "rust" => &[
+            "function_item",
+            "impl_item",
+            "mod_item",
+            "struct_item",
+            "enum_item",
+            "trait_item",
+            "macro_definition",
+            "match_expression",
+            "block",
+        ],
+        "c" | "cpp" => &[
+            "function_definition",
+            "struct_specifier",
+            "enum_specifier",
+            "union_specifier",
+            "class_specifier",
+            "namespace_definition",
+            "compound_statement",
+        ],
+        "javascript" => &[
+            "function_declaration",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+            "class_declaration",
+            "object",
+            "statement_block",
+            "switch_statement",
+        ],
+        "typescript" | "tsx" => &[
+            "function_declaration",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+            "class_declaration",
+            "abstract_class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "internal_module",
+            "object",
+            "statement_block",
+            "switch_statement",
+            "jsx_element",
+        ],
+        "python" => &[
+            "function_definition",
+            "class_definition",
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "try_statement",
+            "with_statement",
+            "match_statement",
+        ],
+        "go" => &[
+            "function_declaration",
+            "method_declaration",
+            "func_literal",
+            "type_declaration",
+            "block",
+        ],
+        "bash" => &[
+            "function_definition",
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "case_statement",
+            "compound_statement",
+        ],
+        "vim" => &["def_function", "function_definition"],
+        "json" => &["object", "array"],
+        "yaml" => &["block_mapping", "block_sequence"],
+        "toml" => &["table", "table_array_element"],
+        _ => &[],
+    }
+}
+
+// 从缓存树上收集折叠区间；level 为折叠祖先数量 + 1。
+fn run_folds_cached(
+    server: &Server,
+    buf: i64,
+    lang: &str,
+    max_items: Option<usize>,
+) -> Result<(u64, Vec<Fold>)> {
+    let cache = server.get_cache(buf, lang)?;
+    let kinds = foldable_kinds(lang);
+    let limit = max_items.unwrap_or(MAX_FOLDS).min(MAX_FOLDS);
+    let mut folds: Vec<Fold> = Vec::new();
+    // (node, level, enclosing fold range) —— 与父 fold 完全同界的嵌套节点合并，
+    // 否则 `fn f() { ... }` 会因 function_item 与 block 同界而叠出两层折叠。
+    let mut stack = vec![(cache.tree.root_node(), 0_u32, None::<(u32, u32)>)];
+    while let Some((node, level, parent_range)) = stack.pop() {
+        if folds.len() >= limit {
+            break;
+        }
+        let sp = node.start_position();
+        let ep = node.end_position();
+        let range = (sp.row as u32 + 1, ep.row as u32 + 1);
+        let mut next_level = level;
+        let mut next_range = parent_range;
+        if kinds.contains(&node.kind()) && ep.row > sp.row && parent_range != Some(range) {
+            folds.push(Fold {
+                lnum: range.0,
+                end_lnum: range.1,
+                level: level + 1,
+            });
+            next_level = level + 1;
+            next_range = Some(range);
+        }
+        let child_count = node.child_count().min(u32::MAX as usize);
+        for index in (0..child_count).rev() {
+            if let Some(child) = node.child(index as u32) {
+                stack.push((child, next_level, next_range));
+            }
+        }
+    }
+    folds.sort_by_key(|fold| (fold.lnum, fold.level));
+    Ok((cache.revision, folds))
+}
+
 fn extract_vim_declarations(text: &str, lrange: Option<(u32, u32)>, limit: usize) -> Vec<Symbol> {
     let mut symbols = Vec::<Symbol>::new();
     // (name, line, column, index in symbols). Vim functions do not normally
@@ -1794,6 +2209,26 @@ fn definition_node<'a>(
         ("javascript", "class") => &["class_declaration"],
         ("javascript", "variable") => &["variable_declarator", "variable_declaration"],
 
+        ("typescript" | "tsx", "function") => &["function_declaration", "function_signature"],
+        ("typescript" | "tsx", "method") => &[
+            "method_definition",
+            "method_signature",
+            "abstract_method_signature",
+        ],
+        ("typescript" | "tsx", "class") => &["class_declaration", "abstract_class_declaration"],
+        ("typescript" | "tsx", "type") => &["interface_declaration", "type_alias_declaration"],
+        ("typescript" | "tsx", "enum") => &["enum_declaration"],
+        ("typescript" | "tsx", "namespace") => &["internal_module", "module"],
+        ("typescript" | "tsx", "variable") => &["variable_declarator", "variable_declaration"],
+        ("typescript" | "tsx", "field") => &["public_field_definition", "property_signature"],
+        // 变体本身就是叶子；有赋值时也只取名字，避免退化到整个 enum_body。
+        ("typescript" | "tsx", "variant") => &["property_identifier"],
+
+        ("json", "property" | "field") => &["pair"],
+        ("yaml", "property" | "field") => &["block_mapping_pair"],
+        ("toml", "namespace") => &["table", "table_array_element"],
+        ("toml", "property") => &["pair"],
+
         ("python", "function" | "method") => &["function_definition"],
         ("python", "class") => &["class_definition"],
         ("python", "variable") => &["assignment", "expression_statement"],
@@ -1822,6 +2257,25 @@ fn definition_node<'a>(
         current = candidate.parent();
     }
     node.parent().unwrap_or(node)
+}
+
+/// Depth-first search for the first descendant (including `node`) of `kind`.
+fn descendant_by_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let child_count = node.child_count().min(u32::MAX as usize);
+    for index in 0..child_count {
+        if let Some(child) = node.child(index as u32)
+            && let Some(found) = descendant_by_kind(child, kind)
+        {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn child_text_by_kind(node: tree_sitter::Node, child_kind: &str, bytes: &[u8]) -> Option<String> {
@@ -2306,12 +2760,25 @@ mod tests {
                 "function javascriptFn() { return 1; }\n",
                 "javascriptFn",
             ),
+            (
+                "typescript",
+                "interface Shape { area(): number }\nfunction tsFn(x: number): number { return x; }\n",
+                "tsFn",
+            ),
+            (
+                "tsx",
+                "function TsxComponent() { return <div className=\"x\">hi</div>; }\n",
+                "TsxComponent",
+            ),
             ("c", "int c_fn(void) { return 0; }\n", "c_fn"),
             ("cpp", "class Widget { public: int value; };\n", "Widget"),
             ("python", "def python_fn():\n    return 1\n", "python_fn"),
             ("go", "package main\nfunc goFn() {}\n", "goFn"),
             ("bash", "bash_fn() { echo ok; }\n", "bash_fn"),
             ("vim", "vim9script\ndef VimFn()\nenddef\n", "VimFn"),
+            ("json", "{\"top_key\": {\"nested\": 1}}\n", "top_key"),
+            ("yaml", "top_key:\n  nested: 1\n", "top_key"),
+            ("toml", "[section]\nkey = \"value\"\n", "section"),
         ];
         let mut server = Server::new();
         for (index, (lang, source, expected_symbol)) in cases.into_iter().enumerate() {
@@ -2328,6 +2795,214 @@ mod tests {
                 "missing {lang} symbol {expected_symbol}: {symbols:?}"
             );
         }
+    }
+
+    fn splice(
+        lstart: u32,
+        old_lend: u32,
+        lines: &[&str],
+        line_count: u64,
+        eol: bool,
+    ) -> LineSplice {
+        LineSplice {
+            lstart,
+            old_lend,
+            lines: lines.iter().map(|line| line.to_string()).collect(),
+            line_count,
+            eol,
+        }
+    }
+
+    #[test]
+    fn edit_lines_replaces_inserts_and_deletes() {
+        let mut server = Server::new();
+        server
+            .set_text(
+                1,
+                "rust",
+                "fn one() {}\nfn two() {}\nfn three() {}\n".to_string(),
+                1,
+            )
+            .unwrap();
+
+        // 替换中间一行
+        let mode = server
+            .edit_lines(1, "rust", 2, splice(2, 3, &["fn changed() {}"], 3, true))
+            .unwrap();
+        assert_eq!(mode, ParseMode::Incremental);
+        assert_eq!(
+            server.cache.get(&1).unwrap().text,
+            "fn one() {}\nfn changed() {}\nfn three() {}\n"
+        );
+
+        // 在开头插入一行
+        server
+            .edit_lines(1, "rust", 3, splice(1, 1, &["fn zero() {}"], 4, true))
+            .unwrap();
+        assert_eq!(
+            server.cache.get(&1).unwrap().text,
+            "fn zero() {}\nfn one() {}\nfn changed() {}\nfn three() {}\n"
+        );
+
+        // 删除最后两行
+        server
+            .edit_lines(1, "rust", 4, splice(3, 5, &[], 2, true))
+            .unwrap();
+        assert_eq!(
+            server.cache.get(&1).unwrap().text,
+            "fn zero() {}\nfn one() {}\n"
+        );
+
+        // 语法树与全量解析一致，revision 精确更新
+        let (revision, symbols) = run_symbols_cached(&mut server, 1, "rust", None, None).unwrap();
+        assert_eq!(revision, 4);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["zero", "one"]);
+    }
+
+    #[test]
+    fn edit_lines_respects_missing_trailing_newline() {
+        let mut server = Server::new();
+        server
+            .set_text(1, "rust", "fn a() {}\nfn b() {}".to_string(), 1)
+            .unwrap();
+        server
+            .edit_lines(1, "rust", 2, splice(2, 3, &[], 1, false))
+            .unwrap();
+        assert_eq!(server.cache.get(&1).unwrap().text, "fn a() {}");
+        server
+            .edit_lines(1, "rust", 3, splice(2, 2, &["fn c() {}"], 2, true))
+            .unwrap();
+        assert_eq!(server.cache.get(&1).unwrap().text, "fn a() {}\nfn c() {}\n");
+    }
+
+    #[test]
+    fn edit_lines_mismatch_drops_the_cache() {
+        let mut server = Server::new();
+        server
+            .set_text(1, "rust", "fn a() {}\n".to_string(), 1)
+            .unwrap();
+        let error = server
+            .edit_lines(1, "rust", 2, splice(1, 2, &["fn b() {}"], 99, true))
+            .unwrap_err();
+        assert!(error.to_string().contains("edit_lines mismatch"));
+        assert!(!server.cache.contains_key(&1));
+
+        // 未缓存 buffer 的 edit_lines 必须请求全量重同步
+        let error = server
+            .edit_lines(2, "rust", 1, splice(1, 1, &["fn x() {}"], 1, true))
+            .unwrap_err();
+        assert!(error.to_string().contains("buffer not cached"));
+    }
+
+    #[test]
+    fn folds_are_nested_and_merge_identical_ranges() {
+        let mut server = Server::new();
+        let source = "fn outer() {\n    match 1 {\n        _ => {}\n    }\n}\nfn flat() {}\n";
+        server.set_text(1, "rust", source.to_string(), 7).unwrap();
+        let (revision, folds) = run_folds_cached(&server, 1, "rust", None).unwrap();
+        assert_eq!(revision, 7);
+        // function_item 与其同界 block 合并为一个 level-1 折叠；match 嵌套其中。
+        let outer = folds.iter().find(|fold| fold.lnum == 1).unwrap();
+        assert_eq!((outer.end_lnum, outer.level), (5, 1));
+        let inner = folds.iter().find(|fold| fold.lnum == 2).unwrap();
+        assert_eq!((inner.end_lnum, inner.level), (4, 2));
+        // 单行函数不产生折叠
+        assert!(!folds.iter().any(|fold| fold.lnum == 6));
+        assert_eq!(folds.len(), 2);
+    }
+
+    #[test]
+    fn folds_cover_config_languages() {
+        let mut server = Server::new();
+        server
+            .set_text(
+                1,
+                "json",
+                "{\n  \"a\": {\n    \"b\": 1\n  }\n}\n".to_string(),
+                1,
+            )
+            .unwrap();
+        let (_, folds) = run_folds_cached(&server, 1, "json", None).unwrap();
+        assert!(folds.iter().any(|fold| fold.level == 1));
+        assert!(folds.iter().any(|fold| fold.level == 2));
+
+        server
+            .set_text(2, "yaml", "top:\n  a: 1\n  b: 2\n".to_string(), 1)
+            .unwrap();
+        let (_, folds) = run_folds_cached(&server, 2, "yaml", None).unwrap();
+        assert!(!folds.is_empty());
+    }
+
+    #[test]
+    fn typescript_symbols_have_containers_and_ranges() {
+        let mut server = Server::new();
+        let source = "export const VALUE = 1;\ninterface Shape {\n  area(): number;\n}\nclass Circle {\n  radius: number = 1;\n  area(): number { return this.radius; }\n}\nenum Color { Red, Green }\nnamespace Util {}\n";
+        server
+            .set_text(1, "typescript", source.to_string(), 1)
+            .unwrap();
+        let (_, symbols) = run_symbols_cached(&mut server, 1, "typescript", None, None).unwrap();
+
+        let value = symbols.iter().find(|s| s.name == "VALUE").unwrap();
+        assert_eq!(value.kind, "variable");
+        let shape = symbols.iter().find(|s| s.name == "Shape").unwrap();
+        assert_eq!(shape.kind, "type");
+        assert_eq!(shape.end_lnum, 4);
+        let circle_area = symbols
+            .iter()
+            .find(|s| s.name == "area" && s.container_name.as_deref() == Some("Circle"))
+            .unwrap();
+        assert_eq!(circle_area.kind, "method");
+        assert_eq!(circle_area.container_kind.as_deref(), Some("class"));
+        let radius = symbols.iter().find(|s| s.name == "radius").unwrap();
+        assert_eq!(radius.container_name.as_deref(), Some("Circle"));
+        let red = symbols.iter().find(|s| s.name == "Red").unwrap();
+        assert_eq!(red.kind, "variant");
+        assert_eq!(red.container_name.as_deref(), Some("Color"));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Util" && s.kind == "namespace")
+        );
+    }
+
+    #[test]
+    fn config_symbols_nest_under_their_parents() {
+        let mut server = Server::new();
+        server
+            .set_text(
+                1,
+                "yaml",
+                "server:\n  host: localhost\n  port: 8080\nlogging:\n  level: info\n".to_string(),
+                1,
+            )
+            .unwrap();
+        let (_, symbols) = run_symbols_cached(&mut server, 1, "yaml", None, None).unwrap();
+        let host = symbols.iter().find(|s| s.name == "host").unwrap();
+        assert_eq!(host.container_name.as_deref(), Some("server"));
+        assert_eq!(host.container_kind.as_deref(), Some("property"));
+
+        server
+            .set_text(
+                2,
+                "toml",
+                "top = 1\n[dependencies]\nserde = \"1\"\n[dev.extra]\nother = 2\n".to_string(),
+                1,
+            )
+            .unwrap();
+        let (_, symbols) = run_symbols_cached(&mut server, 2, "toml", None, None).unwrap();
+        let serde = symbols.iter().find(|s| s.name == "serde").unwrap();
+        assert_eq!(serde.container_name.as_deref(), Some("dependencies"));
+        assert_eq!(serde.container_kind.as_deref(), Some("namespace"));
+        let top = symbols.iter().find(|s| s.name == "top").unwrap();
+        assert!(top.container_kind.is_none());
+
+        server
+            .set_text(3, "json", "{\"outer\": {\"inner\": true}}\n".to_string(), 1)
+            .unwrap();
+        let (_, symbols) = run_symbols_cached(&mut server, 3, "json", None, None).unwrap();
+        let inner = symbols.iter().find(|s| s.name == "inner").unwrap();
+        assert_eq!(inner.container_name.as_deref(), Some("outer"));
     }
 
     #[test]

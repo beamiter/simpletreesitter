@@ -5,15 +5,16 @@
 ## 主要能力
 
 - 实时语法高亮：仅查询可见区域与 margin，编辑、滚动分别防抖。
-- 真增量解析：daemon 计算最小文本变更，使用 `Tree::edit` 和旧语法树重新解析。
+- 端到端增量：首次全量快照后，Vim 只发送变更行区间（`edit_lines`），daemon 用
+  `Tree::edit` + 旧语法树增量重解析；行数校验失配自动回退全量同步。
 - 代码大纲：层级容器、折叠、跳转、光标跟随、ASCII/Nerd Font 两套图标。
-- 精确版本协议：所有结果携带 buffer revision，过期高亮、符号和 AST 会被丢弃。
+- Tree-sitter 折叠：`:TsHlFoldsToggle` 由语法树驱动 `foldexpr`，支持嵌套层级。
+- 符号跳转：`:TsHlSymbols` 把当前 buffer 符号送入 location list。
+- 精确版本协议：所有结果携带 buffer revision，过期高亮、符号、折叠和 AST 会被丢弃。
 - 长会话稳定性：buffer 关闭即释放 daemon cache；daemon 重启后自动重新同步。
 - 大文件保护：Vim 端默认跳过超过 5 MiB 的 buffer；daemon 另有硬上限和有界结果。
 - 彩虹括号、缩进参考线、breadcrumb、AST 调试视图。
-- 查询与语义回归测试：覆盖 Rust、C、C++、JavaScript、Python、Go、Bash 和 Vim9。
-
-Vim 到 daemon 目前仍传输完整文本；“增量”指 Tree-sitter 解析树复用。超大文件可通过 buffer 大小限制直接跳过。
+- 查询与语义回归测试：覆盖全部 13 种语言。
 
 ## 支持语言
 
@@ -23,10 +24,15 @@ Vim 到 daemon 目前仍传输完整文本；“增量”指 Tree-sitter 解析�
 | C | `c` | ✅ | ✅ |
 | C++ | `cpp`, `cc` | ✅ | ✅ |
 | JavaScript / JSX | `javascript`, `javascriptreact`, `jsx` | ✅ | ✅ |
+| TypeScript | `typescript` | ✅ | ✅ |
+| TSX | `typescriptreact` | ✅ | ✅ |
 | Python | `python` | ✅ | ✅ |
 | Go | `go` | ✅ | ✅ |
 | Bash / Shell | `sh`, `bash`, `zsh` | ✅ | ✅ |
 | Vim9 | `vim`, `vimrc` | ✅ | ✅ |
+| JSON / JSONC | `json`, `jsonc` | ✅ | ✅ |
+| YAML | `yaml` | ✅ | ✅ |
+| TOML | `toml` | ✅ | ✅ |
 
 ## 环境要求
 
@@ -71,6 +77,8 @@ install -m 0755 target/release/ts-hl-daemon lib/ts-hl-daemon
 | `:TsHlOutlineRefresh` | 刷新当前大纲 |
 | `:TsHlDumpAST` | 打开当前 revision 的 AST 视图 |
 | `:TsHlStatus` | 显示 daemon 协议、cache 和解析统计；不会启动 daemon |
+| `:TsHlSymbols` | 当前 buffer 符号送入 location list 并打开 |
+| `:TsHlFoldsToggle` | 切换 Tree-sitter 折叠（`foldexpr` 驱动，可恢复原设置） |
 
 默认普通模式映射：
 
@@ -96,7 +104,9 @@ nmap <leader>s <Plug>(simpletreesitter-outline-toggle)
 " 自动启动与 daemon
 g:simpletreesitter_auto_enable_filetypes = [
   'rust', 'c', 'cpp', 'cc', 'javascript', 'javascriptreact', 'jsx',
-  'python', 'go', 'sh', 'bash', 'zsh', 'vim', 'vimrc'
+  'typescript', 'typescriptreact',
+  'python', 'go', 'sh', 'bash', 'zsh', 'vim', 'vimrc',
+  'json', 'jsonc', 'yaml', 'toml'
 ]
 g:simpletreesitter_auto_stop = 1
 g:simpletreesitter_daemon_path = ''
@@ -104,6 +114,10 @@ g:simpletreesitter_debounce = 120
 g:simpletreesitter_scroll_debounce = 300
 g:simpletreesitter_max_buffer_bytes = 5 * 1024 * 1024  " 0 表示不设 Vim 端上限
 g:simpletreesitter_clear_props_on_disable = 1
+g:simpletreesitter_incremental_sync = 1  " 行级增量同步（需要 protocol v3 daemon）
+
+" Tree-sitter 折叠
+g:simpletreesitter_folds = 0
 
 " 高亮范围与上限
 g:simpletreesitter_view_margin = 120
@@ -158,13 +172,14 @@ let b:simpletreesitter_max_buffer_bytes = 0  " 仅当前 buffer 取消 Vim 端�
 
 ```text
 Vim9 plugin/autoload
-  │ newline-delimited JSON，protocol v2 + revision
+  │ newline-delimited JSON，protocol v3 + revision
+  │ 首次 set_text 全量；此后 listener 合并变更行，只发 edit_lines 行区间
   ▼
 ts-hl-daemon
   ├─ 每语言 Parser / 预编译 Query cache
   ├─ 每 buffer text / Tree / line index cache
-  ├─ InputEdit 增量解析
-  └─ 有界 highlights / symbols / AST 响应
+  ├─ edit_lines 行拼接（带行数校验）+ InputEdit 增量解析
+  └─ 有界 highlights / symbols / folds / AST 响应
 ```
 
 daemon 串行处理请求，避免共享语法树并发竞态；Vim 端每个 buffer 合并同步请求，并在响应到达时验证 `changedtick`。关闭、卸载或擦除 buffer 会发送 `close_buffer`。daemon 异常退出时，插件会清空协议状态，并在下一次 buffer 事件重新同步。

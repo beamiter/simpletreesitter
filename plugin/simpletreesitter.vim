@@ -23,10 +23,14 @@ g:simpletreesitter_daemon_path = get(g:, 'simpletreesitter_daemon_path', '')
 g:simpletreesitter_debounce = get(g:, 'simpletreesitter_debounce', 120)
 g:simpletreesitter_auto_enable_filetypes = get(g:, 'simpletreesitter_auto_enable_filetypes',
   ['rust', 'c', 'cpp', 'cc', 'javascript', 'javascriptreact', 'jsx',
-   'python', 'go', 'sh', 'bash', 'zsh', 'vim', 'vimrc'])
+   'typescript', 'typescriptreact',
+   'python', 'go', 'sh', 'bash', 'zsh', 'vim', 'vimrc',
+   'json', 'jsonc', 'yaml', 'toml'])
 g:simpletreesitter_auto_stop = get(g:, 'simpletreesitter_auto_stop', 1)
 g:simpletreesitter_max_buffer_bytes = get(g:, 'simpletreesitter_max_buffer_bytes', 5 * 1024 * 1024)
 g:simpletreesitter_clear_props_on_disable = get(g:, 'simpletreesitter_clear_props_on_disable', 1)
+# 增量同步：只把变更行区间发给 daemon（需要 protocol v3 的 daemon）
+g:simpletreesitter_incremental_sync = get(g:, 'simpletreesitter_incremental_sync', 1)
 
 g:simpletreesitter_debug = get(g:, 'simpletreesitter_debug', 0)
 g:simpletreesitter_log_file = get(g:, 'simpletreesitter_log_file', '/tmp/ts-hl.log')
@@ -61,6 +65,9 @@ g:simpletreesitter_indent_guide_char = get(g:, 'simpletreesitter_indent_guide_ch
 # =============== 彩虹括号 ===============
 g:simpletreesitter_rainbow_brackets = get(g:, 'simpletreesitter_rainbow_brackets', 1)
 
+# =============== Tree-sitter 折叠 ===============
+g:simpletreesitter_folds = get(g:, 'simpletreesitter_folds', 0)
+
 # =============== 面包屑导航 ===============
 g:simpletreesitter_breadcrumb = get(g:, 'simpletreesitter_breadcrumb', 0)
 g:simpletreesitter_breadcrumb_separator = get(g:, 'simpletreesitter_breadcrumb_separator', ' > ')
@@ -86,6 +93,8 @@ command! TsHlOutlineToggle  call simpletreesitter#OutlineToggle()
 command! TsHlOutlineRefresh call simpletreesitter#OutlineRefresh()
 command! TsHlDumpAST        call simpletreesitter#DumpAST()
 command! TsHlStatus         call simpletreesitter#Status()
+command! TsHlSymbols        call simpletreesitter#SymbolsToLoclist()
+command! TsHlFoldsToggle    call simpletreesitter#FoldsToggle()
 
 # =============== 快捷键 ===============
 nnoremap <silent> <Plug>(simpletreesitter-toggle) <Cmd>TsHlToggle<CR>

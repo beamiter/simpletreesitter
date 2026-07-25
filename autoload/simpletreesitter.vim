@@ -45,6 +45,22 @@ var s_pending_hl: dict<bool> = {}
 # BufUnload 后保留 tombstone，阻止同一 daemon 会话中迟到的 ACK/事件复活状态。
 var s_closed_bufs: dict<bool> = {}
 var s_user_disabled: bool = false
+# =============== 增量同步状态（protocol v3） ===============
+# buf -> listener id（listener_add 返回值）
+var s_listener_ids: dict<number> = {}
+# buf -> 自上次发送以来累计的行级变更 {os, oe, ne}：
+# 旧文本（上次发送快照）中被替换的 [os, oe) 行区间，及其在当前 buffer 中的
+# 新终点 ne（1-based，end-exclusive）。
+var s_pending_splice: dict<dict<number>> = {}
+# =============== 折叠状态 ===============
+var s_inflight_folds: dict<bool> = {}
+var s_pending_folds: dict<bool> = {}
+# buf -> 每行 foldexpr 取值（'>1'、'2'、'0' 等）
+var s_fold_exprs: dict<list<string>> = {}
+# winid -> {method: string, expr: string} 应用折叠前的窗口设置
+var s_fold_windows: dict<dict<string>> = {}
+# =============== 符号 location list 请求 ===============
+var s_loclist_pending: dict<bool> = {}
 
 # 待用的 TS 高亮组 -> Vim 高亮组 默认链接
 const s_groups = [
@@ -73,6 +89,8 @@ const s_language_by_filetype = {
   javascript: 'javascript',
   javascriptreact: 'javascript',
   jsx: 'javascript',
+  typescript: 'typescript',
+  typescriptreact: 'tsx',
   python: 'python',
   go: 'go',
   sh: 'bash',
@@ -80,6 +98,10 @@ const s_language_by_filetype = {
   zsh: 'bash',
   vim: 'vim',
   vimrc: 'vim',
+  json: 'json',
+  jsonc: 'json',
+  yaml: 'yaml',
+  toml: 'toml',
 }
 
 # =============== 面包屑状态 ===============
@@ -433,6 +455,10 @@ def ResetProtocolState()
   s_pending_hl = {}
   s_pending_syms = {}
   s_pending_ast = {}
+  s_pending_splice = {}
+  s_inflight_folds = {}
+  s_pending_folds = {}
+  s_loclist_pending = {}
   s_protocol_version = 0
 enddef
 
@@ -506,6 +532,10 @@ def OnDaemonEvent(line: string, generation: number)
       s_bc_items = syms
       ScheduleBreadcrumbUpdate()
     endif
+    if get(s_loclist_pending, buf, false)
+      s_loclist_pending[buf] = false
+      PopulateSymbolLoclist(buf, syms)
+    endif
     ApplySymbols(buf, syms)
     if retry
       ScheduleSymbols(buf)
@@ -519,10 +549,24 @@ def OnDaemonEvent(line: string, generation: number)
     endif
     var lines = get(ev, 'lines', [])
     ShowAst(buf, lines)
+  elseif ev.type ==# 'folds'
+    var buf = get(ev, 'buf', 0)
+    var retry = get(s_pending_folds, buf, false)
+    s_inflight_folds[buf] = false
+    s_pending_folds[buf] = false
+    if !EventRevisionIsCurrent(ev, buf)
+      Log('Discarded stale folds for buffer ' .. buf)
+      ScheduleSync(buf)
+      return
+    endif
+    ApplyFolds(buf, get(ev, 'folds', []))
+    if retry
+      ScheduleFolds(buf)
+    endif
   elseif ev.type ==# 'ok'
     var buf = get(ev, 'buf', 0)
     var op  = get(ev, 'op', '')
-    if op ==# 'set_text'
+    if op ==# 'set_text' || op ==# 'edit_lines'
       # 无对应在途请求的 ACK 必定来自已关闭 buffer 或旧请求，不能复活状态。
       if !has_key(s_inflight_revision, buf)
         Log('Ignored set_text ACK without an inflight revision for buffer ' .. buf)
@@ -552,6 +596,10 @@ def OnDaemonEvent(line: string, generation: number)
         ScheduleRequest(buf, 'edit')
       endif
       ScheduleSymbols(buf)
+      ScheduleFolds(buf)
+      if get(s_loclist_pending, buf, false)
+        RequestLoclistSymbols(buf)
+      endif
       if get(s_pending_ast, buf, false)
         s_pending_ast[buf] = false
         RequestAstNow(buf)
@@ -563,6 +611,11 @@ def OnDaemonEvent(line: string, generation: number)
       s_protocol_notice_shown = true
       echohl WarningMsg
       echom '[ts-hl] daemon protocol is outdated; run install.sh to rebuild it'
+      echohl None
+    elseif s_protocol_version == 2 && !s_protocol_notice_shown
+      s_protocol_notice_shown = true
+      echohl WarningMsg
+      echom '[ts-hl] daemon protocol is v2; run install.sh to enable incremental sync and folds'
       echohl None
     endif
   elseif ev.type ==# 'status'
@@ -590,11 +643,15 @@ def OnDaemonEvent(line: string, generation: number)
       s_inflight_syms[buf] = false
       s_inflight_hl[buf] = false
       s_inflight_sync[buf] = false
+      s_inflight_folds[buf] = false
       if has_key(s_inflight_revision, buf)
         remove(s_inflight_revision, string(buf))
       endif
-      if message =~# 'buffer not cached\|lang mismatch'
+      if message =~# 'buffer not cached\|lang mismatch\|edit_lines mismatch'
         s_sent_changedtick[buf] = -1
+        if has_key(s_pending_splice, buf)
+          remove(s_pending_splice, string(buf))
+        endif
         ScheduleSync(buf)
       endif
     endif
@@ -657,7 +714,7 @@ def EnsureDaemon(): bool
   if s_running
     EnsureHlGroupsAndProps()
     Log('Daemon started successfully')
-    Send({type: 'hello', client_protocol: 2})
+    Send({type: 'hello', client_protocol: 3})
   endif
   return s_running
 enddef
@@ -760,6 +817,75 @@ def GetChangedTick(buf: number): number
   return 0
 enddef
 
+# =============== 增量同步（protocol v3） ===============
+# 把一次 listener 变更（当前坐标系中 [lnum, lend) 被替换为 [lnum, lend+added)）
+# 合并进 buf 的累计 splice。累计状态 {os, oe, ne}：上次发送快照中 [os, oe) 行
+# 被替换为当前 buffer 的 [os, ne) 行。
+def MergeChange(buf: number, lnum: number, lend: number, added: number)
+  if !has_key(s_pending_splice, buf)
+    s_pending_splice[buf] = {os: lnum, oe: lend, ne: lend + added}
+    return
+  endif
+  var sp = s_pending_splice[buf]
+  # 当前坐标与旧坐标在累计区间下方相差 shift 行
+  var shift = sp.ne - sp.oe
+  var new_os = min([sp.os, lnum])
+  var new_oe = sp.oe
+  if lend >= sp.ne
+    new_oe = max([sp.oe, lend - shift])
+  endif
+  var new_ne = sp.ne >= lend ? sp.ne + added : lend + added
+  s_pending_splice[buf] = {os: new_os, oe: new_oe, ne: new_ne}
+enddef
+
+def OnBufLines(buf: number, _start: number, _lend: number, _added: number, changes: list<dict<any>>)
+  if get(s_closed_bufs, buf, false)
+    return
+  endif
+  for change in changes
+    MergeChange(buf, get(change, 'lnum', 1), get(change, 'end', 1), get(change, 'added', 0))
+  endfor
+enddef
+
+def EnsureListener(buf: number)
+  if !get(g:, 'simpletreesitter_incremental_sync', 1)
+    return
+  endif
+  if get(s_listener_ids, buf, 0) != 0
+    return
+  endif
+  if !bufexists(buf) || !bufloaded(buf) || !exists('*listener_add')
+    return
+  endif
+  try
+    s_listener_ids[buf] = listener_add(OnBufLines, buf)
+  catch
+    s_listener_ids[buf] = 0
+  endtry
+enddef
+
+def RemoveListener(buf: number)
+  if has_key(s_listener_ids, buf)
+    if s_listener_ids[buf] != 0
+      try | listener_remove(s_listener_ids[buf]) | catch | endtry
+    endif
+    remove(s_listener_ids, string(buf))
+  endif
+  if has_key(s_pending_splice, buf)
+    remove(s_pending_splice, string(buf))
+  endif
+enddef
+
+def RemoveAllListeners()
+  for [k, id] in items(s_listener_ids)
+    if id != 0
+      try | listener_remove(id) | catch | endtry
+    endif
+  endfor
+  s_listener_ids = {}
+  s_pending_splice = {}
+enddef
+
 def SyncBufferNow(buf: number)
   if !s_enabled || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
     return
@@ -771,6 +897,12 @@ def SyncBufferNow(buf: number)
   # 同一 buffer 只允许一个 set_text 在途；ACK 后会自动发送最新快照。
   if get(s_inflight_sync, buf, false)
     return
+  endif
+
+  # 注册 listener 并强制送达排队中的变更，让 splice 状态覆盖到当前 changedtick。
+  EnsureListener(buf)
+  if exists('*listener_flush')
+    try | listener_flush(buf) | catch | endtry
   endif
 
   var ct = GetChangedTick(buf)
@@ -798,20 +930,61 @@ def SyncBufferNow(buf: number)
     if has_key(s_sent_changedtick, buf)
       remove(s_sent_changedtick, string(buf))
     endif
+    if has_key(s_pending_splice, buf)
+      remove(s_pending_splice, string(buf))
+    endif
     s_skipped_changedtick[buf] = ct
     return
   endif
 
-  var lines = getbufline(buf, 1, '$')
-  var text = join(lines, "\n")
-  if getbufvar(buf, '&endofline') && !empty(lines)
-    text ..= "\n"
-  endif
   if has_key(s_skipped_changedtick, buf)
     remove(s_skipped_changedtick, string(buf))
   endif
   if has_key(s_oversized_notified, buf)
     remove(s_oversized_notified, string(buf))
+  endif
+
+  var eol = getbufvar(buf, '&endofline') ? true : false
+
+  # 增量路径：daemon 已持有上次发送的快照，只传变更的行区间。
+  # daemon 会校验总行数，任何失配都会触发一次全量重同步。
+  if s_protocol_version >= 3
+      && get(g:, 'simpletreesitter_incremental_sync', 1)
+      && last_ct >= 0
+      && has_key(s_pending_splice, buf)
+    var sp = s_pending_splice[buf]
+    remove(s_pending_splice, string(buf))
+    if sp.os >= 1 && sp.oe >= sp.os && sp.ne >= sp.os
+      var new_lines = sp.ne > sp.os ? getbufline(buf, sp.os, sp.ne - 1) : []
+      s_inflight_sync[buf] = true
+      s_inflight_revision[buf] = ct
+      if !Send({
+        type: 'edit_lines',
+        buf: buf,
+        lang: lang,
+        revision: ct,
+        lstart: sp.os,
+        old_lend: sp.oe,
+        lines: new_lines,
+        line_count: BufLineCount(buf),
+        eol: eol,
+      })
+        return
+      endif
+      Log('Sent edit_lines for buffer ' .. buf .. ' (changedtick=' .. ct
+        .. ' lines=' .. sp.os .. '..' .. sp.oe .. '->' .. len(new_lines) .. ')')
+      return
+    endif
+  endif
+
+  var lines = getbufline(buf, 1, '$')
+  var text = join(lines, "\n")
+  if eol && !empty(lines)
+    text ..= "\n"
+  endif
+  # 全量快照本身就是新的 baseline
+  if has_key(s_pending_splice, buf)
+    remove(s_pending_splice, string(buf))
   endif
   s_inflight_sync[buf] = true
   s_inflight_revision[buf] = ct
@@ -1022,6 +1195,187 @@ def ApplyIndentGuidesForBuf()
   var parts = filter(split(&l:listchars, ','), (_, value) => value !~# '^leadmultispace:')
   parts->add('leadmultispace:' .. ch .. filler)
   &l:listchars = join(parts, ',')
+enddef
+
+# =============== Tree-sitter 折叠 ===============
+def FoldsEnabled(): bool
+  return get(g:, 'simpletreesitter_folds', 0) ? true : false
+enddef
+
+def ScheduleFolds(buf: number)
+  if !s_enabled || !FoldsEnabled() || s_protocol_version < 3
+    return
+  endif
+  if !IsSupportedLang(buf)
+    return
+  endif
+  RequestFoldsNow(buf)
+enddef
+
+def RequestFoldsNow(buf: number)
+  if !s_enabled || !s_running || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+    return
+  endif
+  var lang = DetectLang(buf)
+  if lang ==# '' | return | endif
+  # 未同步时直接放弃；set_text/edit_lines 的 ACK 会重新调度。
+  if GetChangedTick(buf) != get(s_sent_changedtick, buf, -1) || get(s_inflight_sync, buf, false)
+    return
+  endif
+  if get(s_inflight_folds, buf, false)
+    s_pending_folds[buf] = true
+    return
+  endif
+  s_inflight_folds[buf] = true
+  s_pending_folds[buf] = false
+  Send({type: 'folds', buf: buf, lang: lang})
+enddef
+
+def ApplyFolds(buf: number, folds: list<dict<any>>)
+  if !bufexists(buf) || !FoldsEnabled()
+    return
+  endif
+  var line_count = BufLineCount(buf)
+  # 用差分数组重建每行嵌套深度；level = 覆盖该行的折叠数量。
+  var delta = repeat([0], line_count + 2)
+  var starts: dict<bool> = {}
+  for fold in folds
+    var l1 = get(fold, 'lnum', 0)
+    var l2 = get(fold, 'end_lnum', 0)
+    if l1 < 1 || l2 > line_count || l2 <= l1
+      continue
+    endif
+    delta[l1] += 1
+    delta[l2 + 1] -= 1
+    starts[string(l1)] = true
+  endfor
+  var exprs: list<string> = []
+  var level = 0
+  for lnum in range(1, line_count)
+    level += delta[lnum]
+    if get(starts, string(lnum), false)
+      exprs->add('>' .. level)
+    else
+      exprs->add(string(level))
+    endif
+  endfor
+  s_fold_exprs[buf] = exprs
+  for wid in win_findbuf(buf)
+    ApplyFoldSettingsToWin(wid)
+  endfor
+enddef
+
+def ApplyFoldSettingsToWin(wid: number)
+  if empty(getwininfo(wid))
+    return
+  endif
+  if !has_key(s_fold_windows, wid)
+    s_fold_windows[wid] = {
+      method: getwinvar(wid, '&foldmethod'),
+      expr: getwinvar(wid, '&foldexpr'),
+    }
+  endif
+  # 重新赋值 foldexpr 会触发该窗口的折叠重算
+  setwinvar(wid, '&foldmethod', 'expr')
+  setwinvar(wid, '&foldexpr', 'simpletreesitter#FoldExpr(v:lnum)')
+enddef
+
+def RestoreFoldSettings()
+  for [wid_str, saved] in items(s_fold_windows)
+    var wid = str2nr(wid_str)
+    if !empty(getwininfo(wid))
+      try
+        setwinvar(wid, '&foldmethod', get(saved, 'method', 'manual'))
+        setwinvar(wid, '&foldexpr', get(saved, 'expr', '0'))
+      catch
+      endtry
+    endif
+  endfor
+  s_fold_windows = {}
+  s_fold_exprs = {}
+enddef
+
+export def FoldExpr(lnum: number): string
+  var exprs = get(s_fold_exprs, bufnr(), [])
+  if lnum < 1 || lnum > len(exprs)
+    # 折叠数据尚未跟上编辑时沿用上一行的层级
+    return '='
+  endif
+  return exprs[lnum - 1]
+enddef
+
+export def FoldsToggle()
+  if FoldsEnabled()
+    g:simpletreesitter_folds = 0
+    RestoreFoldSettings()
+    echo '[ts-hl] folds disabled'
+    return
+  endif
+  g:simpletreesitter_folds = 1
+  if !s_enabled
+    Enable()
+  endif
+  ScheduleFolds(bufnr())
+  echo '[ts-hl] folds enabled'
+enddef
+
+# =============== 符号 location list ===============
+def RequestLoclistSymbols(buf: number)
+  if !s_enabled || !s_running || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+    s_loclist_pending[buf] = false
+    return
+  endif
+  var lang = DetectLang(buf)
+  if lang ==# ''
+    s_loclist_pending[buf] = false
+    return
+  endif
+  if GetChangedTick(buf) != get(s_sent_changedtick, buf, -1) || get(s_inflight_sync, buf, false)
+    # ACK 处理器会在同步完成后重新发起
+    ScheduleSync(buf)
+    return
+  endif
+  var scan_limit = get(g:, 'simpletreesitter_outline_scan_max_items', 5000)
+  Send({type: 'symbols', buf: buf, lang: lang, lstart: 1, lend: BufLineCount(buf), max_items: scan_limit})
+enddef
+
+def PopulateSymbolLoclist(buf: number, syms: list<dict<any>>)
+  var entries: list<dict<any>> = []
+  for s in syms
+    var text = get(s, 'kind', '') .. ': ' .. get(s, 'name', '')
+    var container = get(s, 'container_name', '')
+    if type(container) == v:t_string && container !=# ''
+      text ..= ' [' .. container .. ']'
+    endif
+    entries->add({bufnr: buf, lnum: get(s, 'lnum', 1), col: get(s, 'col', 1), text: text})
+  endfor
+  var wins = win_findbuf(buf)
+  if empty(wins)
+    return
+  endif
+  setloclist(wins[0], [], ' ', {title: '[ts-hl] symbols', items: entries})
+  if win_gotoid(wins[0])
+    execute 'lopen'
+  endif
+enddef
+
+export def SymbolsToLoclist()
+  var buf = bufnr()
+  if buf == s_outline_buf && s_outline_src_buf != 0
+    buf = s_outline_src_buf
+  endif
+  if !IsSupportedLang(buf)
+    echo '[ts-hl] symbols unsupported for this &filetype'
+    return
+  endif
+  if !s_enabled
+    Enable()
+  endif
+  if !s_enabled || !EnsureDaemon()
+    return
+  endif
+  s_loclist_pending[buf] = true
+  RequestLoclistSymbols(buf)
 enddef
 
 # =============== 面包屑导航 ===============
@@ -1273,6 +1627,9 @@ export def Disable()
     catch
     endtry
   endif
+  # 清理 listener 与折叠状态
+  RemoveAllListeners()
+  RestoreFoldSettings()
   # 清理缩进参考线
   DisableIndentGuides()
   # 清理面包屑
@@ -1415,8 +1772,10 @@ export def OnBufClose(buf: number)
   if had_cache && s_running && s_protocol_version >= 2
     Send({type: 'close_buffer', buf: buf})
   endif
+  RemoveListener(buf)
   for state in [s_inflight_sync, s_pending_ast, s_inflight_syms, s_inflight_hl,
-      s_pending_syms, s_pending_hl, s_oversized_notified]
+      s_pending_syms, s_pending_hl, s_oversized_notified,
+      s_inflight_folds, s_pending_folds, s_loclist_pending]
     if has_key(state, buf)
       remove(state, string(buf))
     endif
@@ -1432,6 +1791,9 @@ export def OnBufClose(buf: number)
   endif
   if has_key(s_applied_types, buf)
     remove(s_applied_types, string(buf))
+  endif
+  if has_key(s_fold_exprs, buf)
+    remove(s_fold_exprs, string(buf))
   endif
   if buf == s_outline_src_buf
     s_outline_src_buf = 0

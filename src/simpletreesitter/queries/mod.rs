@@ -16,3 +16,17 @@ pub const BASH_SYM_QUERY: &str = include_str!("bash_symbols.scm");
 
 pub const VIM_QUERY: &str = include_str!("vim.scm");
 pub const VIM_SYM_QUERY: &str = include_str!("vim_symbols.scm");
+
+pub const TS_QUERY: &str = include_str!("typescript.scm");
+// TSX 语法是 TypeScript 的超集：先编译共享查询，再追加 JSX 专属模式。
+pub const TSX_QUERY: &str = concat!(
+    include_str!("typescript.scm"),
+    include_str!("tsx_extra.scm")
+);
+pub const TS_SYM_QUERY: &str = include_str!("typescript_symbols.scm");
+pub const JSON_QUERY: &str = include_str!("json.scm");
+pub const JSON_SYM_QUERY: &str = include_str!("json_symbols.scm");
+pub const YAML_QUERY: &str = include_str!("yaml.scm");
+pub const YAML_SYM_QUERY: &str = include_str!("yaml_symbols.scm");
+pub const TOML_QUERY: &str = include_str!("toml.scm");
+pub const TOML_SYM_QUERY: &str = include_str!("toml_symbols.scm");

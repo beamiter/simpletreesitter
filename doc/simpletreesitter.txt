@@ -15,10 +15,13 @@ CONTENTS                                                *simpletreesitter*
 
 simpletreesitter uses an asynchronous Rust daemon for Tree-sitter parsing,
 highlight queries, symbol extraction and incremental syntax-tree updates.  Vim
-renders namespaced text properties and an optional code Outline.
+renders namespaced text properties and an optional code Outline.  After the
+first full snapshot, edits are shipped as line-range deltas (edit_lines), so
+large buffers stay cheap to keep in sync.
 
 Supported filetypes: rust, c, cpp, cc, javascript, javascriptreact, jsx,
-python, go, sh, bash, zsh, vim and vimrc.
+typescript, typescriptreact, python, go, sh, bash, zsh, vim, vimrc, json,
+jsonc, yaml and toml.
 
 ===============================================================================
 2. REQUIREMENTS                              *simpletreesitter-requirements*
@@ -61,6 +64,16 @@ Build or update the daemon from the plugin directory: >
 :TsHlStatus             Show protocol, cache and parse statistics.  This
                         command does not start a stopped daemon.
 
+                                                *:TsHlSymbols*
+:TsHlSymbols            Collect the buffer's symbols into the location list
+                        and open it.
+
+                                                *:TsHlFoldsToggle*
+:TsHlFoldsToggle        Toggle Tree-sitter folds.  When enabled the window
+                        uses 'foldmethod' expr with fold levels computed from
+                        the syntax tree; toggling off restores the previous
+                        fold settings.
+
 ===============================================================================
 4. MAPPINGS                                  *simpletreesitter-mappings*
 
@@ -84,6 +97,8 @@ g:simpletreesitter_debounce                  120
 g:simpletreesitter_scroll_debounce           300
 g:simpletreesitter_max_buffer_bytes          5242880 (0 means unlimited)
 g:simpletreesitter_clear_props_on_disable    1
+g:simpletreesitter_incremental_sync          1 (line-delta sync, protocol v3)
+g:simpletreesitter_folds                     0 (Tree-sitter folds)
 
 g:simpletreesitter_view_margin               120
 g:simpletreesitter_symbols_view_margin       10000

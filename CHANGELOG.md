@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 — 2026-07-25
+
+- Added protocol v3 line-delta sync: after the first full snapshot, Vim merges
+  `listener_add` changes into a single splice and sends only the changed line
+  range (`edit_lines`); the daemon re-splices its cached text, verifies the
+  resulting line count and falls back to a full resync on any mismatch.
+- Added five languages: TypeScript, TSX, JSON/JSONC, YAML and TOML, each with
+  highlight and symbol queries, outline containers and regression coverage.
+- Added Tree-sitter folds: a bounded `folds` request computes nested fold
+  ranges from the syntax tree; `:TsHlFoldsToggle` drives 'foldexpr' per window
+  and restores the previous fold settings when disabled.
+- Added `:TsHlSymbols` to collect the buffer's symbols into the location list.
+- Extended smoke and unit coverage: splice-merge composition, incremental
+  end-to-end sync, folds, location list and the new filetype routing.
+
 ## 0.2.0 — 2026-07-15
 
 - Added protocol v2 handshake and revision-safe highlights, symbols, AST and sync acknowledgements.

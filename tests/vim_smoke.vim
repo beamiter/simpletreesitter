@@ -161,6 +161,92 @@ enew
 call assert_false(s:CallPrivate('BufferTextExceedsLimit', [s:bytes_buf, 7]))
 call assert_true(s:CallPrivate('BufferTextExceedsLimit', [s:bytes_buf, 6]))
 
+" MergeChange composes successive listener changes into one splice that stays
+" anchored to the last synced snapshot.
+call s:CallPrivate('MergeChange', [999, 2, 4, -1])
+let s:splice = s:State().s_pending_splice['999']
+call assert_equal({'os': 2, 'oe': 4, 'ne': 3}, s:splice)
+call s:CallPrivate('MergeChange', [999, 1, 1, 2])
+let s:splice = s:State().s_pending_splice['999']
+call assert_equal({'os': 1, 'oe': 4, 'ne': 5}, s:splice)
+" Current line 5 maps back to old line 4 (two lines were inserted above, one
+" removed), so the composed old range grows to [1, 5).
+call s:CallPrivate('MergeChange', [999, 5, 6, 0])
+let s:splice = s:State().s_pending_splice['999']
+call assert_equal({'os': 1, 'oe': 5, 'ne': 6}, s:splice)
+call simpletreesitter#OnBufClose(999)
+call assert_false(has_key(s:State().s_pending_splice, '999'))
+
+" End-to-end incremental sync: an edit after the first full sync travels via
+" edit_lines and highlights keep tracking the buffer.
+enew
+call setline(1, ['fn incr_one() {', '    let a = 1;', '}'])
+setfiletype rust
+let s:incr = bufnr()
+call simpletreesitter#Enable()
+sleep 300m
+call assert_true(len(prop_list(1, {'bufnr': s:incr})) > 0, 'no props before incremental edit')
+call setline(2, '    let renamed_variable = 2;')
+call listener_flush(s:incr)
+" -es 模式下 setline() 不触发 TextChanged，手动模拟自动命令
+call simpletreesitter#OnBufEvent(s:incr)
+sleep 300m
+let s:incr_state = s:State()
+call assert_equal(getbufinfo(s:incr)[0].changedtick,
+      \ get(s:incr_state.s_sent_changedtick, string(s:incr), -1),
+      \ 'incremental edit was not acknowledged')
+call assert_false(has_key(s:incr_state.s_pending_splice, string(s:incr)),
+      \ 'pending splice survived a completed sync')
+call assert_true(len(prop_list(2, {'bufnr': s:incr})) > 0, 'no props after incremental edit')
+
+" Tree-sitter folds: multi-line functions produce nested expr folds, and
+" toggling off restores the window's previous fold settings.
+let g:simpletreesitter_folds = 0
+call simpletreesitter#FoldsToggle()
+sleep 300m
+call assert_equal('expr', &l:foldmethod, 'foldmethod was not applied')
+call assert_match('simpletreesitter#FoldExpr', &l:foldexpr)
+call assert_equal('>1', simpletreesitter#FoldExpr(1))
+call assert_true(foldlevel(2) > 0, 'line 2 is not inside a fold')
+call simpletreesitter#FoldsToggle()
+call assert_equal('manual', &l:foldmethod, 'fold settings were not restored')
+call assert_equal(0, g:simpletreesitter_folds)
+
+" :TsHlSymbols fills the location list.
+call simpletreesitter#SymbolsToLoclist()
+sleep 300m
+let s:loc = getloclist(win_findbuf(s:incr)[0])
+call assert_true(len(s:loc) > 0, 'TsHlSymbols produced an empty location list')
+call assert_match('incr_one', join(map(copy(s:loc), 'v:val.text'), ' '))
+lclose
+call simpletreesitter#Disable()
+
+" New filetypes route to the daemon languages.
+for [s:ft, s:expected] in items({'typescript': 'typescript', 'typescriptreact': 'tsx',
+      \ 'json': 'json', 'yaml': 'yaml', 'toml': 'toml'})
+  enew
+  execute 'setfiletype ' . s:ft
+  call assert_equal(s:expected, s:CallPrivate('DetectLang', [bufnr()]),
+        \ 'DetectLang failed for ' . s:ft)
+endfor
+
+" TypeScript end-to-end: highlights and symbols from the real daemon.
+enew
+call setline(1, ['interface Shape {', '  area(): number;', '}',
+      \ 'function makeShape(): Shape {', '  return { area: () => 1 };', '}'])
+setfiletype typescript
+let s:ts = bufnr()
+call simpletreesitter#Enable()
+sleep 300m
+call assert_true(len(prop_list(1, {'bufnr': s:ts})) > 0, 'TypeScript received no text properties')
+call simpletreesitter#OutlineOpen()
+sleep 300m
+let s:ts_outline = join(getbufline(bufnr('ts-hl-outline'), 1, '$'), "\n")
+call assert_match('makeShape', s:ts_outline)
+call assert_match('Shape', s:ts_outline)
+call simpletreesitter#OutlineClose()
+call simpletreesitter#Disable()
+
 let s:size_file = '/tmp/simpletreesitter-size-preflight.txt'
 call writefile(['123456'], s:size_file, 'b')
 execute 'edit ' . fnameescape(s:size_file)
