@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 — 2026-07-25
+
+- Added three languages: Lua, HTML and CSS, each with highlight and symbol
+  queries plus end-to-end regression tests (parse → highlight spans → outline
+  symbols).
+- Migrated the crate metadata forward (dependency refresh, lockfile update).
+
 ## 0.3.0 — 2026-07-25
 
 - Added protocol v3 line-delta sync: after the first full snapshot, Vim merges

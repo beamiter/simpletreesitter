@@ -102,6 +102,9 @@ const s_language_by_filetype = {
   jsonc: 'json',
   yaml: 'yaml',
   toml: 'toml',
+  lua: 'lua',
+  html: 'html',
+  css: 'css',
 }
 
 # =============== 面包屑状态 ===============

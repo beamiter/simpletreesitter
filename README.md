@@ -33,6 +33,9 @@
 | JSON / JSONC | `json`, `jsonc` | ✅ | ✅ |
 | YAML | `yaml` | ✅ | ✅ |
 | TOML | `toml` | ✅ | ✅ |
+| Lua | `lua` | ✅ | ✅ |
+| HTML | `html` | ✅ | ✅ |
+| CSS | `css` | ✅ | ✅ |
 
 ## 环境要求
 
@@ -106,7 +109,7 @@ g:simpletreesitter_auto_enable_filetypes = [
   'rust', 'c', 'cpp', 'cc', 'javascript', 'javascriptreact', 'jsx',
   'typescript', 'typescriptreact',
   'python', 'go', 'sh', 'bash', 'zsh', 'vim', 'vimrc',
-  'json', 'jsonc', 'yaml', 'toml'
+  'json', 'jsonc', 'yaml', 'toml', 'lua', 'html', 'css'
 ]
 g:simpletreesitter_auto_stop = 1
 g:simpletreesitter_daemon_path = ''

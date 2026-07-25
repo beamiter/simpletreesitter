@@ -1,6 +1,6 @@
 [package]
 name = "simpletreesitter"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Tree-sitter powered syntax highlighting and code outline daemon for Vim9"
@@ -31,6 +31,9 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-json = "0.24.8"
 tree-sitter-yaml = "0.7.2"
 tree-sitter-toml-ng = "0.7.0"
+tree-sitter-lua = "0.5"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.25"
 [dependencies.tree-sitter-vim9]
 git = "https://github.com/beamiter/tree-sitter-vim9"
 rev = "fc891a2a5d6a0fde65a256d508c9e5406aba4464"

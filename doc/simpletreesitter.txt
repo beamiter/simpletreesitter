@@ -21,7 +21,7 @@ large buffers stay cheap to keep in sync.
 
 Supported filetypes: rust, c, cpp, cc, javascript, javascriptreact, jsx,
 typescript, typescriptreact, python, go, sh, bash, zsh, vim, vimrc, json,
-jsonc, yaml and toml.
+jsonc, yaml, toml, lua, html and css.
 
 ===============================================================================
 2. REQUIREMENTS                              *simpletreesitter-requirements*

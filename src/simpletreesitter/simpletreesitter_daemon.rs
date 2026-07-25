@@ -21,6 +21,9 @@ const SUPPORTED_LANGUAGES: &[&str] = &[
     "json",
     "yaml",
     "toml",
+    "lua",
+    "html",
+    "css",
 ];
 const PROTOCOL_VERSION: u32 = 3;
 
@@ -343,6 +346,21 @@ impl Server {
                 tree_sitter_vim9::LANGUAGE.into(),
                 queries::VIM_QUERY,
                 queries::VIM_SYM_QUERY,
+            ),
+            "lua" => (
+                tree_sitter_lua::LANGUAGE.into(),
+                queries::LUA_QUERY,
+                queries::LUA_SYM_QUERY,
+            ),
+            "html" => (
+                tree_sitter_html::LANGUAGE.into(),
+                queries::HTML_QUERY,
+                queries::HTML_SYM_QUERY,
+            ),
+            "css" => (
+                tree_sitter_css::LANGUAGE.into(),
+                queries::CSS_QUERY,
+                queries::CSS_SYM_QUERY,
             ),
             _ => return Err(anyhow!("unsupported language: {lang}")),
         };
@@ -3015,5 +3033,96 @@ mod tests {
         }
         assert_eq!(server.cache.len(), MAX_CACHED_BUFFERS);
         assert_eq!(server.cache_evictions, 3);
+    }
+
+    #[test]
+    fn lua_highlights_and_symbols() {
+        let mut server = Server::new();
+        let source = "local M = {}\n\
+                      -- doc comment\n\
+                      function M.greet(name)\n  print('hi ' .. name)\nend\n\
+                      function M:method_one()\nend\n\
+                      local top_level = 42\n\
+                      return M\n";
+        server
+            .set_text(1, "lua", source.to_string(), 1)
+            .expect("lua parse");
+        let (_, spans) = run_highlight_cached(&mut server, 1, "lua", None, false, None).unwrap();
+        let groups: Vec<&str> = spans.iter().map(|s| s.group.as_str()).collect();
+        for expected in [
+            "TSComment",
+            "TSString",
+            "TSKeyword",
+            "TSFunctionBuiltin",
+            "TSNumber",
+        ] {
+            assert!(
+                groups.contains(&expected),
+                "missing {expected} in {groups:?}"
+            );
+        }
+        let (_, symbols) = run_symbols_cached(&mut server, 1, "lua", None, None).unwrap();
+        let names: Vec<(&str, &str)> = symbols
+            .iter()
+            .map(|s| (s.kind.as_str(), s.name.as_str()))
+            .collect();
+        assert!(names.contains(&("function", "M.greet")), "{names:?}");
+        assert!(names.contains(&("method", "M:method_one")), "{names:?}");
+        assert!(names.contains(&("variable", "top_level")), "{names:?}");
+    }
+
+    #[test]
+    fn html_highlights_and_symbols() {
+        let mut server = Server::new();
+        let source = "<!DOCTYPE html>\n<!-- comment -->\n<html>\n<body class=\"main\">\n\
+                      <h1>Title</h1>\n<script>var x = 1;</script>\n</body>\n</html>\n";
+        server
+            .set_text(2, "html", source.to_string(), 1)
+            .expect("html parse");
+        let (_, spans) = run_highlight_cached(&mut server, 2, "html", None, false, None).unwrap();
+        let groups: Vec<&str> = spans.iter().map(|s| s.group.as_str()).collect();
+        for expected in ["TSComment", "TSType", "TSProperty", "TSString"] {
+            assert!(
+                groups.contains(&expected),
+                "missing {expected} in {groups:?}"
+            );
+        }
+        let (_, symbols) = run_symbols_cached(&mut server, 2, "html", None, None).unwrap();
+        assert!(
+            symbols.iter().any(|s| s.kind == "class" && s.name == "h1"),
+            "{symbols:?}"
+        );
+    }
+
+    #[test]
+    fn css_highlights_and_symbols() {
+        let mut server = Server::new();
+        let source = "/* comment */\n.card, #hero {\n  color: #fff;\n  margin: 2px;\n}\n\
+                      @media (min-width: 600px) {\n  .card { padding: 1em; }\n}\n\
+                      @keyframes spin {\n  from { opacity: 0; }\n  to { opacity: 1; }\n}\n";
+        server
+            .set_text(3, "css", source.to_string(), 1)
+            .expect("css parse");
+        let (_, spans) = run_highlight_cached(&mut server, 3, "css", None, false, None).unwrap();
+        let groups: Vec<&str> = spans.iter().map(|s| s.group.as_str()).collect();
+        for expected in [
+            "TSComment",
+            "TSProperty",
+            "TSField",
+            "TSNumber",
+            "TSKeyword",
+        ] {
+            assert!(
+                groups.contains(&expected),
+                "missing {expected} in {groups:?}"
+            );
+        }
+        let (_, symbols) = run_symbols_cached(&mut server, 3, "css", None, None).unwrap();
+        let names: Vec<(&str, &str)> = symbols
+            .iter()
+            .map(|s| (s.kind.as_str(), s.name.as_str()))
+            .collect();
+        assert!(names.contains(&("class", ".card, #hero")), "{names:?}");
+        assert!(names.contains(&("function", "spin")), "{names:?}");
     }
 }
