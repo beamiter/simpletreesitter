@@ -181,7 +181,9 @@ struct Span {
     col: u32,
     end_lnum: u32,
     end_col: u32,
-    group: String,
+    // 高亮组名全部来自 map_capture_to_group 的静态表；用 &'static str
+    // 避免每个 span 一次堆分配（大文件全量高亮时有数千个 span）。
+    group: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     depth: Option<u32>,
 }
@@ -196,14 +198,15 @@ struct Fold {
 #[derive(Debug, Serialize, Clone)]
 struct Symbol {
     name: String,
-    kind: String,
+    // 符号种类与容器种类都来自静态表，避免逐符号堆分配。
+    kind: &'static str,
     lnum: u32,
     col: u32,
     #[serde(default)]
     end_lnum: u32,
     #[serde(default)]
     end_col: u32,
-    container_kind: Option<String>,
+    container_kind: Option<&'static str>,
     container_name: Option<String>,
     container_lnum: Option<u32>,
     container_col: Option<u32>,
@@ -1081,7 +1084,7 @@ fn run_highlight_cached(
             let key = (lnum, col, end_lnum, end_col);
             let cname = query.capture_names()[cap.index as usize];
             let priority = capture_priority(cname);
-            let group = map_capture_to_group(cname).to_string();
+            let group = map_capture_to_group(cname);
             if group.is_empty() {
                 continue;
             }
@@ -1140,16 +1143,16 @@ fn run_symbols_cached(
     let limit = max_items.unwrap_or(MAX_SYMBOLS).min(MAX_SYMBOLS);
     use std::collections::{HashMap, HashSet};
     let mut seen = HashSet::<(
-        String,
+        &'static str,
         String,
         u32,
         u32,
-        Option<String>,
+        Option<&'static str>,
         Option<String>,
         Option<u32>,
         Option<u32>,
     )>::new();
-    let mut seen_at = HashMap::<(u32, u32), String>::new();
+    let mut seen_at = HashMap::<(u32, u32), &'static str>::new();
 
     let mut symbols = Vec::with_capacity(limit.min(4096));
 
@@ -1165,14 +1168,14 @@ fn run_symbols_cached(
             continue;
         }
         let cname = query.capture_names()[cap.index as usize];
-        let mut kind = map_symbol_capture(cname).to_string();
+        let mut kind = map_symbol_capture(cname);
         if kind.is_empty() {
             continue;
         }
 
         if cache.lang == "rust" && kind == "function" && ancestor_kind(node, "impl_item").is_some()
         {
-            kind = "method".to_string();
+            kind = "method";
         }
 
         let name = node_text(node, bytes);
@@ -1180,7 +1183,7 @@ fn run_symbols_cached(
         let lnum = sp.row as u32 + 1;
         let col = sp.column as u32 + 1;
         // Query 捕获的一般只是名称节点；向上找到真正的定义，范围才会覆盖函数体。
-        let def_end = definition_node(node, &cache.lang, &kind).end_position();
+        let def_end = definition_node(node, &cache.lang, kind).end_position();
         let sym_end_lnum = def_end.row as u32 + 1;
         let sym_end_col = def_end.column as u32 + 1;
 
@@ -1191,27 +1194,27 @@ fn run_symbols_cached(
         }
 
         // 容器信息（可选）
-        let mut ckind: Option<String> = None;
+        let mut ckind: Option<&'static str> = None;
         let mut cname_opt: Option<String> = None;
         let mut clnum: Option<u32> = None;
         let mut ccol: Option<u32> = None;
 
         // Rust 容器推断
         if cache.lang == "rust" {
-            match kind.as_str() {
+            match kind {
                 "field" => {
                     if let Some(vinfo) = variant_info(node, bytes) {
-                        ckind = Some("variant".to_string());
+                        ckind = Some("variant");
                         cname_opt = Some(vinfo.0);
                         clnum = Some(vinfo.1);
                         ccol = Some(vinfo.2);
                     } else if let Some(sinfo) = struct_info(node, bytes) {
-                        ckind = Some("struct".to_string());
+                        ckind = Some("struct");
                         cname_opt = Some(sinfo.0);
                         clnum = Some(sinfo.1);
                         ccol = Some(sinfo.2);
                     } else if let Some(minfo) = mod_info(node, bytes) {
-                        ckind = Some("namespace".to_string());
+                        ckind = Some("namespace");
                         cname_opt = Some(minfo.0);
                         clnum = Some(minfo.1);
                         ccol = Some(minfo.2);
@@ -1219,7 +1222,7 @@ fn run_symbols_cached(
                 }
                 "variant" => {
                     if let Some(einfo) = enum_info(node, bytes) {
-                        ckind = Some("enum".to_string());
+                        ckind = Some("enum");
                         cname_opt = Some(einfo.0);
                         clnum = Some(einfo.1);
                         ccol = Some(einfo.2);
@@ -1227,7 +1230,7 @@ fn run_symbols_cached(
                 }
                 "method" => {
                     if let Some(tinfo) = impl_type_info(node, bytes) {
-                        ckind = Some("type".to_string());
+                        ckind = Some("type");
                         cname_opt = Some(tinfo.0);
                         clnum = Some(tinfo.1);
                         ccol = Some(tinfo.2);
@@ -1235,12 +1238,12 @@ fn run_symbols_cached(
                 }
                 "function" => {
                     if let Some(finfo) = outer_fn_info(node, bytes) {
-                        ckind = Some("function".to_string());
+                        ckind = Some("function");
                         cname_opt = Some(finfo.0);
                         clnum = Some(finfo.1);
                         ccol = Some(finfo.2);
                     } else if let Some(minfo) = mod_info(node, bytes) {
-                        ckind = Some("namespace".to_string());
+                        ckind = Some("namespace");
                         cname_opt = Some(minfo.0);
                         clnum = Some(minfo.1);
                         ccol = Some(minfo.2);
@@ -1248,7 +1251,7 @@ fn run_symbols_cached(
                 }
                 "const" => {
                     if let Some(minfo) = mod_info(node, bytes) {
-                        ckind = Some("namespace".to_string());
+                        ckind = Some("namespace");
                         cname_opt = Some(minfo.0);
                         clnum = Some(minfo.1);
                         ccol = Some(minfo.2);
@@ -1263,7 +1266,7 @@ fn run_symbols_cached(
             if let Some(cls) = ancestor_kind(node, "class_declaration") {
                 if let Some(cls_name) = child_text_by_kind(cls, "identifier", bytes) {
                     if let Some((ln, co)) = child_pos_by_kind(cls, "identifier") {
-                        ckind = Some("class".to_string());
+                        ckind = Some("class");
                         cname_opt = Some(cls_name);
                         clnum = Some(ln);
                         ccol = Some(co);
@@ -1284,7 +1287,7 @@ fn run_symbols_cached(
                         && let Some(cls_name) = child_text_by_kind(cls, name_kind, bytes)
                         && let Some((ln, co)) = child_pos_by_kind(cls, name_kind)
                     {
-                        ckind = Some(container_kind.to_string());
+                        ckind = Some(container_kind);
                         cname_opt = Some(cls_name);
                         clnum = Some(ln);
                         ccol = Some(co);
@@ -1296,7 +1299,7 @@ fn run_symbols_cached(
                 && let Some(enum_name) = child_text_by_kind(en, "identifier", bytes)
                 && let Some((ln, co)) = child_pos_by_kind(en, "identifier")
             {
-                ckind = Some("enum".to_string());
+                ckind = Some("enum");
                 cname_opt = Some(enum_name);
                 clnum = Some(ln);
                 ccol = Some(co);
@@ -1322,7 +1325,7 @@ fn run_symbols_cached(
                     .and_then(|key| descendant_by_kind(key, key_kind))
             {
                 let sp = key_node.start_position();
-                ckind = Some("property".to_string());
+                ckind = Some("property");
                 cname_opt = Some(node_text(key_node, bytes));
                 clnum = Some(sp.row as u32 + 1);
                 ccol = Some(sp.column as u32 + 1);
@@ -1339,7 +1342,7 @@ fn run_symbols_cached(
                 if let Some(key_name) = child_text_by_kind(table, key_kind, bytes)
                     && let Some((ln, co)) = child_pos_by_kind(table, key_kind)
                 {
-                    ckind = Some("namespace".to_string());
+                    ckind = Some("namespace");
                     cname_opt = Some(key_name);
                     clnum = Some(ln);
                     ccol = Some(co);
@@ -1355,7 +1358,7 @@ fn run_symbols_cached(
             && let Some(cls_name) = child_text_by_kind(cls, "identifier", bytes)
             && let Some((ln, co)) = child_pos_by_kind(cls, "identifier")
         {
-            ckind = Some("class".to_string());
+            ckind = Some("class");
             cname_opt = Some(cls_name);
             clnum = Some(ln);
             ccol = Some(co);
@@ -1382,7 +1385,7 @@ fn run_symbols_cached(
                                         child_text_by_kind(pd, "type_identifier", bytes)
                                     {
                                         let sp = pd.start_position();
-                                        ckind = Some("type".to_string());
+                                        ckind = Some("type");
                                         cname_opt = Some(tname);
                                         clnum = Some(sp.row as u32 + 1);
                                         ccol = Some(sp.column as u32 + 1);
@@ -1398,7 +1401,7 @@ fn run_symbols_cached(
                 && let Some(type_name) = child_text_by_kind(type_spec, "type_identifier", bytes)
                 && let Some((ln, co)) = child_pos_by_kind(type_spec, "type_identifier")
             {
-                ckind = Some("type".to_string());
+                ckind = Some("type");
                 cname_opt = Some(type_name);
                 clnum = Some(ln);
                 ccol = Some(co);
@@ -1426,13 +1429,13 @@ fn run_symbols_cached(
                     cur = parent;
                 }
                 if in_func {
-                    ckind = Some("function".to_string());
+                    ckind = Some("function");
                 }
             }
         }
 
         // 同一位置的 function/method 去重规则
-        if let Some(prev) = seen_at.get(&(lnum, col)) {
+        if let Some(&prev) = seen_at.get(&(lnum, col)) {
             if prev == "method" && kind == "function" {
                 continue;
             }
@@ -1442,18 +1445,18 @@ fn run_symbols_cached(
                 }) {
                     symbols.remove(pos);
                 }
-                seen_at.insert((lnum, col), "method".to_string());
+                seen_at.insert((lnum, col), "method");
             }
         } else {
-            seen_at.insert((lnum, col), kind.clone());
+            seen_at.insert((lnum, col), kind);
         }
 
         let key = (
-            kind.clone(),
+            kind,
             name.clone(),
             lnum,
             col,
-            ckind.clone(),
+            ckind,
             cname_opt.clone(),
             clnum,
             ccol,
@@ -1483,11 +1486,11 @@ fn run_symbols_cached(
     if cache.lang == "vim" && symbols.len() < limit {
         for symbol in extract_vim_declarations(&cache.text, lrange, limit - symbols.len()) {
             let key = (
-                symbol.kind.clone(),
+                symbol.kind,
                 symbol.name.clone(),
                 symbol.lnum,
                 symbol.col,
-                symbol.container_kind.clone(),
+                symbol.container_kind,
                 symbol.container_name.clone(),
                 symbol.container_lnum,
                 symbol.container_col,
@@ -1585,7 +1588,7 @@ fn run_symbols_cached(
                                 (None, None)
                             } else {
                                 (
-                                    Some("mapping".to_string()),
+                                    Some("mapping"),
                                     Some(format!("{} {}", cmd.trim(), lhs)),
                                 )
                             }
@@ -1608,7 +1611,7 @@ fn run_symbols_cached(
                                 });
                             match plug_name {
                                 Some(name) => {
-                                    (Some("module".to_string()), Some(format!("Plug: {}", name)))
+                                    (Some("module"), Some(format!("Plug: {}", name)))
                                 }
                                 None => (None, None),
                             }
@@ -1626,7 +1629,7 @@ fn run_symbols_cached(
                                 (None, None)
                             } else {
                                 (
-                                    Some("property".to_string()),
+                                    Some("property"),
                                     Some(format!("{} {}", cmd.trim(), opts_str)),
                                 )
                             }
@@ -1640,7 +1643,7 @@ fn run_symbols_cached(
                                 .map(|c| node_text(c, bytes).trim().to_string());
                             match group {
                                 Some(g) if g != "END" => (
-                                    Some("namespace".to_string()),
+                                    Some("namespace"),
                                     Some(format!("augroup {}", g)),
                                 ),
                                 _ => (None, None),
@@ -1659,7 +1662,7 @@ fn run_symbols_cached(
                                 (None, None)
                             } else {
                                 (
-                                    Some("event".to_string()),
+                                    Some("event"),
                                     Some(format!("autocmd {}", args.join(" "))),
                                 )
                             }
@@ -1673,7 +1676,7 @@ fn run_symbols_cached(
                                 .map(|c| node_text(c, bytes).trim().to_string());
                             match scheme {
                                 Some(s) => (
-                                    Some("property".to_string()),
+                                    Some("property"),
                                     Some(format!("colorscheme {}", s)),
                                 ),
                                 None => (None, None),
@@ -1687,7 +1690,7 @@ fn run_symbols_cached(
                                 .find(|c| c.kind() == "safe_arg")
                                 .map(|c| node_text(c, bytes).trim().to_string());
                             match fname {
-                                Some(f) => (Some("function".to_string()), Some(f)),
+                                Some(f) => (Some("function"), Some(f)),
                                 None => (None, None),
                             }
                         }
@@ -1707,7 +1710,7 @@ fn run_symbols_cached(
                                         .find(|w| !w.starts_with('-'))
                                         .unwrap_or(&r);
                                     (
-                                        Some("method".to_string()),
+                                        Some("method"),
                                         Some(format!("command! {}", cmd_def_name)),
                                     )
                                 }
@@ -1716,7 +1719,7 @@ fn run_symbols_cached(
                         }
                         // plug#begin / plug#end
                         s if s.contains('#') => {
-                            (Some("namespace".to_string()), Some(cmd.trim().to_string()))
+                            (Some("namespace"), Some(cmd.trim().to_string()))
                         }
                         // filetype, syntax
                         "filetype" | "syntax" => {
@@ -1727,7 +1730,7 @@ fn run_symbols_cached(
                                 .map(|c| node_text(c, bytes).trim().to_string())
                                 .collect();
                             (
-                                Some("property".to_string()),
+                                Some("property"),
                                 Some(format!("{} {}", cmd.trim(), args.join(" "))),
                             )
                         }
@@ -1744,7 +1747,7 @@ fn run_symbols_cached(
                                 (None, None)
                             } else {
                                 (
-                                    Some("property".to_string()),
+                                    Some("property"),
                                     Some(format!("{} {}", cmd.trim(), args.join(" "))),
                                 )
                             }
@@ -1753,7 +1756,7 @@ fn run_symbols_cached(
                     };
                     if let (Some(kind), Some(name)) = (sym_kind, sym_name) {
                         let key = (
-                            kind.clone(),
+                            kind,
                             name.clone(),
                             lnum,
                             col,
@@ -1797,7 +1800,7 @@ fn run_symbols_cached(
             .map(|symbol| (symbol.name.clone(), (symbol.lnum, symbol.col)))
             .collect();
         for symbol in &mut symbols {
-            if symbol.container_kind.as_deref() == Some("type")
+            if symbol.container_kind == Some("type")
                 && let Some(name) = &symbol.container_name
                 && let Some((line, column)) = type_positions.get(name)
             {
@@ -1989,12 +1992,12 @@ fn extract_vim_declarations(text: &str, lrange: Option<(u32, u32)>, limit: usize
                     let container = functions.last();
                     symbols.push(Symbol {
                         name: name.to_string(),
-                        kind: "function".to_string(),
+                        kind: "function",
                         lnum: line_number,
                         col: column,
                         end_lnum: line_number,
                         end_col: source_line.len() as u32 + 1,
-                        container_kind: container.map(|_| "function".to_string()),
+                        container_kind: container.map(|_| "function"),
                         container_name: container.map(|value| value.0.clone()),
                         container_lnum: container.map(|value| value.1),
                         container_col: container.map(|value| value.2),
@@ -2032,15 +2035,15 @@ fn extract_vim_declarations(text: &str, lrange: Option<(u32, u32)>, limit: usize
             symbols.push(Symbol {
                 name: name.to_string(),
                 kind: if matches!(keyword, "const" | "final") {
-                    "const".to_string()
+                    "const"
                 } else {
-                    "variable".to_string()
+                    "variable"
                 },
                 lnum: line_number,
                 col: (declaration_offset + keyword.len() + spaces + 1) as u32,
                 end_lnum: line_number,
                 end_col: source_line.len() as u32 + 1,
-                container_kind: container.map(|_| "function".to_string()),
+                container_kind: container.map(|_| "function"),
                 container_name: container.map(|value| value.0.clone()),
                 container_lnum: container.map(|value| value.1),
                 container_col: container.map(|value| value.2),
@@ -2733,7 +2736,7 @@ mod tests {
 
         let (_, spans) =
             run_highlight_cached(&mut server, 9, "markdown", None, false, None).unwrap();
-        let groups: Vec<&str> = spans.iter().map(|s| s.group.as_str()).collect();
+        let groups: Vec<&str> = spans.iter().map(|s| s.group).collect();
         for expected in [
             "TSTitle",    // headings (block)
             "TSEmphasis", // *emphasis* (inline)
@@ -2753,7 +2756,7 @@ mod tests {
         let (_, symbols) = run_symbols_cached(&mut server, 9, "markdown", None, None).unwrap();
         let names: Vec<(&str, &str)> = symbols
             .iter()
-            .map(|s| (s.kind.as_str(), s.name.as_str()))
+            .map(|s| (s.kind, s.name.as_str()))
             .collect();
         assert!(names.contains(&("namespace", "Top")), "{names:?}");
         assert!(names.contains(&("class", "Second level")), "{names:?}");
@@ -2824,7 +2827,7 @@ mod tests {
             .iter()
             .find(|symbol| symbol.name == "inner")
             .unwrap();
-        assert_eq!(inner.container_kind.as_deref(), Some("function"));
+        assert_eq!(inner.container_kind, Some("function"));
         assert_eq!(inner.container_name.as_deref(), Some("outer"));
         assert!(symbols.iter().all(|symbol| symbol.end_lnum >= symbol.lnum));
     }
@@ -3130,7 +3133,7 @@ mod tests {
             .find(|s| s.name == "area" && s.container_name.as_deref() == Some("Circle"))
             .unwrap();
         assert_eq!(circle_area.kind, "method");
-        assert_eq!(circle_area.container_kind.as_deref(), Some("class"));
+        assert_eq!(circle_area.container_kind, Some("class"));
         let radius = symbols.iter().find(|s| s.name == "radius").unwrap();
         assert_eq!(radius.container_name.as_deref(), Some("Circle"));
         let red = symbols.iter().find(|s| s.name == "Red").unwrap();
@@ -3157,7 +3160,7 @@ mod tests {
         let (_, symbols) = run_symbols_cached(&mut server, 1, "yaml", None, None).unwrap();
         let host = symbols.iter().find(|s| s.name == "host").unwrap();
         assert_eq!(host.container_name.as_deref(), Some("server"));
-        assert_eq!(host.container_kind.as_deref(), Some("property"));
+        assert_eq!(host.container_kind, Some("property"));
 
         server
             .set_text(
@@ -3170,7 +3173,7 @@ mod tests {
         let (_, symbols) = run_symbols_cached(&mut server, 2, "toml", None, None).unwrap();
         let serde = symbols.iter().find(|s| s.name == "serde").unwrap();
         assert_eq!(serde.container_name.as_deref(), Some("dependencies"));
-        assert_eq!(serde.container_kind.as_deref(), Some("namespace"));
+        assert_eq!(serde.container_kind, Some("namespace"));
         let top = symbols.iter().find(|s| s.name == "top").unwrap();
         assert!(top.container_kind.is_none());
 
@@ -3207,7 +3210,7 @@ mod tests {
             .set_text(1, "lua", source.to_string(), 1)
             .expect("lua parse");
         let (_, spans) = run_highlight_cached(&mut server, 1, "lua", None, false, None).unwrap();
-        let groups: Vec<&str> = spans.iter().map(|s| s.group.as_str()).collect();
+        let groups: Vec<&str> = spans.iter().map(|s| s.group).collect();
         for expected in [
             "TSComment",
             "TSString",
@@ -3223,7 +3226,7 @@ mod tests {
         let (_, symbols) = run_symbols_cached(&mut server, 1, "lua", None, None).unwrap();
         let names: Vec<(&str, &str)> = symbols
             .iter()
-            .map(|s| (s.kind.as_str(), s.name.as_str()))
+            .map(|s| (s.kind, s.name.as_str()))
             .collect();
         assert!(names.contains(&("function", "M.greet")), "{names:?}");
         assert!(names.contains(&("method", "M:method_one")), "{names:?}");
@@ -3239,7 +3242,7 @@ mod tests {
             .set_text(2, "html", source.to_string(), 1)
             .expect("html parse");
         let (_, spans) = run_highlight_cached(&mut server, 2, "html", None, false, None).unwrap();
-        let groups: Vec<&str> = spans.iter().map(|s| s.group.as_str()).collect();
+        let groups: Vec<&str> = spans.iter().map(|s| s.group).collect();
         for expected in ["TSComment", "TSType", "TSProperty", "TSString"] {
             assert!(
                 groups.contains(&expected),
@@ -3263,7 +3266,7 @@ mod tests {
             .set_text(3, "css", source.to_string(), 1)
             .expect("css parse");
         let (_, spans) = run_highlight_cached(&mut server, 3, "css", None, false, None).unwrap();
-        let groups: Vec<&str> = spans.iter().map(|s| s.group.as_str()).collect();
+        let groups: Vec<&str> = spans.iter().map(|s| s.group).collect();
         for expected in [
             "TSComment",
             "TSProperty",
@@ -3279,7 +3282,7 @@ mod tests {
         let (_, symbols) = run_symbols_cached(&mut server, 3, "css", None, None).unwrap();
         let names: Vec<(&str, &str)> = symbols
             .iter()
-            .map(|s| (s.kind.as_str(), s.name.as_str()))
+            .map(|s| (s.kind, s.name.as_str()))
             .collect();
         assert!(names.contains(&("class", ".card, #hero")), "{names:?}");
         assert!(names.contains(&("function", "spin")), "{names:?}");

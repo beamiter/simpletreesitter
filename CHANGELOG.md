@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1 — 2026-07-26
+
+- Performance: highlight span groups and symbol kinds now use `&'static str`
+  from the capture tables instead of per-item heap allocations — a full
+  highlight pass on a large buffer no longer allocates thousands of short
+  strings, and symbol dedup keys got cheaper.
+- Release profile now aborts on panic (daemons never unwind), trimming the
+  binary.
+
 ## 0.5.0 — 2026-07-25
 
 - Added Markdown (GFM) support with a dual-tree pipeline: the block grammar
