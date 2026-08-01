@@ -84,20 +84,21 @@ doautocmd BufEnter
 sleep 100m
 call assert_equal([], prop_list(1, {'bufnr': s:source}))
 
-" Events already queued by the old job must be fenced off after Disable.
-call s:CallPrivate('OnDaemonEvent', [json_encode({
+" Events already queued by the old job must be fenced off after Disable.  The
+" job-level fence now lives in the supervisor (see tests/vim_core.vim); what
+" this checks is that a leaked event cannot revive a disabled plugin.
+call s:CallPrivate('OnDaemonEvent', [{
       \ 'type': 'error',
       \ 'buf': s:source,
       \ 'message': 'buffer not cached',
-      \ }), s:old_generation])
-call s:CallPrivate('OnDaemonEvent', [json_encode({
+      \ }])
+call s:CallPrivate('OnDaemonEvent', [{
       \ 'type': 'hello',
       \ 'protocol_version': 2,
-      \ }), s:old_generation])
+      \ }])
 sleep 100m
-let s:disabled_state = s:State()
-call assert_false(s:disabled_state.s_running, 'old daemon callback restarted the daemon after Disable')
-call assert_equal(0, s:disabled_state.s_protocol_version, 'old daemon callback mutated disabled protocol state')
+call assert_false(simpletreesitter#core#IsRunning(),
+      \ 'old daemon callback restarted the daemon after Disable')
 call assert_equal([], prop_list(1, {'bufnr': s:source}))
 
 " BufUnload/close tombstones must reject a late ACK before it can revive the
@@ -109,16 +110,15 @@ let s:closed = bufnr()
 call simpletreesitter#Enable()
 sleep 100m
 let s:closed_revision = getbufinfo(s:closed)[0].changedtick
-let s:closed_generation = s:State().s_daemon_generation
 call prop_clear(1, line('$'), {'bufnr': s:closed})
 call simpletreesitter#OnBufClose(s:closed)
-call s:CallPrivate('OnDaemonEvent', [json_encode({
+call s:CallPrivate('OnDaemonEvent', [{
       \ 'type': 'ok',
       \ 'op': 'set_text',
       \ 'buf': s:closed,
       \ 'revision': s:closed_revision,
-      \ }), s:closed_generation])
-call s:CallPrivate('OnDaemonEvent', [json_encode({
+      \ }])
+call s:CallPrivate('OnDaemonEvent', [{
       \ 'type': 'highlights',
       \ 'buf': s:closed,
       \ 'revision': s:closed_revision,
@@ -129,7 +129,7 @@ call s:CallPrivate('OnDaemonEvent', [json_encode({
       \   'end_col': 3,
       \   'group': 'TSKeyword',
       \ }],
-      \ }), s:closed_generation])
+      \ }])
 let s:closed_state = s:State()
 call assert_true(get(s:closed_state.s_closed_bufs, string(s:closed), 0))
 call assert_false(has_key(s:closed_state.s_sent_changedtick, string(s:closed)), 'late ACK revived a closed buffer revision')

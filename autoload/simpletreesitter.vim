@@ -1,8 +1,6 @@
 vim9script
 
 # =============== 状态 ===============
-var s_job: any = v:null
-var s_running: bool = false
 var s_enabled: bool = false
 var s_daemon_generation: number = 0
 var s_protocol_version: number = 0
@@ -274,22 +272,45 @@ def EnsureHlGroupsAndProps()
   endtry
 enddef
 
-def FindDaemon(): string
-  var p = get(g:, 'simpletreesitter_daemon_path', '')
-  if type(p) == v:t_string && p !=# '' && executable(p)
-    return p
+# The vendored simplecore supervisor owns the daemon process: job_status-based
+# liveness (a 'fail' job is never mistaken for a live one), generation-guarded
+# callbacks, exponential-backoff restarts and a crash-loop breaker.
+var s_core_ready: bool = false
+
+def SetupCore()
+  if s_core_ready
+    return
   endif
-  for dir in split(&runtimepath, ',')
-    var exe = dir .. '/lib/ts-hl-daemon'
-    if executable(exe)
-      return exe
-    endif
-    var exe2 = dir .. '/lib/ts-hl-daemon.exe'
-    if executable(exe2)
-      return exe2
-    endif
-  endfor
-  return ''
+  s_core_ready = true
+  simpletreesitter#core#Setup({
+    name: 'ts-hl',
+    exe: 'ts-hl-daemon',
+    path_var: 'simpletreesitter_daemon_path',
+    debug_var: 'simpletreesitter_debug',
+    OnEvent: OnDaemonEvent,
+    OnStart: OnDaemonStart,
+    OnExit: OnDaemonExit,
+  })
+enddef
+
+def FindDaemon(): string
+  SetupCore()
+  return simpletreesitter#core#FindExe()
+enddef
+
+# A new process has no buffer cache, so every buffer must re-handshake.
+def OnDaemonStart()
+  InvalidateDaemonSession()
+  EnsureHlGroupsAndProps()
+  simpletreesitter#core#Send({type: 'hello', client_protocol: 3})
+enddef
+
+def OnDaemonExit(code: number, restarting: bool)
+  s_protocol_version = 0
+  InvalidateDaemonSession()
+  if restarting
+    Log('daemon exited with code ' .. code .. '; restarting')
+  endif
 enddef
 
 def BufLineCount(buf: number): number
@@ -492,20 +513,8 @@ def EventRevisionIsCurrent(ev: dict<any>, buf: number): bool
   return revision == acknowledged && revision == GetChangedTick(buf)
 enddef
 
-def OnDaemonEvent(line: string, generation: number)
-  if generation != s_daemon_generation
-    return
-  endif
-  if line ==# ''
-    return
-  endif
-  var ev: any
-  try
-    ev = json_decode(line)
-  catch
-    return
-  endtry
-  if type(ev) != v:t_dict || !has_key(ev, 'type')
+def OnDaemonEvent(ev: dict<any>)
+  if !has_key(ev, 'type')
     return
   endif
   var event_buf = get(ev, 'buf', 0)
@@ -674,85 +683,12 @@ def OnDaemonEvent(line: string, generation: number)
 enddef
 
 def EnsureDaemon(): bool
-  if s_running && s_job != v:null
-    try
-      if job_status(s_job) ==# 'run'
-        return true
-      endif
-    catch
-    endtry
-  endif
-  s_running = false
-  s_job = v:null
-  var exe = FindDaemon()
-  if exe ==# ''
-    echohl ErrorMsg
-    echom '[ts-hl] daemon not found, set g:simpletreesitter_daemon_path or place ts-hl-daemon in runtimepath/lib'
-    echohl None
-    return false
-  endif
-  # 新进程没有任何 buffer cache，必须强制所有 buffer 重新握手。
-  InvalidateDaemonSession()
-  var generation = s_daemon_generation
-  try
-    s_job = job_start([exe], {
-      in_io: 'pipe',
-      out_mode: 'nl',
-      out_cb: (ch, l) => OnDaemonEvent(l, generation),
-      err_mode: 'nl',
-      err_cb: (ch, l) => {
-        if generation == s_daemon_generation
-          Log('daemon stderr: ' .. l)
-        endif
-      },
-      exit_cb: (ch, code) => {
-        if generation == s_daemon_generation
-          s_running = false
-          s_job = v:null
-          InvalidateDaemonSession()
-          Log('Daemon exited with code ' .. code)
-        endif
-    },
-    stoponexit: 'term'
-    })
-  catch
-    # job_start() 即使在部分初始化后抛错，也不能留下仍可写入当前状态的 callback。
-    InvalidateDaemonSession()
-    s_job = v:null
-    s_running = false
-    echohl ErrorMsg
-    echom '[ts-hl] failed to start daemon: ' .. v:exception
-    echohl None
-    return false
-  endtry
-  s_running = (s_job != v:null)
-  if s_running
-    EnsureHlGroupsAndProps()
-    Log('Daemon started successfully')
-    Send({type: 'hello', client_protocol: 3})
-  endif
-  return s_running
+  SetupCore()
+  return simpletreesitter#core#Ensure()
 enddef
 
 def Send(req: dict<any>): bool
-  if !s_running
-    return false
-  endif
-  try
-    var j = json_encode(req) .. "\n"
-    ch_sendraw(s_job, j)
-    return true
-  catch
-    Log('Failed to send request: ' .. v:exception)
-    var failed_job = s_job
-    s_running = false
-    s_job = v:null
-    InvalidateDaemonSession()
-    if failed_job != v:null
-      try | job_stop(failed_job, 'term') | catch | endtry
-    endif
-    return false
-  endtry
+  return simpletreesitter#core#Send(req)
 enddef
 
 def StopBufTimer(buf: number)
@@ -1228,7 +1164,7 @@ def ScheduleFolds(buf: number)
 enddef
 
 def RequestFoldsNow(buf: number)
-  if !s_enabled || !s_running || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+  if !s_enabled || !simpletreesitter#core#IsRunning() || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
     return
   endif
   var lang = DetectLang(buf)
@@ -1336,7 +1272,7 @@ enddef
 
 # =============== 符号 location list ===============
 def RequestLoclistSymbols(buf: number)
-  if !s_enabled || !s_running || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+  if !s_enabled || !simpletreesitter#core#IsRunning() || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
     s_loclist_pending[buf] = false
     return
   endif
@@ -1592,17 +1528,45 @@ export def Enable()
   endif
 enddef
 
+export def Restart()
+  SetupCore()
+  s_protocol_version = 0
+  InvalidateDaemonSession()
+  if simpletreesitter#core#Restart()
+    echom '[ts-hl] daemon restarted'
+  endif
+enddef
+
+export def ShowLog()
+  simpletreesitter#core#ShowLog()
+enddef
+
+export def Health()
+  SetupCore()
+  var h = simpletreesitter#core#Health()
+  echo '[ts-hl] health'
+  for line in simpletreesitter#core#HealthLines()
+    echo '  ' .. line
+  endfor
+  echo printf('  [%s] protocol: v%d (plugin speaks v3)',
+    s_protocol_version >= 3 ? 'OK' : 'WARN', s_protocol_version)
+  echo printf('  [%s] text properties: %s',
+    has('textprop') ? 'OK' : 'ERROR',
+    has('textprop') ? 'available' : 'missing +textprop — highlighting disabled')
+  echo printf('  [INFO] enabled: %s, active buffers: %d',
+    s_enabled ? 'yes' : 'no', len(s_active_bufs))
+enddef
+
 export def Disable()
-  if !s_enabled && !s_running && s_outline_win == 0
+  if !s_enabled && !simpletreesitter#core#IsRunning() && s_outline_win == 0
     s_user_disabled = true
     return
   endif
   s_enabled = false
   s_user_disabled = true   # 记录用户主动关闭
   # 先失效当前会话；随后即使旧 channel 中已有回调排队，也不能重新绘制或调度请求。
-  var job_to_stop = s_job
-  s_running = false
-  s_job = v:null
+  SetupCore()
+  simpletreesitter#core#Stop()
   InvalidateDaemonSession()
   if s_sym_timer != 0
     try | timer_stop(s_sym_timer) | catch | endtry
@@ -1635,13 +1599,6 @@ export def Disable()
   if get(g:, 'simpletreesitter_clear_props_on_disable', 1)
     ClearAllProps()
   endif
-  if job_to_stop != v:null
-    try
-      call job_stop(job_to_stop, 'term')
-      Log('Daemon stopped')
-    catch
-    endtry
-  endif
   # 清理 listener 与折叠状态
   RemoveAllListeners()
   RestoreFoldSettings()
@@ -1667,7 +1624,7 @@ export def Toggle()
 enddef
 
 export def Status()
-  if !s_running
+  if !simpletreesitter#core#IsRunning()
     echo '[ts-hl] daemon is stopped'
     return
   endif
@@ -1784,7 +1741,7 @@ export def OnBufClose(buf: number)
   endif
   StopBufTimer(buf)
   StopSyncTimer(buf)
-  if had_cache && s_running && s_protocol_version >= 2
+  if had_cache && simpletreesitter#core#IsRunning() && s_protocol_version >= 2
     Send({type: 'close_buffer', buf: buf})
   endif
   RemoveListener(buf)

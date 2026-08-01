@@ -47,3 +47,9 @@ jobs:
 
       - name: Validate installer syntax
         run: bash -n install.sh
+
+      - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
+        run: make defcompile
+
+      - name: simplecore supervisor regression suite
+        run: make vim-core

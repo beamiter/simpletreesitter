@@ -95,6 +95,9 @@ command! TsHlDumpAST        call simpletreesitter#DumpAST()
 command! TsHlStatus         call simpletreesitter#Status()
 command! TsHlSymbols        call simpletreesitter#SymbolsToLoclist()
 command! TsHlFoldsToggle    call simpletreesitter#FoldsToggle()
+command! TsHlHealth  call simpletreesitter#Health()
+command! TsHlRestart call simpletreesitter#Restart()
+command! TsHlLog     call simpletreesitter#ShowLog()
 
 # =============== 快捷键 ===============
 nnoremap <silent> <Plug>(simpletreesitter-toggle) <Cmd>TsHlToggle<CR>

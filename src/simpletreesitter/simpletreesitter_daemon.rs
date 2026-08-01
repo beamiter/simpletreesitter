@@ -1587,10 +1587,7 @@ fn run_symbols_cached(
                             if lhs.is_empty() {
                                 (None, None)
                             } else {
-                                (
-                                    Some("mapping"),
-                                    Some(format!("{} {}", cmd.trim(), lhs)),
-                                )
+                                (Some("mapping"), Some(format!("{} {}", cmd.trim(), lhs)))
                             }
                         }
                         // Plug 插件
@@ -1610,9 +1607,7 @@ fn run_symbols_cached(
                                     }
                                 });
                             match plug_name {
-                                Some(name) => {
-                                    (Some("module"), Some(format!("Plug: {}", name)))
-                                }
+                                Some(name) => (Some("module"), Some(format!("Plug: {}", name))),
                                 None => (None, None),
                             }
                         }
@@ -1642,10 +1637,9 @@ fn run_symbols_cached(
                                 .find(|c| c.kind() == "safe_arg")
                                 .map(|c| node_text(c, bytes).trim().to_string());
                             match group {
-                                Some(g) if g != "END" => (
-                                    Some("namespace"),
-                                    Some(format!("augroup {}", g)),
-                                ),
+                                Some(g) if g != "END" => {
+                                    (Some("namespace"), Some(format!("augroup {}", g)))
+                                }
                                 _ => (None, None),
                             }
                         }
@@ -1661,10 +1655,7 @@ fn run_symbols_cached(
                             if args.is_empty() {
                                 (None, None)
                             } else {
-                                (
-                                    Some("event"),
-                                    Some(format!("autocmd {}", args.join(" "))),
-                                )
+                                (Some("event"), Some(format!("autocmd {}", args.join(" "))))
                             }
                         }
                         // Colorscheme
@@ -1675,10 +1666,7 @@ fn run_symbols_cached(
                                 .find(|c| c.kind() == "safe_arg")
                                 .map(|c| node_text(c, bytes).trim().to_string());
                             match scheme {
-                                Some(s) => (
-                                    Some("property"),
-                                    Some(format!("colorscheme {}", s)),
-                                ),
+                                Some(s) => (Some("property"), Some(format!("colorscheme {}", s))),
                                 None => (None, None),
                             }
                         }
@@ -1709,18 +1697,13 @@ fn run_symbols_cached(
                                         .split_whitespace()
                                         .find(|w| !w.starts_with('-'))
                                         .unwrap_or(&r);
-                                    (
-                                        Some("method"),
-                                        Some(format!("command! {}", cmd_def_name)),
-                                    )
+                                    (Some("method"), Some(format!("command! {}", cmd_def_name)))
                                 }
                                 None => (None, None),
                             }
                         }
                         // plug#begin / plug#end
-                        s if s.contains('#') => {
-                            (Some("namespace"), Some(cmd.trim().to_string()))
-                        }
+                        s if s.contains('#') => (Some("namespace"), Some(cmd.trim().to_string())),
                         // filetype, syntax
                         "filetype" | "syntax" => {
                             let mut cursor = n.walk();
@@ -1755,16 +1738,7 @@ fn run_symbols_cached(
                         _ => (None, None),
                     };
                     if let (Some(kind), Some(name)) = (sym_kind, sym_name) {
-                        let key = (
-                            kind,
-                            name.clone(),
-                            lnum,
-                            col,
-                            None,
-                            None,
-                            None,
-                            None,
-                        );
+                        let key = (kind, name.clone(), lnum, col, None, None, None, None);
                         if !seen.contains(&key) {
                             seen.insert(key);
                             let ep = n.end_position();
@@ -2754,10 +2728,7 @@ mod tests {
         }
 
         let (_, symbols) = run_symbols_cached(&mut server, 9, "markdown", None, None).unwrap();
-        let names: Vec<(&str, &str)> = symbols
-            .iter()
-            .map(|s| (s.kind, s.name.as_str()))
-            .collect();
+        let names: Vec<(&str, &str)> = symbols.iter().map(|s| (s.kind, s.name.as_str())).collect();
         assert!(names.contains(&("namespace", "Top")), "{names:?}");
         assert!(names.contains(&("class", "Second level")), "{names:?}");
         assert!(names.contains(&("namespace", "Setext Title")), "{names:?}");
@@ -3224,10 +3195,7 @@ mod tests {
             );
         }
         let (_, symbols) = run_symbols_cached(&mut server, 1, "lua", None, None).unwrap();
-        let names: Vec<(&str, &str)> = symbols
-            .iter()
-            .map(|s| (s.kind, s.name.as_str()))
-            .collect();
+        let names: Vec<(&str, &str)> = symbols.iter().map(|s| (s.kind, s.name.as_str())).collect();
         assert!(names.contains(&("function", "M.greet")), "{names:?}");
         assert!(names.contains(&("method", "M:method_one")), "{names:?}");
         assert!(names.contains(&("variable", "top_level")), "{names:?}");
@@ -3280,10 +3248,7 @@ mod tests {
             );
         }
         let (_, symbols) = run_symbols_cached(&mut server, 3, "css", None, None).unwrap();
-        let names: Vec<(&str, &str)> = symbols
-            .iter()
-            .map(|s| (s.kind, s.name.as_str()))
-            .collect();
+        let names: Vec<(&str, &str)> = symbols.iter().map(|s| (s.kind, s.name.as_str())).collect();
         assert!(names.contains(&("class", ".card, #hero")), "{names:?}");
         assert!(names.contains(&("function", "spin")), "{names:?}");
     }
