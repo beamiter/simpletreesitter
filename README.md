@@ -42,7 +42,7 @@
 
 - Vim 9.0+，并包含 `+vim9script`、`+job`、`+channel`、`+textprop`、`+timers`。
 - UTF-8 编码。
-- Rust 1.85+，用于构建 daemon。
+- Rust 1.88+，用于构建 daemon。
 - 当前插件使用 Vim9 script，不支持 Neovim。
 
 ## 安装与更新

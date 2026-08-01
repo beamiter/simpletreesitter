@@ -32,7 +32,7 @@ Outline shows the heading hierarchy (h1..h6 map to distinct symbol kinds).
 2. REQUIREMENTS                              *simpletreesitter-requirements*
 
 Vim 9.0+ with +vim9script, +job, +channel, +textprop and +timers; UTF-8; and
-Rust 1.85+ when building the daemon.  Neovim is not supported.
+Rust 1.88+ when building the daemon.  Neovim is not supported.
 
 Build or update the daemon from the plugin directory: >
 

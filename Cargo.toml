@@ -2,7 +2,7 @@
 name = "simpletreesitter"
 version = "0.5.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Tree-sitter powered syntax highlighting and code outline daemon for Vim9"
 license = "MIT"
 repository = "https://github.com/beamiter/simpletreesitter"

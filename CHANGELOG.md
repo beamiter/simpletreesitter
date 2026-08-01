@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-08-01
 
+### 构建与 CI 修复
+
+- clippy 的 `collapsible_if` / `manual_is_multiple_of` 属于按 MSRV 放开的 lint;声明升到 1.88 后开始生效,17 处已修正。
+- `rust-version` 由 1.85 更正为 1.88:daemon 自身有 26 处 let-chains,按 1.85 根本编译不过;README、doc 与 install.sh 的提示同步更新。
+- 修复 clippy `manual_filter`(CI 用的 1.97 会报错,本地 1.96 不报),该作业已失败很久。
+- 新增 CI 的 MSRV 作业。
+
 ### 修复
 
 - `cargo fmt --check` 长期不通过(与本仓库 CI 的质量门冲突),现已按当前 rustfmt

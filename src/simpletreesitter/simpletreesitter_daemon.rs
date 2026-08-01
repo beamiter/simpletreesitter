@@ -942,7 +942,7 @@ impl SparseLineIndex {
                 continue;
             }
             newline_count += 1;
-            if newline_count % LINE_INDEX_STRIDE == 0 {
+            if newline_count.is_multiple_of(LINE_INDEX_STRIDE) {
                 checkpoints.push(index + 1);
             }
         }
@@ -1075,10 +1075,10 @@ fn run_highlight_cached(
             let end_lnum = ep.row as u32 + 1;
             let end_col = ep.column as u32 + 1;
 
-            if let Some((ls, le)) = lrange {
-                if end_lnum < ls || lnum > le {
-                    continue;
-                }
+            if let Some((ls, le)) = lrange
+                && (end_lnum < ls || lnum > le)
+            {
+                continue;
             }
 
             let key = (lnum, col, end_lnum, end_col);
@@ -1187,10 +1187,10 @@ fn run_symbols_cached(
         let sym_end_lnum = def_end.row as u32 + 1;
         let sym_end_col = def_end.column as u32 + 1;
 
-        if let Some((ls, le)) = lrange {
-            if lnum < ls || lnum > le {
-                continue;
-            }
+        if let Some((ls, le)) = lrange
+            && (lnum < ls || lnum > le)
+        {
+            continue;
         }
 
         // 容器信息（可选）
@@ -1262,17 +1262,16 @@ fn run_symbols_cached(
         }
 
         // JavaScript 容器推断：method → class
-        if cache.lang == "javascript" && kind == "method" {
-            if let Some(cls) = ancestor_kind(node, "class_declaration") {
-                if let Some(cls_name) = child_text_by_kind(cls, "identifier", bytes) {
-                    if let Some((ln, co)) = child_pos_by_kind(cls, "identifier") {
-                        ckind = Some("class");
-                        cname_opt = Some(cls_name);
-                        clnum = Some(ln);
-                        ccol = Some(co);
-                    }
-                }
-            }
+        if cache.lang == "javascript"
+            && kind == "method"
+            && let Some(cls) = ancestor_kind(node, "class_declaration")
+            && let Some(cls_name) = child_text_by_kind(cls, "identifier", bytes)
+            && let Some((ln, co)) = child_pos_by_kind(cls, "identifier")
+        {
+            ckind = Some("class");
+            cname_opt = Some(cls_name);
+            clnum = Some(ln);
+            ccol = Some(co);
         }
 
         // TypeScript/TSX 容器推断：method/field → class/interface，variant → enum
@@ -1368,28 +1367,21 @@ fn run_symbols_cached(
         if cache.lang == "go" {
             if kind == "method" {
                 // method_declaration 的 receiver 有 parameter_declaration → type_identifier
-                if let Some(mdecl) = node.parent().and_then(|p| {
-                    if p.kind() == "method_declaration" {
-                        Some(p)
-                    } else {
-                        None
-                    }
-                }) {
+                if let Some(mdecl) = node.parent().filter(|p| p.kind() == "method_declaration") {
                     let mut c = mdecl.walk();
                     for ch in mdecl.children(&mut c) {
                         if ch.kind() == "parameter_list" {
                             let mut c2 = ch.walk();
                             for pd in ch.children(&mut c2) {
-                                if pd.kind() == "parameter_declaration" {
-                                    if let Some(tname) =
+                                if pd.kind() == "parameter_declaration"
+                                    && let Some(tname) =
                                         child_text_by_kind(pd, "type_identifier", bytes)
-                                    {
-                                        let sp = pd.start_position();
-                                        ckind = Some("type");
-                                        cname_opt = Some(tname);
-                                        clnum = Some(sp.row as u32 + 1);
-                                        ccol = Some(sp.column as u32 + 1);
-                                    }
+                                {
+                                    let sp = pd.start_position();
+                                    ckind = Some("type");
+                                    cname_opt = Some(tname);
+                                    clnum = Some(sp.row as u32 + 1);
+                                    ccol = Some(sp.column as u32 + 1);
                                 }
                             }
                             break;
@@ -1521,15 +1513,15 @@ fn run_symbols_cached(
                     let lnum = sp.row as u32 + 1;
                     let col = sp.column as u32 + 1;
 
-                    if let Some((ls, le)) = lrange {
-                        if lnum < ls || lnum > le {
-                            // 压入子节点继续遍历
-                            let mut child_cursor = n.walk();
-                            for ch in n.children(&mut child_cursor) {
-                                stack.push(ch);
-                            }
-                            continue;
+                    if let Some((ls, le)) = lrange
+                        && (lnum < ls || lnum > le)
+                    {
+                        // 压入子节点继续遍历
+                        let mut child_cursor = n.walk();
+                        for ch in n.children(&mut child_cursor) {
+                            stack.push(ch);
                         }
+                        continue;
                     }
 
                     let cmd_lower = cmd.trim().to_lowercase();
@@ -2378,34 +2370,31 @@ fn child_pos_by_kind(node: tree_sitter::Node, child_kind: &str) -> Option<(u32, 
     None
 }
 fn struct_info(node: tree_sitter::Node, bytes: &[u8]) -> Option<(String, u32, u32)> {
-    if let Some(st) = ancestor_kind(node, "struct_item") {
-        if let Some(name) = child_text_by_kind(st, "type_identifier", bytes) {
-            if let Some((ln, co)) = child_pos_by_kind(st, "type_identifier") {
-                return Some((name, ln, co));
-            }
-        }
+    if let Some(st) = ancestor_kind(node, "struct_item")
+        && let Some(name) = child_text_by_kind(st, "type_identifier", bytes)
+        && let Some((ln, co)) = child_pos_by_kind(st, "type_identifier")
+    {
+        return Some((name, ln, co));
     }
     None
 }
 fn enum_info(node: tree_sitter::Node, bytes: &[u8]) -> Option<(String, u32, u32)> {
-    if let Some(en) = ancestor_kind(node, "enum_item") {
-        if let Some(name) = child_text_by_kind(en, "type_identifier", bytes) {
-            if let Some((ln, co)) = child_pos_by_kind(en, "type_identifier") {
-                return Some((name, ln, co));
-            }
-        }
+    if let Some(en) = ancestor_kind(node, "enum_item")
+        && let Some(name) = child_text_by_kind(en, "type_identifier", bytes)
+        && let Some((ln, co)) = child_pos_by_kind(en, "type_identifier")
+    {
+        return Some((name, ln, co));
     }
     None
 }
 fn variant_info(node: tree_sitter::Node, bytes: &[u8]) -> Option<(String, u32, u32)> {
     let mut cur = node;
     while let Some(parent) = cur.parent() {
-        if parent.kind() == "enum_variant" {
-            if let Some(name) = child_text_by_kind(parent, "identifier", bytes) {
-                if let Some((ln, co)) = child_pos_by_kind(parent, "identifier") {
-                    return Some((name, ln, co));
-                }
-            }
+        if parent.kind() == "enum_variant"
+            && let Some(name) = child_text_by_kind(parent, "identifier", bytes)
+            && let Some((ln, co)) = child_pos_by_kind(parent, "identifier")
+        {
+            return Some((name, ln, co));
         }
         cur = parent;
     }
@@ -2429,12 +2418,11 @@ fn impl_type_info(node: tree_sitter::Node, bytes: &[u8]) -> Option<(String, u32,
     None
 }
 fn mod_info(node: tree_sitter::Node, bytes: &[u8]) -> Option<(String, u32, u32)> {
-    if let Some(md) = ancestor_kind(node, "mod_item") {
-        if let Some(name) = child_text_by_kind(md, "identifier", bytes) {
-            if let Some((ln, co)) = child_pos_by_kind(md, "identifier") {
-                return Some((name, ln, co));
-            }
-        }
+    if let Some(md) = ancestor_kind(node, "mod_item")
+        && let Some(name) = child_text_by_kind(md, "identifier", bytes)
+        && let Some((ln, co)) = child_pos_by_kind(md, "identifier")
+    {
+        return Some((name, ln, co));
     }
     None
 }
@@ -2448,10 +2436,10 @@ fn outer_fn_info(node: tree_sitter::Node, bytes: &[u8]) -> Option<(String, u32, 
                 cur = parent;
                 continue;
             }
-            if let Some(name) = child_text_by_kind(parent, "identifier", bytes) {
-                if let Some((ln, co)) = child_pos_by_kind(parent, "identifier") {
-                    return Some((name, ln, co));
-                }
+            if let Some(name) = child_text_by_kind(parent, "identifier", bytes)
+                && let Some((ln, co)) = child_pos_by_kind(parent, "identifier")
+            {
+                return Some((name, ln, co));
             }
         }
         cur = parent;

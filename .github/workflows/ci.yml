@@ -12,6 +12,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+
+  # The crate declares a minimum supported Rust version; a dependency bump or a
+  # newly used language feature can quietly break it, because every other job
+  # runs on stable.  This is the check that caught `ignore` pulling in
+  # let-chains and two crates whose own sources had outgrown their declared
+  # MSRV.  Keep the toolchain here in step with rust-version in Cargo.toml.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Build on the declared minimum supported Rust
+        run: cargo check --all-targets --locked
   quality:
     runs-on: ubuntu-latest
     timeout-minutes: 20

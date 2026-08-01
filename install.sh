@@ -5,7 +5,7 @@ repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$repo_dir"
 
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "error: cargo was not found; install Rust 1.85+ first" >&2
+  echo "error: cargo was not found; install Rust 1.88+ first" >&2
   exit 1
 fi
 
