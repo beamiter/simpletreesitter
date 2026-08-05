@@ -1,32 +1,13 @@
 #!/usr/bin/env bash
+# Builds the SimpleTreeSitter daemon and installs it into lib/.
+#
+# The work is shared with the rest of the simple* suite; see install-common.sh,
+# which is vendored from .simplecore and must not be edited in place.
 set -euo pipefail
 
-repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd -- "$repo_dir"
+SIMPLECORE_BINARY="ts-hl-daemon"
+SIMPLECORE_DISPLAY="SimpleTreeSitter"
+SIMPLECORE_MIN_RUST_MINOR=88
+SIMPLECORE_VERIFY="self-test"
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "error: cargo was not found; install Rust 1.88+ first" >&2
-  exit 1
-fi
-
-cargo build --release --locked
-
-binary="target/release/ts-hl-daemon"
-if [[ -f "${binary}.exe" ]]; then
-  binary="${binary}.exe"
-fi
-if [[ ! -f "$binary" ]]; then
-  echo "error: build completed but $binary was not produced" >&2
-  exit 1
-fi
-
-# 只原子替换 daemon，保留 lib/ 中可能存在的其它文件。
-mkdir -p lib
-destination="lib/$(basename -- "$binary")"
-temporary="${destination}.tmp.$$"
-trap 'rm -f -- "$temporary"' EXIT
-install -m 0755 -- "$binary" "$temporary"
-mv -f -- "$temporary" "$destination"
-trap - EXIT
-
-echo "Installed $destination"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install-common.sh"

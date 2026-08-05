@@ -695,7 +695,65 @@ fn byte_offset_to_point(text: &str, offset: usize) -> tree_sitter::Point {
     tree_sitter::Point { row, column }
 }
 
+const USAGE: &str = "\
+Usage: ts-hl-daemon [OPTION]
+
+With no arguments the daemon serves newline-delimited JSON requests on stdin
+and writes replies to stdout.  That is how the Vim plugin starts it; there is
+nothing useful to do with it interactively.
+
+Options:
+  -V, --version    print the version and exit
+  -h, --help       print this help and exit
+      --self-test  compile every bundled grammar's queries and exit
+";
+
+/// Loads and compiles the highlight queries for every bundled grammar.
+///
+/// This binary links seventeen tree-sitter grammars, and a grammar that fails
+/// to compile its queries is invisible until a user opens that filetype and
+/// gets no highlighting at all.  The installer runs this so the failure lands
+/// at install time instead.
+fn self_test() -> Result<()> {
+    let mut server = Server::new();
+    for language in SUPPORTED_LANGUAGES {
+        server
+            .ensure_queries(language)
+            .map_err(|error| anyhow::anyhow!("{language}: {error}"))?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => serve(),
+        Some("--version" | "-V") => {
+            println!("ts-hl-daemon {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--help" | "-h") => {
+            println!("ts-hl-daemon {}\n\n{USAGE}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--self-test") => match self_test() {
+            Ok(()) => {
+                println!("ok ({} grammars)", SUPPORTED_LANGUAGES.len());
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("self-test failed: {error}");
+                std::process::exit(1);
+            }
+        },
+        Some(other) => {
+            eprintln!("unknown argument: {other}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn serve() -> Result<()> {
     let stdin = std::io::stdin();
     let lines = BufReader::new(stdin).lines();
     let mut out = std::io::stdout();
