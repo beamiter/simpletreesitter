@@ -10,6 +10,7 @@
 - 代码大纲：层级容器、折叠、跳转、光标跟随、ASCII/Nerd Font 两套图标。
 - Tree-sitter 折叠：`:TsHlFoldsToggle` 由语法树驱动 `foldexpr`，支持嵌套层级。
 - 符号跳转：`:TsHlSymbols` 把当前 buffer 符号送入 location list。
+- 异步符号导航：`:TsHlNextSymbol` / `:TsHlPrevSymbol` 支持计数、循环与连续按键合并，不必打开 Outline。
 - 精确版本协议：所有结果携带 buffer revision，过期高亮、符号、折叠和 AST 会被丢弃。
 - 长会话稳定性：buffer 关闭即释放 daemon cache；daemon 重启后自动重新同步。
 - 大文件保护：Vim 端默认跳过超过 5 MiB 的 buffer；daemon 另有硬上限和有界结果。
@@ -82,6 +83,7 @@ install -m 0755 target/release/ts-hl-daemon lib/ts-hl-daemon
 | `:TsHlDumpAST` | 打开当前 revision 的 AST 视图 |
 | `:TsHlStatus` | 显示 daemon 协议、cache 和解析统计；不会启动 daemon |
 | `:TsHlSymbols` | 当前 buffer 符号送入 location list 并打开 |
+| `:[count]TsHlNextSymbol` / `:[count]TsHlPrevSymbol` | 在结构符号间前后跳转，到头循环 |
 | `:TsHlFoldsToggle` | 切换 Tree-sitter 折叠（`foldexpr` 驱动，可恢复原设置） |
 
 默认普通模式映射：
@@ -96,6 +98,8 @@ install -m 0755 target/release/ts-hl-daemon lib/ts-hl-daemon
 ```vim
 nmap <leader>x <Plug>(simpletreesitter-toggle)
 nmap <leader>s <Plug>(simpletreesitter-outline-toggle)
+nmap ]s <Plug>(simpletreesitter-next-symbol)
+nmap [s <Plug>(simpletreesitter-prev-symbol)
 ```
 
 大纲窗口内：`<CR>` 跳转，`o`/`za` 折叠或展开，`q` 关闭。
@@ -145,6 +149,10 @@ g:simpletreesitter_outline_hide_inner_functions = 1
 g:simpletreesitter_outline_hide_fields = 0
 g:simpletreesitter_outline_hide_variants = 0
 g:simpletreesitter_outline_exclude_patterns = []
+g:simpletreesitter_symbol_jump_kinds = [
+  'function', 'method', 'class', 'struct', 'enum',
+  'namespace', 'type', 'module', 'macro'
+]  " [] 表示全部；Markdown/结构化数据自动导航全部层级
 
 " 缩进参考线
 g:simpletreesitter_indent_guides = 0
@@ -165,6 +173,11 @@ g:simpletreesitter_debug = 0
 g:simpletreesitter_log_file = '/tmp/ts-hl.log'
 ```
 
+符号导航会记住按键发起时的 split、光标和 `changedtick`。daemon 响应前
+切到别的窗口不会被抢回焦点；若原光标或文本已改变，旧跳转会取消。
+同一 revision/类别配置的 full-symbol 结果会复用，连续跳转不重复扫描；
+protocol v4 daemon 会在结果上限之前先过滤 kind。
+
 单个 buffer 可选择退出：
 
 ```vim
@@ -176,7 +189,7 @@ let b:simpletreesitter_max_buffer_bytes = 0  " 仅当前 buffer 取消 Vim 端�
 
 ```text
 Vim9 plugin/autoload
-  │ newline-delimited JSON，protocol v3 + revision
+  │ newline-delimited JSON，protocol v4 + revision/request class
   │ 首次 set_text 全量；此后 listener 合并变更行，只发 edit_lines 行区间
   ▼
 ts-hl-daemon

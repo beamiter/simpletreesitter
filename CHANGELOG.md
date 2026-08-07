@@ -37,6 +37,26 @@
   `--self-test` 会编译全部 17 个内置 grammar 的 query——某个 grammar 编不过时,
   在用户打开那种文件、发现完全没有高亮之前是看不出来的。
 
+### 新增：异步符号导航
+
+- `:[count]TsHlNextSymbol` / `:[count]TsHlPrevSymbol` 在 Tree-sitter 提取的结构符号间
+  前后跳转并循环，提供 `<Plug>(simpletreesitter-next-symbol)` / `-prev-symbol`，不抢占
+  用户的 `[s` / `]s`。连续按键会在 daemon 响应前合并成步数。
+- `g:simpletreesitter_symbol_jump_kinds` 控制代码文件的导航种类，空列表表示全部；
+  Markdown、JSON/YAML/TOML、CSS/HTML 自动保留所有层级，低级标题和配置键不会漏掉。
+- full-buffer symbols 请求现在与 Outline/breadcrumb 的视口请求串行化并带用途状态，
+  部分响应不会误填 location list 或误触发跳转。smoke test 覆盖计数、环绕和请求合并。
+- 异步跳转绑定发起 split、光标与 `changedtick`；等待期间切窗不抢焦点，
+  移动光标、修改文本或大文件 preflight 失败都会 fail closed，不会迟到触发旧跳转。
+- full-symbol 结果按 revision + kind 快照缓存，后续 Next/Prev 无需再走 JSON/全缓冲扫描。
+  daemon 升至 protocol v4，在 `max_items` 截断前先过滤导航 kind，并在 error 中标注
+  request class，highlight/fold 错误不再破坏同 buffer 的 symbols 在途状态。
+
+### 修复
+
+- Lua、HTML、CSS 与 Markdown 已受支持且 README 也宣称默认自动启用，但实际默认
+  filetype 列表漏了这四项；现已补齐，并加入 smoke 断言防止语言表再次漂移。
+
 ### 构建与 CI 修复
 
 - clippy 的 `collapsible_if` / `manual_is_multiple_of` 属于按 MSRV 放开的 lint;声明升到 1.88 后开始生效,17 处已修正。

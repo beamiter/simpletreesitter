@@ -25,7 +25,7 @@ g:simpletreesitter_auto_enable_filetypes = get(g:, 'simpletreesitter_auto_enable
   ['rust', 'c', 'cpp', 'cc', 'javascript', 'javascriptreact', 'jsx',
    'typescript', 'typescriptreact',
    'python', 'go', 'sh', 'bash', 'zsh', 'vim', 'vimrc',
-   'json', 'jsonc', 'yaml', 'toml'])
+   'json', 'jsonc', 'yaml', 'toml', 'lua', 'html', 'css', 'markdown'])
 g:simpletreesitter_auto_stop = get(g:, 'simpletreesitter_auto_stop', 1)
 g:simpletreesitter_max_buffer_bytes = get(g:, 'simpletreesitter_max_buffer_bytes', 5 * 1024 * 1024)
 g:simpletreesitter_clear_props_on_disable = get(g:, 'simpletreesitter_clear_props_on_disable', 1)
@@ -51,6 +51,10 @@ g:simpletreesitter_outline_hide_inner_functions = get(g:, 'simpletreesitter_outl
 g:simpletreesitter_outline_hide_fields = get(g:, 'simpletreesitter_outline_hide_fields', 0)
 g:simpletreesitter_outline_hide_variants = get(g:, 'simpletreesitter_outline_hide_variants', 0)
 g:simpletreesitter_outline_exclude_patterns = get(g:, 'simpletreesitter_outline_exclude_patterns', [])
+# ]s/[s-style navigation can be wired through the <Plug> mappings below.
+# An empty list navigates every extracted symbol.
+g:simpletreesitter_symbol_jump_kinds = get(g:, 'simpletreesitter_symbol_jump_kinds',
+  ['function', 'method', 'class', 'struct', 'enum', 'namespace', 'type', 'module', 'macro'])
 
 # =============== 可见范围/懒高亮配置 ===============
 g:simpletreesitter_view_margin = get(g:, 'simpletreesitter_view_margin', 120)
@@ -94,6 +98,8 @@ command! TsHlOutlineRefresh call simpletreesitter#OutlineRefresh()
 command! TsHlDumpAST        call simpletreesitter#DumpAST()
 command! TsHlStatus         call simpletreesitter#Status()
 command! TsHlSymbols        call simpletreesitter#SymbolsToLoclist()
+command! -count=1 TsHlNextSymbol call simpletreesitter#NextSymbol(<count>)
+command! -count=1 TsHlPrevSymbol call simpletreesitter#PrevSymbol(<count>)
 command! TsHlFoldsToggle    call simpletreesitter#FoldsToggle()
 command! TsHlHealth  call simpletreesitter#Health()
 command! TsHlRestart call simpletreesitter#Restart()
@@ -102,6 +108,8 @@ command! TsHlLog     call simpletreesitter#ShowLog()
 # =============== 快捷键 ===============
 nnoremap <silent> <Plug>(simpletreesitter-toggle) <Cmd>TsHlToggle<CR>
 nnoremap <silent> <Plug>(simpletreesitter-outline-toggle) <Cmd>TsHlOutlineToggle<CR>
+nnoremap <silent> <Plug>(simpletreesitter-next-symbol) <Cmd>call simpletreesitter#NextSymbol(v:count1)<CR>
+nnoremap <silent> <Plug>(simpletreesitter-prev-symbol) <Cmd>call simpletreesitter#PrevSymbol(v:count1)<CR>
 
 if maparg('<leader>th', 'n') ==# '' && !hasmapto('<Plug>(simpletreesitter-toggle)', 'n')
   nmap <silent> <leader>th <Plug>(simpletreesitter-toggle)

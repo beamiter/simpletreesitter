@@ -26,7 +26,7 @@ const SUPPORTED_LANGUAGES: &[&str] = &[
     "css",
     "markdown",
 ];
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 
 const MAX_AST_NODES: usize = 50_000;
 const MAX_AST_DEPTH: usize = 512;
@@ -94,6 +94,11 @@ enum Request {
         lend: Option<u32>,
         #[serde(default)]
         max_items: Option<usize>,
+        /// Optional server-side kind filter. Applying it before `max_items`
+        /// keeps a large run of non-navigation symbols from hiding a later
+        /// structural symbol.
+        #[serde(default)]
+        kinds: Vec<String>,
     },
     #[serde(rename = "folds")]
     Folds {
@@ -172,6 +177,10 @@ enum Event {
         message: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         buf: Option<i64>,
+        /// Request class that failed, so clients only clear matching inflight
+        /// state. This is additive and harmless to older clients.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        op: Option<&'static str>,
     },
 }
 
@@ -775,6 +784,7 @@ fn serve() -> Result<()> {
                     &Event::Error {
                         message: format!("invalid request: {e}"),
                         buf: None,
+                        op: None,
                     },
                 )?;
                 continue;
@@ -800,6 +810,7 @@ fn serve() -> Result<()> {
                     &Event::Error {
                         message: e.to_string(),
                         buf: Some(buf),
+                        op: Some("set_text"),
                     },
                 )?,
             },
@@ -834,6 +845,7 @@ fn serve() -> Result<()> {
                         &Event::Error {
                             message: e.to_string(),
                             buf: Some(buf),
+                            op: Some("edit_lines"),
                         },
                     )?,
                 }
@@ -861,6 +873,7 @@ fn serve() -> Result<()> {
                         &Event::Error {
                             message: e.to_string(),
                             buf: Some(buf),
+                            op: Some("highlight"),
                         },
                     )?,
                 }
@@ -871,9 +884,17 @@ fn serve() -> Result<()> {
                 lstart,
                 lend,
                 max_items,
+                kinds,
             } => {
                 let lrange = lstart.zip(lend);
-                match run_symbols_cached(&mut server, buf, &lang, lrange, max_items) {
+                match run_symbols_cached_filtered(
+                    &mut server,
+                    buf,
+                    &lang,
+                    lrange,
+                    max_items,
+                    &kinds,
+                ) {
                     Ok((revision, symbols)) => send(
                         &mut out,
                         &Event::Symbols {
@@ -887,6 +908,7 @@ fn serve() -> Result<()> {
                         &Event::Error {
                             message: e.to_string(),
                             buf: Some(buf),
+                            op: Some("symbols"),
                         },
                     )?,
                 }
@@ -909,6 +931,7 @@ fn serve() -> Result<()> {
                     &Event::Error {
                         message: e.to_string(),
                         buf: Some(buf),
+                        op: Some("folds"),
                     },
                 )?,
             },
@@ -926,6 +949,7 @@ fn serve() -> Result<()> {
                     &Event::Error {
                         message: e.to_string(),
                         buf: Some(buf),
+                        op: Some("dump_ast"),
                     },
                 )?,
             },
@@ -968,6 +992,8 @@ fn serve() -> Result<()> {
                             "bounded_results",
                             "edit_lines",
                             "folds",
+                            "symbol_kind_filter",
+                            "error_op",
                         ],
                     },
                 )?;
@@ -1179,12 +1205,28 @@ fn run_highlight_cached(
 }
 
 // 复用缓存 Tree + bytes 做符号
+#[cfg(test)]
 fn run_symbols_cached(
     server: &mut Server,
     buf: i64,
     lang: &str,
     lrange: Option<(u32, u32)>,
     max_items: Option<usize>,
+) -> Result<(u64, Vec<Symbol>)> {
+    run_symbols_cached_filtered(server, buf, lang, lrange, max_items, &[])
+}
+
+fn symbol_kind_allowed(kind: &str, kinds: &[String]) -> bool {
+    kinds.is_empty() || kinds.iter().any(|candidate| candidate == kind)
+}
+
+fn run_symbols_cached_filtered(
+    server: &mut Server,
+    buf: i64,
+    lang: &str,
+    lrange: Option<(u32, u32)>,
+    max_items: Option<usize>,
+    kinds: &[String],
 ) -> Result<(u64, Vec<Symbol>)> {
     server.ensure_queries(lang)?;
     let cache = server.get_cache(buf, lang)?;
@@ -1234,6 +1276,10 @@ fn run_symbols_cached(
         if cache.lang == "rust" && kind == "function" && ancestor_kind(node, "impl_item").is_some()
         {
             kind = "method";
+        }
+
+        if !symbol_kind_allowed(kind, kinds) {
+            continue;
         }
 
         let name = node_text(node, bytes);
@@ -1534,7 +1580,7 @@ fn run_symbols_cached(
     // Ex commands. A small line-oriented fallback keeps the core outline useful
     // while the grammar evolves.
     if cache.lang == "vim" && symbols.len() < limit {
-        for symbol in extract_vim_declarations(&cache.text, lrange, limit - symbols.len()) {
+        for symbol in extract_vim_declarations(&cache.text, lrange, limit - symbols.len(), kinds) {
             let key = (
                 symbol.kind,
                 symbol.name.clone(),
@@ -1787,7 +1833,9 @@ fn run_symbols_cached(
                         }
                         _ => (None, None),
                     };
-                    if let (Some(kind), Some(name)) = (sym_kind, sym_name) {
+                    if let (Some(kind), Some(name)) = (sym_kind, sym_name)
+                        && symbol_kind_allowed(kind, kinds)
+                    {
                         let key = (kind, name.clone(), lnum, col, None, None, None, None);
                         if !seen.contains(&key) {
                             seen.insert(key);
@@ -1964,7 +2012,12 @@ fn run_folds_cached(
     Ok((cache.revision, folds))
 }
 
-fn extract_vim_declarations(text: &str, lrange: Option<(u32, u32)>, limit: usize) -> Vec<Symbol> {
+fn extract_vim_declarations(
+    text: &str,
+    lrange: Option<(u32, u32)>,
+    limit: usize,
+    kinds: &[String],
+) -> Vec<Symbol> {
     let mut symbols = Vec::<Symbol>::new();
     // (name, line, column, index in symbols). Vim functions do not normally
     // nest, but a stack makes malformed/in-progress edits behave predictably.
@@ -2012,7 +2065,10 @@ fn extract_vim_declarations(text: &str, lrange: Option<(u32, u32)>, limit: usize
                 let column = (declaration_offset + keyword.len() + spaces + 1) as u32;
                 let in_range =
                     lrange.is_none_or(|(start, end)| line_number >= start && line_number <= end);
-                let index = if in_range && symbols.len() < limit {
+                let index = if in_range
+                    && symbols.len() < limit
+                    && symbol_kind_allowed("function", kinds)
+                {
                     let container = functions.last();
                     symbols.push(Symbol {
                         name: name.to_string(),
@@ -2039,7 +2095,13 @@ fn extract_vim_declarations(text: &str, lrange: Option<(u32, u32)>, limit: usize
             .into_iter()
             .find(|keyword| starts_with_vim_keyword(line, keyword));
         if let Some(keyword) = variable_keyword {
-            if symbols.len() >= limit
+            let kind = if matches!(keyword, "const" | "final") {
+                "const"
+            } else {
+                "variable"
+            };
+            if !symbol_kind_allowed(kind, kinds)
+                || symbols.len() >= limit
                 || !lrange.is_none_or(|(start, end)| line_number >= start && line_number <= end)
             {
                 continue;
@@ -2058,11 +2120,7 @@ fn extract_vim_declarations(text: &str, lrange: Option<(u32, u32)>, limit: usize
             let container = functions.last();
             symbols.push(Symbol {
                 name: name.to_string(),
-                kind: if matches!(keyword, "const" | "final") {
-                    "const"
-                } else {
-                    "variable"
-                },
+                kind,
                 lnum: line_number,
                 col: (declaration_offset + keyword.len() + spaces + 1) as u32,
                 end_lnum: line_number,
@@ -2847,6 +2905,28 @@ mod tests {
         assert_eq!(inner.container_kind, Some("function"));
         assert_eq!(inner.container_name.as_deref(), Some("outer"));
         assert!(symbols.iter().all(|symbol| symbol.end_lnum >= symbol.lnum));
+    }
+
+    #[test]
+    fn symbol_kind_filter_is_applied_before_result_limit() {
+        let mut server = Server::new();
+        let source = "const A: i32 = 1;\nconst B: i32 = 2;\nfn target() {}\n";
+        server
+            .set_text(42, "rust", source.to_string(), 1)
+            .expect("rust parse");
+
+        let (_, symbols) = run_symbols_cached_filtered(
+            &mut server,
+            42,
+            "rust",
+            None,
+            Some(1),
+            &["function".to_string()],
+        )
+        .expect("filtered symbols");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "target");
+        assert_eq!(symbols[0].kind, "function");
     }
 
     #[test]

@@ -59,6 +59,16 @@ var s_fold_exprs: dict<list<string>> = {}
 var s_fold_windows: dict<dict<string>> = {}
 # =============== 符号 location list 请求 ===============
 var s_loclist_pending: dict<bool> = {}
+# 当前 symbols 请求的用途：partial 只覆盖视口，full 服务 loclist/导航。
+var s_symbol_request_purpose: dict<string> = {}
+# Kind filter sent with the inflight symbol request, used to validate/cache the
+# response without consulting mutable global configuration later.
+var s_symbol_request_kinds: dict<list<string>> = {}
+# Last full-buffer response per buffer, keyed by revision and kind snapshot.
+var s_full_symbol_cache: dict<dict<any>> = {}
+# buf -> {steps, winid, lnum, col, changedtick}。导航响应必须回到发起窗口，
+# 不能以响应到达时的当前窗口/光标为准。
+var s_symbol_jump_pending: dict<dict<any>> = {}
 
 # 待用的 TS 高亮组 -> Vim 高亮组 默认链接
 const s_groups = [
@@ -302,7 +312,7 @@ enddef
 def OnDaemonStart()
   InvalidateDaemonSession()
   EnsureHlGroupsAndProps()
-  simpletreesitter#core#Send({type: 'hello', client_protocol: 3})
+  simpletreesitter#core#Send({type: 'hello', client_protocol: 4})
 enddef
 
 def OnDaemonExit(code: number, restarting: bool)
@@ -495,6 +505,10 @@ def ResetProtocolState()
   s_inflight_folds = {}
   s_pending_folds = {}
   s_loclist_pending = {}
+  s_symbol_request_purpose = {}
+  s_symbol_request_kinds = {}
+  s_full_symbol_cache = {}
+  s_symbol_jump_pending = {}
   s_protocol_version = 0
 enddef
 
@@ -543,8 +557,17 @@ def OnDaemonEvent(ev: dict<any>)
   elseif ev.type ==# 'symbols'
     var buf = get(ev, 'buf', 0)
     var retry = get(s_pending_syms, buf, false)
+    var purpose = get(s_symbol_request_purpose, buf, '')
+    var was_full = purpose ==# 'full'
+    var request_kinds = get(s_symbol_request_kinds, buf, [])
     s_inflight_syms[buf] = false
     s_pending_syms[buf] = false
+    if has_key(s_symbol_request_purpose, buf)
+      remove(s_symbol_request_purpose, string(buf))
+    endif
+    if has_key(s_symbol_request_kinds, buf)
+      remove(s_symbol_request_kinds, string(buf))
+    endif
     if !EventRevisionIsCurrent(ev, buf)
       Log('Discarded stale symbols for buffer ' .. buf)
       ScheduleSync(buf)
@@ -556,12 +579,21 @@ def OnDaemonEvent(ev: dict<any>)
       s_bc_items = syms
       ScheduleBreadcrumbUpdate()
     endif
-    if get(s_loclist_pending, buf, false)
-      s_loclist_pending[buf] = false
-      PopulateSymbolLoclist(buf, syms)
+    if was_full
+      s_full_symbol_cache[buf] = {
+        revision: GetChangedTick(buf),
+        kinds: copy(request_kinds),
+        symbols: syms,
+      }
+      ConsumeFullSymbols(buf, syms, request_kinds)
+    else
+      ApplySymbols(buf, syms)
     endif
-    ApplySymbols(buf, syms)
-    if retry
+    # A partial outline response cannot satisfy loclist/navigation consumers;
+    # serialize one full-buffer request behind it.
+    if get(s_loclist_pending, buf, false) || has_key(s_symbol_jump_pending, buf)
+      RequestFullSymbols(buf)
+    elseif retry
       ScheduleSymbols(buf)
     endif
   elseif ev.type ==# 'ast'
@@ -622,7 +654,10 @@ def OnDaemonEvent(ev: dict<any>)
       ScheduleSymbols(buf)
       ScheduleFolds(buf)
       if get(s_loclist_pending, buf, false)
-        RequestLoclistSymbols(buf)
+        RequestFullSymbols(buf)
+      endif
+      if has_key(s_symbol_jump_pending, buf)
+        RequestFullSymbols(buf)
       endif
       if get(s_pending_ast, buf, false)
         s_pending_ast[buf] = false
@@ -641,6 +676,11 @@ def OnDaemonEvent(ev: dict<any>)
       echohl WarningMsg
       echom '[ts-hl] daemon protocol is v2; run install.sh to enable incremental sync and folds'
       echohl None
+    elseif s_protocol_version == 3 && !s_protocol_notice_shown
+      s_protocol_notice_shown = true
+      echohl WarningMsg
+      echom '[ts-hl] daemon protocol is v3; run install.sh for filtered symbol navigation'
+      echohl None
     endif
   elseif ev.type ==# 'status'
     echom printf('[ts-hl] daemon v%s protocol=%d | cache=%d/%d bytes evicted=%d | parse full=%d incremental=%d unchanged=%d | %s',
@@ -651,6 +691,7 @@ def OnDaemonEvent(ev: dict<any>)
   elseif ev.type ==# 'error'
     var buf = get(ev, 'buf', 0)
     var message = get(ev, 'message', '')
+    var op = get(ev, 'op', '')
     if message =~# 'unknown variant.*hello'
       s_protocol_version = -1
       if !s_protocol_notice_shown
@@ -662,14 +703,46 @@ def OnDaemonEvent(ev: dict<any>)
       return
     endif
     echom '[ts-hl] error: ' .. message
-    # 清掉占用标记；只有 cache 失配才重同步，避免永久错误形成重试风暴。
+    # protocol v4 的 error 带 op，只清理真正失败的请求类别。否则
+    # highlight/fold 错误可能破坏同 buffer 的 full-symbol 用途归类。
     if buf > 0
-      s_inflight_syms[buf] = false
-      s_inflight_hl[buf] = false
-      s_inflight_sync[buf] = false
-      s_inflight_folds[buf] = false
-      if has_key(s_inflight_revision, buf)
-        remove(s_inflight_revision, string(buf))
+      if op ==# 'symbols'
+        s_inflight_syms[buf] = false
+        s_pending_syms[buf] = false
+        if has_key(s_symbol_request_purpose, buf)
+          remove(s_symbol_request_purpose, string(buf))
+        endif
+        if has_key(s_symbol_request_kinds, buf)
+          remove(s_symbol_request_kinds, string(buf))
+        endif
+        if message !~# 'buffer not cached\|lang mismatch\|edit_lines mismatch'
+          CancelSymbolConsumers(buf)
+        endif
+      elseif op ==# 'highlight'
+        s_inflight_hl[buf] = false
+      elseif op ==# 'folds'
+        s_inflight_folds[buf] = false
+      elseif op ==# 'set_text' || op ==# 'edit_lines'
+        s_inflight_sync[buf] = false
+        if has_key(s_inflight_revision, buf)
+          remove(s_inflight_revision, string(buf))
+        endif
+      elseif op ==# ''
+        # 兼容 protocol v3 及更早 daemon 的无 op 错误。新 daemon 不走此分支。
+        s_inflight_syms[buf] = false
+        s_pending_syms[buf] = false
+        if has_key(s_symbol_request_purpose, buf)
+          remove(s_symbol_request_purpose, string(buf))
+        endif
+        if has_key(s_symbol_request_kinds, buf)
+          remove(s_symbol_request_kinds, string(buf))
+        endif
+        s_inflight_hl[buf] = false
+        s_inflight_sync[buf] = false
+        s_inflight_folds[buf] = false
+        if has_key(s_inflight_revision, buf)
+          remove(s_inflight_revision, string(buf))
+        endif
       endif
       if message =~# 'buffer not cached\|lang mismatch\|edit_lines mismatch'
         s_sent_changedtick[buf] = -1
@@ -861,6 +934,9 @@ def SyncBufferNow(buf: number)
   if last_ct == ct
     return
   endif
+  if has_key(s_full_symbol_cache, buf)
+    remove(s_full_symbol_cache, string(buf))
+  endif
 
   var max_bytes = getbufvar(buf, 'simpletreesitter_max_buffer_bytes',
     get(g:, 'simpletreesitter_max_buffer_bytes', 5242880))
@@ -885,6 +961,9 @@ def SyncBufferNow(buf: number)
       remove(s_pending_splice, string(buf))
     endif
     s_skipped_changedtick[buf] = ct
+    # A full-symbol consumer waiting for this sync would otherwise remain
+    # pending forever and could fire much later after the buffer shrinks.
+    CancelSymbolConsumers(buf)
     return
   endif
 
@@ -1271,23 +1350,77 @@ export def FoldsToggle()
 enddef
 
 # =============== 符号 location list ===============
-def RequestLoclistSymbols(buf: number)
-  if !s_enabled || !simpletreesitter#core#IsRunning() || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+def CancelSymbolConsumers(buf: number, notice: string = '')
+  if has_key(s_loclist_pending, buf)
     s_loclist_pending[buf] = false
+  endif
+  if has_key(s_symbol_jump_pending, buf)
+    remove(s_symbol_jump_pending, string(buf))
+  endif
+  if notice !=# ''
+    echo '[ts-hl] ' .. notice
+  endif
+enddef
+
+def RequestFullSymbols(buf: number)
+  if !s_enabled || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+    CancelSymbolConsumers(buf)
+    return
+  endif
+  if !EnsureDaemon()
+    CancelSymbolConsumers(buf, 'symbol request could not start the daemon')
     return
   endif
   var lang = DetectLang(buf)
   if lang ==# ''
-    s_loclist_pending[buf] = false
+    CancelSymbolConsumers(buf)
     return
   endif
-  if GetChangedTick(buf) != get(s_sent_changedtick, buf, -1) || get(s_inflight_sync, buf, false)
-    # ACK 处理器会在同步完成后重新发起
+  var changedtick = GetChangedTick(buf)
+  if get(s_skipped_changedtick, buf, -1) == changedtick
+    CancelSymbolConsumers(buf, 'buffer exceeds g:simpletreesitter_max_buffer_bytes')
+    return
+  endif
+  if changedtick != get(s_sent_changedtick, buf, -1) || get(s_inflight_sync, buf, false)
+    # ACK 处理器会在同步完成后重新发起。
     ScheduleSync(buf)
     return
   endif
-  var scan_limit = get(g:, 'simpletreesitter_outline_scan_max_items', 5000)
-  Send({type: 'symbols', buf: buf, lang: lang, lstart: 1, lend: BufLineCount(buf), max_items: scan_limit})
+  # Full consumers do not inherit the outline's small scan limit. Protocol v4
+  # filters navigation kinds in the daemon before this hard cap. The kind set
+  # comes from the queued command, not mutable configuration at response time.
+  var kinds: list<string> = []
+  if !get(s_loclist_pending, buf, false) && has_key(s_symbol_jump_pending, buf)
+      && s_protocol_version >= 4
+    kinds = JumpKindsSnapshot(s_symbol_jump_pending[buf])
+  endif
+
+  var cached = get(s_full_symbol_cache, buf, {})
+  var cached_kinds = get(cached, 'kinds', [])
+  var cache_compatible = empty(kinds)
+    ? empty(cached_kinds)
+    : empty(cached_kinds) || cached_kinds == kinds
+  if get(cached, 'revision', -1) == changedtick && cache_compatible
+    ConsumeFullSymbols(buf, get(cached, 'symbols', []), cached_kinds, false)
+    return
+  endif
+  if get(s_inflight_syms, buf, false)
+    if get(s_symbol_request_purpose, buf, '') !=# 'full'
+      s_pending_syms[buf] = true
+    endif
+    return
+  endif
+  s_inflight_syms[buf] = true
+  s_pending_syms[buf] = false
+  s_symbol_request_purpose[buf] = 'full'
+  s_symbol_request_kinds[buf] = copy(kinds)
+  if !Send({type: 'symbols', buf: buf, lang: lang, lstart: 1,
+      lend: BufLineCount(buf), max_items: 100000, kinds: kinds})
+    s_inflight_syms[buf] = false
+    remove(s_symbol_request_purpose, string(buf))
+    remove(s_symbol_request_kinds, string(buf))
+    CancelSymbolConsumers(buf, 'symbol request could not be sent')
+  endif
 enddef
 
 def PopulateSymbolLoclist(buf: number, syms: list<dict<any>>)
@@ -1310,6 +1443,239 @@ def PopulateSymbolLoclist(buf: number, syms: list<dict<any>>)
   endif
 enddef
 
+def JumpKindsSnapshot(jump: dict<any>): list<string>
+  var result: list<string> = []
+  var raw = get(jump, 'kinds', [])
+  if type(raw) != v:t_list
+    return result
+  endif
+  for kind in raw
+    if type(kind) == v:t_string
+      result->add(kind)
+    endif
+  endfor
+  return result
+enddef
+
+def ConsumeFullSymbols(buf: number, syms: list<dict<any>>,
+    response_kinds: list<string> = [], apply_outline: bool = true)
+  # A filtered navigation response cannot satisfy an unfiltered location list.
+  if empty(response_kinds) && get(s_loclist_pending, buf, false)
+    s_loclist_pending[buf] = false
+    PopulateSymbolLoclist(buf, syms)
+  endif
+  if has_key(s_symbol_jump_pending, buf)
+    var jump = s_symbol_jump_pending[buf]
+    var jump_kinds = JumpKindsSnapshot(jump)
+    if empty(response_kinds) || response_kinds == jump_kinds
+      remove(s_symbol_jump_pending, string(buf))
+      JumpToSymbol(buf, syms, jump)
+    endif
+  endif
+  if apply_outline
+    ApplySymbols(buf, syms)
+  endif
+enddef
+
+def SymbolJumpKinds(): list<string>
+  var configured = get(g:, 'simpletreesitter_symbol_jump_kinds', [])
+  if type(configured) != v:t_list
+    return []
+  endif
+  var kinds: list<string> = []
+  for kind in configured
+    if type(kind) == v:t_string && kind !=# ''
+      kinds->add(kind)
+    endif
+  endfor
+  return kinds
+enddef
+
+def SymbolJumpKindsForBuf(buf: number): list<string>
+  var filetype = getbufvar(buf, '&filetype')
+  # 文档和结构化数据的层级借用 field/property/variable 等 kind；
+  # 这些 filetype 必须保留全部符号。
+  if index(['markdown', 'json', 'jsonc', 'yaml', 'toml', 'css', 'html'], filetype) >= 0
+    return []
+  endif
+  return SymbolJumpKinds()
+enddef
+
+def NavigableSymbols(buf: number, syms: list<dict<any>>, kinds: list<string>): list<dict<any>>
+  var result: list<dict<any>> = []
+  var seen: dict<bool> = {}
+  for symbol in syms
+    var lnum = get(symbol, 'lnum', 0)
+    var col = get(symbol, 'col', 0)
+    if lnum <= 0 || col <= 0
+      continue
+    endif
+    if !empty(kinds) && index(kinds, get(symbol, 'kind', '')) < 0
+      continue
+    endif
+    var key = lnum .. ':' .. col
+    if !has_key(seen, key)
+      seen[key] = true
+      result->add(symbol)
+    endif
+  endfor
+  result->sort((left, right) => {
+    var line_delta = get(left, 'lnum', 0) - get(right, 'lnum', 0)
+    return line_delta != 0 ? line_delta : get(left, 'col', 0) - get(right, 'col', 0)
+  })
+  return result
+enddef
+
+def JumpToSymbol(buf: number, syms: list<dict<any>>, jump: dict<any>)
+  var target_win = get(jump, 'winid', 0)
+  if target_win <= 0 || winbufnr(target_win) != buf
+    echo '[ts-hl] symbol source window is no longer available'
+    return
+  endif
+  if get(jump, 'changedtick', -1) != GetChangedTick(buf)
+    echo '[ts-hl] symbol jump cancelled because the buffer changed'
+    return
+  endif
+  var live_pos = getcurpos(target_win)
+  if live_pos[1] != get(jump, 'lnum', 1) || live_pos[2] != get(jump, 'col', 1)
+    echo '[ts-hl] symbol jump cancelled because the source cursor moved'
+    return
+  endif
+
+  var items = NavigableSymbols(buf, syms, JumpKindsSnapshot(jump))
+  if empty(items)
+    echo '[ts-hl] no symbols match g:simpletreesitter_symbol_jump_kinds'
+    return
+  endif
+
+  var steps = get(jump, 'steps', 0)
+  if steps == 0
+    return
+  endif
+  var current_line = get(jump, 'lnum', 1)
+  var current_col = get(jump, 'col', 1)
+  var forward = steps > 0
+  var target_idx = -1
+  if forward
+    for i in range(len(items))
+      var item = items[i]
+      var item_line = get(item, 'lnum', 0)
+      var item_col = get(item, 'col', 0)
+      if item_line > current_line || (item_line == current_line && item_col > current_col)
+        target_idx = i
+        break
+      endif
+    endfor
+    if target_idx < 0
+      target_idx = 0
+    endif
+  else
+    var i = len(items) - 1
+    while i >= 0
+      var item = items[i]
+      var item_line = get(item, 'lnum', 0)
+      var item_col = get(item, 'col', 0)
+      if item_line < current_line || (item_line == current_line && item_col < current_col)
+        target_idx = i
+        break
+      endif
+      i -= 1
+    endwhile
+    if target_idx < 0
+      target_idx = len(items) - 1
+    endif
+  endif
+
+  var extra = (abs(steps) - 1) % len(items)
+  target_idx = forward ? (target_idx + extra) % len(items) : (target_idx - extra) % len(items)
+  if target_idx < 0
+    target_idx += len(items)
+  endif
+  var target = items[target_idx]
+  var target_line = get(target, 'lnum', 1)
+  var target_col = get(target, 'col', 1)
+  # Update the originating split and restore the user's current focus if they
+  # switched windows while the daemon was working. Restoring the captured
+  # origin first also makes the previous-context mark deterministic.
+  var return_win = win_getid()
+  var restore_focus = return_win != target_win
+  try
+    if restore_focus
+      execute $'noautocmd call win_gotoid({target_win})'
+    endif
+    cursor(current_line, current_col)
+    execute "normal! m'"
+    cursor(target_line, target_col)
+    normal! zv
+    # cursor() inside a closed fold may first land on its start; repeat after
+    # zv so the exact symbol position wins.
+    cursor(target_line, target_col)
+  finally
+    if restore_focus && winbufnr(return_win) >= 0
+      execute $'noautocmd call win_gotoid({return_win})'
+    endif
+  endtry
+  echo printf('[ts-hl] %s: %s', get(target, 'kind', 'symbol'), get(target, 'name', ''))
+enddef
+
+def QueueSymbolJump(direction: number, count: number)
+  var buf = bufnr()
+  var source_win = win_getid()
+  if buf == s_outline_buf && s_outline_src_buf != 0
+    buf = s_outline_src_buf
+    source_win = s_outline_src_win
+  endif
+  if source_win <= 0 || winbufnr(source_win) != buf
+    echo '[ts-hl] symbol source window is no longer available'
+    return
+  endif
+  if !IsSupportedLang(buf)
+    echo '[ts-hl] symbol navigation unsupported for this &filetype'
+    return
+  endif
+  if !s_enabled
+    Enable()
+  endif
+  if !s_enabled || !EnsureDaemon()
+    return
+  endif
+  var delta = (direction < 0 ? -1 : 1) * max([1, count])
+  var pos = getcurpos(source_win)
+  var changedtick = GetChangedTick(buf)
+  var kinds = SymbolJumpKindsForBuf(buf)
+  var old = get(s_symbol_jump_pending, buf, {})
+  var same_origin = !empty(old)
+    && get(old, 'winid', 0) == source_win
+    && get(old, 'lnum', 0) == pos[1]
+    && get(old, 'col', 0) == pos[2]
+    && get(old, 'changedtick', -1) == changedtick
+    && JumpKindsSnapshot(old) == kinds
+  var steps = (same_origin ? get(old, 'steps', 0) : 0) + delta
+  if steps == 0
+    if has_key(s_symbol_jump_pending, buf)
+      remove(s_symbol_jump_pending, string(buf))
+    endif
+    return
+  endif
+  s_symbol_jump_pending[buf] = {
+    steps: steps,
+    winid: source_win,
+    lnum: pos[1],
+    col: pos[2],
+    changedtick: changedtick,
+    kinds: kinds,
+  }
+  RequestFullSymbols(buf)
+enddef
+
+export def NextSymbol(count: number = 1)
+  QueueSymbolJump(1, count)
+enddef
+
+export def PrevSymbol(count: number = 1)
+  QueueSymbolJump(-1, count)
+enddef
+
 export def SymbolsToLoclist()
   var buf = bufnr()
   if buf == s_outline_buf && s_outline_src_buf != 0
@@ -1326,7 +1692,7 @@ export def SymbolsToLoclist()
     return
   endif
   s_loclist_pending[buf] = true
-  RequestLoclistSymbols(buf)
+  RequestFullSymbols(buf)
 enddef
 
 # =============== 面包屑导航 ===============
@@ -1548,8 +1914,8 @@ export def Health()
   for line in simpletreesitter#core#HealthLines()
     echo '  ' .. line
   endfor
-  echo printf('  [%s] protocol: v%d (plugin speaks v3)',
-    s_protocol_version >= 3 ? 'OK' : 'WARN', s_protocol_version)
+  echo printf('  [%s] protocol: v%d (plugin speaks v4)',
+    s_protocol_version >= 4 ? 'OK' : 'WARN', s_protocol_version)
   echo printf('  [%s] text properties: %s',
     has('textprop') ? 'OK' : 'ERROR',
     has('textprop') ? 'available' : 'missing +textprop — highlighting disabled')
@@ -1747,13 +2113,14 @@ export def OnBufClose(buf: number)
   RemoveListener(buf)
   for state in [s_inflight_sync, s_pending_ast, s_inflight_syms, s_inflight_hl,
       s_pending_syms, s_pending_hl, s_oversized_notified,
-      s_inflight_folds, s_pending_folds, s_loclist_pending]
+      s_inflight_folds, s_pending_folds, s_loclist_pending, s_symbol_request_purpose,
+      s_symbol_request_kinds, s_full_symbol_cache]
     if has_key(state, buf)
       remove(state, string(buf))
     endif
   endfor
   for state in [s_inflight_revision, s_sent_changedtick, s_skipped_changedtick,
-      s_req_timers, s_sync_timers]
+      s_req_timers, s_sync_timers, s_symbol_jump_pending]
     if has_key(state, buf)
       remove(state, string(buf))
     endif
@@ -2049,11 +2416,18 @@ def RequestSymbolsNow(buf: number)
   endif
   s_inflight_syms[buf] = true
   s_pending_syms[buf] = false
+  s_symbol_request_purpose[buf] = 'partial'
+  s_symbol_request_kinds[buf] = []
 
   var [vstart, vend] = VisibleRangeForBufSymbols(buf)
   var render_limit = get(g:, 'simpletreesitter_outline_max_items', 1000)
   var scan_limit = max([render_limit, get(g:, 'simpletreesitter_outline_scan_max_items', 5000)])
-  Send({type: 'symbols', buf: buf, lang: lang, lstart: vstart, lend: vend, max_items: scan_limit})
+  if !Send({type: 'symbols', buf: buf, lang: lang, lstart: vstart, lend: vend, max_items: scan_limit})
+    s_inflight_syms[buf] = false
+    remove(s_symbol_request_purpose, string(buf))
+    remove(s_symbol_request_kinds, string(buf))
+    return
+  endif
   Log('Requested symbols (range-only) for buffer ' .. buf .. ' ...')
 enddef
 

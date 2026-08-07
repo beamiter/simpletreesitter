@@ -31,8 +31,18 @@ nnoremap <leader>th :let g:simpletreesitter_user_mapping_won = 1<CR>
 runtime plugin/simpletreesitter.vim
 
 call assert_equal(2, exists(':TsHlStatus'))
+for s:auto_ft in ['lua', 'html', 'css', 'markdown']
+  call assert_true(index(g:simpletreesitter_auto_enable_filetypes, s:auto_ft) >= 0,
+        \ s:auto_ft . ' must auto-enable by default')
+endfor
+call assert_equal(2, exists(':TsHlNextSymbol'))
+call assert_equal(2, exists(':TsHlPrevSymbol'))
 call assert_match('simpletreesitter_user_mapping_won', maparg('<leader>th', 'n'))
 call assert_notequal('', maparg('<Plug>(simpletreesitter-toggle)', 'n'))
+call assert_notequal('', maparg('<Plug>(simpletreesitter-next-symbol)', 'n'))
+call assert_notequal('', maparg('<Plug>(simpletreesitter-prev-symbol)', 'n'))
+call assert_match('v:count1', maparg('<Plug>(simpletreesitter-next-symbol)', 'n'),
+      \ 'next-symbol <Plug> mapping must preserve a user count')
 
 enew
 call setline(1, ['pub fn main() {', '    let answer = 42;', '}'])
@@ -219,6 +229,84 @@ let s:loc = getloclist(win_findbuf(s:incr)[0])
 call assert_true(len(s:loc) > 0, 'TsHlSymbols produced an empty location list')
 call assert_match('incr_one', join(map(copy(s:loc), 'v:val.text'), ' '))
 lclose
+call simpletreesitter#Disable()
+
+" Full-buffer symbol navigation is asynchronous, count-aware and wraps.  Two
+" requests queued before the first response must coalesce into two steps.
+enew
+call setline(1, ['fn alpha() {}', 'fn beta() {}', 'fn gamma() {}'])
+setfiletype rust
+let s:nav = bufnr()
+call simpletreesitter#Enable()
+sleep 300m
+call cursor(1, 4)
+call simpletreesitter#NextSymbol()
+call simpletreesitter#NextSymbol()
+sleep 300m
+call assert_equal(3, line('.'), 'queued NextSymbol calls did not coalesce or jump to gamma')
+call simpletreesitter#NextSymbol()
+sleep 300m
+call assert_equal(1, line('.'), 'NextSymbol did not wrap to alpha')
+call simpletreesitter#PrevSymbol(2)
+sleep 300m
+call assert_equal(2, line('.'), 'counted PrevSymbol did not wrap to beta')
+
+" A completed full-buffer response is cached by revision/config. The next
+" command must navigate immediately without another daemon round-trip.
+let s:nav_state = s:State()
+call assert_true(has_key(s:nav_state.s_full_symbol_cache, string(s:nav)),
+      \ 'full symbol response was not cached')
+let s:cached_symbols = s:nav_state.s_full_symbol_cache[string(s:nav)].symbols
+call simpletreesitter#NextSymbol()
+call assert_equal(3, line('.'), 'cached symbol navigation was not immediate')
+call assert_false(get(s:State().s_inflight_syms, string(s:nav), v:false),
+      \ 'cached navigation unexpectedly sent another symbols request')
+
+" An async response updates only the initiating split. Switching away must not
+" steal focus, and moving the source cursor invalidates the captured context.
+call cursor(1, 4)
+let s:nav_win = win_getid()
+let s:nav_tick = getbufinfo(s:nav)[0].changedtick
+vnew
+let s:other_win = win_getid()
+let s:jump = {'steps': 1, 'winid': s:nav_win, 'lnum': 1, 'col': 4,
+      \ 'changedtick': s:nav_tick,
+      \ 'kinds': copy(g:simpletreesitter_symbol_jump_kinds)}
+call s:CallPrivate('JumpToSymbol', [s:nav, s:cached_symbols, s:jump])
+call assert_equal(s:other_win, win_getid(), 'symbol response stole current-window focus')
+call assert_equal(2, getcurpos(s:nav_win)[1], 'originating split was not updated')
+close
+call cursor(1, 4)
+let s:moved = copy(s:jump)
+call cursor(2, 4)
+call s:CallPrivate('JumpToSymbol', [s:nav, s:cached_symbols, s:moved])
+call assert_equal(2, line('.'), 'stale cursor context performed a surprise jump')
+
+" A typed daemon error must clear only its matching request class. Requesting
+" an unfiltered loclist cannot reuse the filtered navigation cache, so this is
+" a real inflight full request when the synthetic highlight error arrives.
+call simpletreesitter#SymbolsToLoclist()
+call assert_equal('full', get(s:State().s_symbol_request_purpose,
+      \ string(s:nav), ''), 'loclist did not start a full symbols request')
+call s:CallPrivate('OnDaemonEvent', [{'type': 'error', 'buf': s:nav,
+      \ 'op': 'highlight', 'message': 'synthetic highlight failure'}])
+call assert_equal('full', get(s:State().s_symbol_request_purpose,
+      \ string(s:nav), ''), 'unrelated error destroyed symbol request purpose')
+sleep 300m
+lclose
+call simpletreesitter#Disable()
+
+" Oversize preflight can complete after a jump is queued. It must cancel that
+" pending action so shrinking the buffer later cannot trigger a stale jump.
+enew
+let b:simpletreesitter_max_buffer_bytes = 1
+call setline(1, ['fn too_large() {}'])
+setfiletype rust
+let s:oversized = bufnr()
+call simpletreesitter#NextSymbol()
+sleep 100m
+call assert_false(has_key(s:State().s_symbol_jump_pending, string(s:oversized)),
+      \ 'oversized buffer left a stale symbol jump queued')
 call simpletreesitter#Disable()
 
 " New filetypes route to the daemon languages.

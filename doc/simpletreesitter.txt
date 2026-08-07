@@ -73,6 +73,18 @@ Build or update the daemon from the plugin directory: >
 :TsHlSymbols            Collect the buffer's symbols into the location list
                         and open it.
 
+                                                *:TsHlNextSymbol*
+:TsHlNextSymbol         Jump to the next configured structural symbol and
+                        wrap at the end.  A command count skips multiple
+                        symbols.  The originating window/cursor/revision is
+                        captured while the asynchronous request runs; moving
+                        it cancels the stale jump and switching windows does
+                        not steal focus.  Full results are cached per revision.
+
+                                                *:TsHlPrevSymbol*
+:TsHlPrevSymbol         Jump to the previous configured structural symbol and
+                        wrap at the beginning.  A command count is supported.
+
                                                 *:TsHlFoldsToggle*
 :TsHlFoldsToggle        Toggle Tree-sitter folds.  When enabled the window
                         uses 'foldmethod' expr with fold levels computed from
@@ -87,6 +99,8 @@ are never replaced.  For custom mappings use: >
 
   nmap <Leader>x <Plug>(simpletreesitter-toggle)
   nmap <Leader>s <Plug>(simpletreesitter-outline-toggle)
+  nmap ]s <Plug>(simpletreesitter-next-symbol)
+  nmap [s <Plug>(simpletreesitter-prev-symbol)
 <
 Inside the Outline, <CR> jumps, o and za toggle a node, and q closes it.
 
@@ -125,6 +139,13 @@ g:simpletreesitter_outline_hide_inner_functions  1
 g:simpletreesitter_outline_hide_fields       0
 g:simpletreesitter_outline_hide_variants     0
 g:simpletreesitter_outline_exclude_patterns  []
+g:simpletreesitter_symbol_jump_kinds         function, method, class, struct,
+                                             enum, namespace, type, module,
+                                             macro ([] means all)
+
+Navigation kind filtering is performed by a protocol-v4 daemon before its
+bounded result limit. Markdown and structured-data filetypes intentionally
+navigate all extracted levels. Rebuild the daemon after updating the plugin.
 
 g:simpletreesitter_indent_guides             0
 g:simpletreesitter_indent_guide_char         '│'
