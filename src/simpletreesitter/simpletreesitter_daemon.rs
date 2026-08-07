@@ -26,7 +26,7 @@ const SUPPORTED_LANGUAGES: &[&str] = &[
     "css",
     "markdown",
 ];
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 5;
 
 const MAX_AST_NODES: usize = 50_000;
 const MAX_AST_DEPTH: usize = 512;
@@ -88,6 +88,10 @@ enum Request {
     Symbols {
         buf: i64,
         lang: String,
+        /// Client-generated correlation token. Protocol-v4 clients omit it
+        /// and deserialize as zero; v5 clients use it to reject late replies.
+        #[serde(default)]
+        request_id: u64,
         #[serde(default)]
         lstart: Option<u32>,
         #[serde(default)]
@@ -133,6 +137,7 @@ enum Event {
     Symbols {
         buf: i64,
         revision: u64,
+        request_id: u64,
         symbols: Vec<Symbol>,
     },
     #[serde(rename = "ast")]
@@ -181,6 +186,10 @@ enum Event {
         /// state. This is additive and harmless to older clients.
         #[serde(skip_serializing_if = "Option::is_none")]
         op: Option<&'static str>,
+        /// Present for symbol requests in protocol v5. Other request classes
+        /// keep None, preserving their v4 wire representation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
 }
 
@@ -785,6 +794,7 @@ fn serve() -> Result<()> {
                         message: format!("invalid request: {e}"),
                         buf: None,
                         op: None,
+                        request_id: None,
                     },
                 )?;
                 continue;
@@ -811,6 +821,7 @@ fn serve() -> Result<()> {
                         message: e.to_string(),
                         buf: Some(buf),
                         op: Some("set_text"),
+                        request_id: None,
                     },
                 )?,
             },
@@ -846,6 +857,7 @@ fn serve() -> Result<()> {
                             message: e.to_string(),
                             buf: Some(buf),
                             op: Some("edit_lines"),
+                            request_id: None,
                         },
                     )?,
                 }
@@ -874,6 +886,7 @@ fn serve() -> Result<()> {
                             message: e.to_string(),
                             buf: Some(buf),
                             op: Some("highlight"),
+                            request_id: None,
                         },
                     )?,
                 }
@@ -881,6 +894,7 @@ fn serve() -> Result<()> {
             Request::Symbols {
                 buf,
                 lang,
+                request_id,
                 lstart,
                 lend,
                 max_items,
@@ -900,6 +914,7 @@ fn serve() -> Result<()> {
                         &Event::Symbols {
                             buf,
                             revision,
+                            request_id,
                             symbols,
                         },
                     )?,
@@ -909,6 +924,7 @@ fn serve() -> Result<()> {
                             message: e.to_string(),
                             buf: Some(buf),
                             op: Some("symbols"),
+                            request_id: Some(request_id),
                         },
                     )?,
                 }
@@ -932,6 +948,7 @@ fn serve() -> Result<()> {
                         message: e.to_string(),
                         buf: Some(buf),
                         op: Some("folds"),
+                        request_id: None,
                     },
                 )?,
             },
@@ -950,6 +967,7 @@ fn serve() -> Result<()> {
                         message: e.to_string(),
                         buf: Some(buf),
                         op: Some("dump_ast"),
+                        request_id: None,
                     },
                 )?,
             },
@@ -994,6 +1012,7 @@ fn serve() -> Result<()> {
                             "folds",
                             "symbol_kind_filter",
                             "error_op",
+                            "symbol_request_id",
                         ],
                     },
                 )?;
@@ -2606,6 +2625,42 @@ fn vim_func_name(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_request_ids_are_additive_and_echoed_on_success_and_error() {
+        let legacy: Request =
+            serde_json::from_str(r#"{"type":"symbols","buf":3,"lang":"rust"}"#).unwrap();
+        match legacy {
+            Request::Symbols { request_id, .. } => assert_eq!(request_id, 0),
+            _ => panic!("wrong legacy request variant"),
+        }
+
+        let current: Request =
+            serde_json::from_str(r#"{"type":"symbols","buf":3,"lang":"rust","request_id":77}"#)
+                .unwrap();
+        match current {
+            Request::Symbols { request_id, .. } => assert_eq!(request_id, 77),
+            _ => panic!("wrong current request variant"),
+        }
+
+        let success = serde_json::to_value(Event::Symbols {
+            buf: 3,
+            revision: 9,
+            request_id: 77,
+            symbols: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(success["request_id"], 77);
+
+        let error = serde_json::to_value(Event::Error {
+            message: "synthetic".into(),
+            buf: Some(3),
+            op: Some("symbols"),
+            request_id: Some(77),
+        })
+        .unwrap();
+        assert_eq!(error["request_id"], 77);
+    }
 
     #[test]
     fn byte_offsets_use_tree_sitter_byte_columns() {

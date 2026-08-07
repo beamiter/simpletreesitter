@@ -2,6 +2,18 @@
 
 ## Unreleased - 2026-08-05
 
+### Protocol v5：异步 symbols 精确关联
+
+- 每个 partial/full symbols 请求新增单调 `request_id`，daemon 在成功与 error 中
+  原样回传；Vim 端仅允许当前 token 清理 inflight/purpose/kinds、写 full cache 或
+  执行跳转。迟到的 Outline partial、旧 full、旧 buffer 生命周期响应不再可能被
+  同 revision 的新导航误认。
+- `request_id` 是加法字段：v4 daemon 会忽略请求字段并省略响应字段，前端检测到
+  v4 时继续完整使用已有 revision/op/kind 守卫，不禁用导航、Outline 或 loclist。
+- Rust 覆盖旧请求默认 token 及 success/error 回显；Vim 回归按迟到 full → partial
+  → error 的顺序注入响应，确认当前 token、用途、inflight 与 pending jump 均不变，
+  随后的匹配响应仍完成合并跳转。
+
 ### 全套统一
 
 - `.simplecore/` 回来了。10 个仓库里的 supervisor(`autoload/<plugin>/core.vim`

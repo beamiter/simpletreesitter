@@ -143,8 +143,12 @@ g:simpletreesitter_symbol_jump_kinds         function, method, class, struct,
                                              enum, namespace, type, module,
                                              macro ([] means all)
 
-Navigation kind filtering is performed by a protocol-v4 daemon before its
-bounded result limit. Markdown and structured-data filetypes intentionally
+Navigation kind filtering is performed by a protocol-v4-or-newer daemon before
+its bounded result limit. Protocol v5 additionally correlates every symbols
+success/error with a monotonic request ID: a late partial/full response cannot
+clear a newer request, populate its full cache, or execute an old jump. A v4
+daemon omits this additive field and keeps using the existing revision, request
+class, and kind guards. Markdown and structured-data filetypes intentionally
 navigate all extracted levels. Rebuild the daemon after updating the plugin.
 
 g:simpletreesitter_indent_guides             0

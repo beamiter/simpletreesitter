@@ -64,6 +64,11 @@ var s_symbol_request_purpose: dict<string> = {}
 # Kind filter sent with the inflight symbol request, used to validate/cache the
 # response without consulting mutable global configuration later.
 var s_symbol_request_kinds: dict<list<string>> = {}
+# Protocol-v5 correlation token for the one inflight symbols request per buf.
+# The counter stays monotonic across buffer close/reopen so a reused bufnr can
+# never accept a late reply from its previous lifetime.
+var s_next_symbol_request_id: number = 0
+var s_symbol_request_ids: dict<number> = {}
 # Last full-buffer response per buffer, keyed by revision and kind snapshot.
 var s_full_symbol_cache: dict<dict<any>> = {}
 # buf -> {steps, winid, lnum, col, changedtick}。导航响应必须回到发起窗口，
@@ -312,7 +317,7 @@ enddef
 def OnDaemonStart()
   InvalidateDaemonSession()
   EnsureHlGroupsAndProps()
-  simpletreesitter#core#Send({type: 'hello', client_protocol: 4})
+  simpletreesitter#core#Send({type: 'hello', client_protocol: 5})
 enddef
 
 def OnDaemonExit(code: number, restarting: bool)
@@ -507,6 +512,7 @@ def ResetProtocolState()
   s_loclist_pending = {}
   s_symbol_request_purpose = {}
   s_symbol_request_kinds = {}
+  s_symbol_request_ids = {}
   s_full_symbol_cache = {}
   s_symbol_jump_pending = {}
   s_protocol_version = 0
@@ -525,6 +531,34 @@ def EventRevisionIsCurrent(ev: dict<any>, buf: number): bool
   # 缺少 revision 时回退到 acknowledged，兼容旧 daemon。
   var revision = get(ev, 'revision', acknowledged)
   return revision == acknowledged && revision == GetChangedTick(buf)
+enddef
+
+def NextSymbolRequestId(): number
+  s_next_symbol_request_id += 1
+  return s_next_symbol_request_id
+enddef
+
+def ClearSymbolRequestId(buf: number)
+  if has_key(s_symbol_request_ids, buf)
+    remove(s_symbol_request_ids, string(buf))
+  endif
+enddef
+
+# v5 correlates success and error with the exact request. A v4 daemon ignores
+# the additive request_id field and omits it in replies, so it deliberately
+# retains the existing revision/op/kind guards instead of losing functionality.
+def SymbolEventMatchesCurrent(ev: dict<any>, buf: number): bool
+  if s_protocol_version < 5
+    return true
+  endif
+  var expected = get(s_symbol_request_ids, buf, 0)
+  var received = get(ev, 'request_id', 0)
+  if expected <= 0 || received != expected
+    Log(printf('Discarded stale symbols event for buffer %d (request=%d expected=%d)',
+      buf, received, expected))
+    return false
+  endif
+  return true
 enddef
 
 def OnDaemonEvent(ev: dict<any>)
@@ -556,12 +590,16 @@ def OnDaemonEvent(ev: dict<any>)
     endif
   elseif ev.type ==# 'symbols'
     var buf = get(ev, 'buf', 0)
+    if !SymbolEventMatchesCurrent(ev, buf)
+      return
+    endif
     var retry = get(s_pending_syms, buf, false)
     var purpose = get(s_symbol_request_purpose, buf, '')
     var was_full = purpose ==# 'full'
     var request_kinds = get(s_symbol_request_kinds, buf, [])
     s_inflight_syms[buf] = false
     s_pending_syms[buf] = false
+    ClearSymbolRequestId(buf)
     if has_key(s_symbol_request_purpose, buf)
       remove(s_symbol_request_purpose, string(buf))
     endif
@@ -681,6 +719,11 @@ def OnDaemonEvent(ev: dict<any>)
       echohl WarningMsg
       echom '[ts-hl] daemon protocol is v3; run install.sh for filtered symbol navigation'
       echohl None
+    elseif s_protocol_version == 4 && !s_protocol_notice_shown
+      s_protocol_notice_shown = true
+      echohl WarningMsg
+      echom '[ts-hl] daemon protocol is v4; run install.sh for correlated symbol responses'
+      echohl None
     endif
   elseif ev.type ==# 'status'
     echom printf('[ts-hl] daemon v%s protocol=%d | cache=%d/%d bytes evicted=%d | parse full=%d incremental=%d unchanged=%d | %s',
@@ -702,6 +745,9 @@ def OnDaemonEvent(ev: dict<any>)
       endif
       return
     endif
+    if buf > 0 && op ==# 'symbols' && !SymbolEventMatchesCurrent(ev, buf)
+      return
+    endif
     echom '[ts-hl] error: ' .. message
     # protocol v4 的 error 带 op，只清理真正失败的请求类别。否则
     # highlight/fold 错误可能破坏同 buffer 的 full-symbol 用途归类。
@@ -709,6 +755,7 @@ def OnDaemonEvent(ev: dict<any>)
       if op ==# 'symbols'
         s_inflight_syms[buf] = false
         s_pending_syms[buf] = false
+        ClearSymbolRequestId(buf)
         if has_key(s_symbol_request_purpose, buf)
           remove(s_symbol_request_purpose, string(buf))
         endif
@@ -731,6 +778,7 @@ def OnDaemonEvent(ev: dict<any>)
         # 兼容 protocol v3 及更早 daemon 的无 op 错误。新 daemon 不走此分支。
         s_inflight_syms[buf] = false
         s_pending_syms[buf] = false
+        ClearSymbolRequestId(buf)
         if has_key(s_symbol_request_purpose, buf)
           remove(s_symbol_request_purpose, string(buf))
         endif
@@ -1386,7 +1434,7 @@ def RequestFullSymbols(buf: number)
     ScheduleSync(buf)
     return
   endif
-  # Full consumers do not inherit the outline's small scan limit. Protocol v4
+  # Full consumers do not inherit the outline's small scan limit. Protocol v4+
   # filters navigation kinds in the daemon before this hard cap. The kind set
   # comes from the queued command, not mutable configuration at response time.
   var kinds: list<string> = []
@@ -1414,9 +1462,12 @@ def RequestFullSymbols(buf: number)
   s_pending_syms[buf] = false
   s_symbol_request_purpose[buf] = 'full'
   s_symbol_request_kinds[buf] = copy(kinds)
+  var request_id = NextSymbolRequestId()
+  s_symbol_request_ids[buf] = request_id
   if !Send({type: 'symbols', buf: buf, lang: lang, lstart: 1,
-      lend: BufLineCount(buf), max_items: 100000, kinds: kinds})
+      lend: BufLineCount(buf), max_items: 100000, kinds: kinds, request_id: request_id})
     s_inflight_syms[buf] = false
+    ClearSymbolRequestId(buf)
     remove(s_symbol_request_purpose, string(buf))
     remove(s_symbol_request_kinds, string(buf))
     CancelSymbolConsumers(buf, 'symbol request could not be sent')
@@ -1914,8 +1965,8 @@ export def Health()
   for line in simpletreesitter#core#HealthLines()
     echo '  ' .. line
   endfor
-  echo printf('  [%s] protocol: v%d (plugin speaks v4)',
-    s_protocol_version >= 4 ? 'OK' : 'WARN', s_protocol_version)
+  echo printf('  [%s] protocol: v%d (plugin speaks v5)',
+    s_protocol_version >= 5 ? 'OK' : 'WARN', s_protocol_version)
   echo printf('  [%s] text properties: %s',
     has('textprop') ? 'OK' : 'ERROR',
     has('textprop') ? 'available' : 'missing +textprop — highlighting disabled')
@@ -2114,7 +2165,7 @@ export def OnBufClose(buf: number)
   for state in [s_inflight_sync, s_pending_ast, s_inflight_syms, s_inflight_hl,
       s_pending_syms, s_pending_hl, s_oversized_notified,
       s_inflight_folds, s_pending_folds, s_loclist_pending, s_symbol_request_purpose,
-      s_symbol_request_kinds, s_full_symbol_cache]
+      s_symbol_request_kinds, s_symbol_request_ids, s_full_symbol_cache]
     if has_key(state, buf)
       remove(state, string(buf))
     endif
@@ -2418,12 +2469,16 @@ def RequestSymbolsNow(buf: number)
   s_pending_syms[buf] = false
   s_symbol_request_purpose[buf] = 'partial'
   s_symbol_request_kinds[buf] = []
+  var request_id = NextSymbolRequestId()
+  s_symbol_request_ids[buf] = request_id
 
   var [vstart, vend] = VisibleRangeForBufSymbols(buf)
   var render_limit = get(g:, 'simpletreesitter_outline_max_items', 1000)
   var scan_limit = max([render_limit, get(g:, 'simpletreesitter_outline_scan_max_items', 5000)])
-  if !Send({type: 'symbols', buf: buf, lang: lang, lstart: vstart, lend: vend, max_items: scan_limit})
+  if !Send({type: 'symbols', buf: buf, lang: lang, lstart: vstart, lend: vend,
+      max_items: scan_limit, request_id: request_id})
     s_inflight_syms[buf] = false
+    ClearSymbolRequestId(buf)
     remove(s_symbol_request_purpose, string(buf))
     remove(s_symbol_request_kinds, string(buf))
     return

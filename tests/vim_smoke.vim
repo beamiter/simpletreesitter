@@ -239,11 +239,71 @@ setfiletype rust
 let s:nav = bufnr()
 call simpletreesitter#Enable()
 sleep 300m
+
+" A protocol-v4 daemon omits request_id. The additive v5 guard must explicitly
+" preserve that legacy path, leaving revision/op/kind validation in charge.
+call s:CallPrivate('OnDaemonEvent', [{'type': 'hello', 'protocol_version': 4}])
+call assert_true(s:CallPrivate('SymbolEventMatchesCurrent', [{
+      \ 'type': 'symbols', 'buf': s:nav, 'revision': getbufinfo(s:nav)[0].changedtick,
+      \ }, s:nav]), 'protocol-v4 symbol response unexpectedly required request_id')
+call s:CallPrivate('OnDaemonEvent', [{'type': 'hello', 'protocol_version': 5}])
+
+" Reserve three tokens as already-retired request identities so the injected
+" responses below are genuinely older than the live request, not just unequal.
+let s:late_full_token = s:CallPrivate('NextSymbolRequestId', [])
+let s:late_partial_token = s:CallPrivate('NextSymbolRequestId', [])
+let s:late_error_token = s:CallPrivate('NextSymbolRequestId', [])
+
 call cursor(1, 4)
 call simpletreesitter#NextSymbol()
 call simpletreesitter#NextSymbol()
+
+" Full, partial and error replies from older requests may arrive after this
+" full navigation request. None may clear its purpose/token, consume its jump,
+" or move the cursor; the matching real daemon reply below must still win.
+let s:token_state = s:State()
+let s:expected_symbol_request = get(s:token_state.s_symbol_request_ids, string(s:nav), 0)
+call assert_true(s:expected_symbol_request > 0, 'full navigation request has no v5 token')
+let s:pending_jump = deepcopy(s:token_state.s_symbol_jump_pending[string(s:nav)])
+let s:nav_revision = getbufinfo(s:nav)[0].changedtick
+for [s:late_label, s:late_token] in [
+      \ ['full', s:late_full_token],
+      \ ['partial', s:late_partial_token],
+      \ ]
+  call s:CallPrivate('OnDaemonEvent', [{
+        \ 'type': 'symbols', 'buf': s:nav, 'revision': s:nav_revision,
+        \ 'request_id': s:late_token,
+        \ 'symbols': [{'name': 'stale_' . s:late_label, 'kind': 'function',
+        \   'lnum': 2, 'col': 4}],
+        \ }])
+  let s:after_late_success = s:State()
+  call assert_equal(s:expected_symbol_request,
+        \ get(s:after_late_success.s_symbol_request_ids, string(s:nav), 0),
+        \ 'late ' . s:late_label . ' response cleared the current token')
+  call assert_equal('full', get(s:after_late_success.s_symbol_request_purpose,
+        \ string(s:nav), ''), 'late ' . s:late_label . ' response changed request purpose')
+  call assert_equal(s:pending_jump, s:after_late_success.s_symbol_jump_pending[string(s:nav)],
+        \ 'late ' . s:late_label . ' response consumed the current jump')
+  call assert_equal(1, line('.'), 'late ' . s:late_label . ' response moved the cursor')
+endfor
+call s:CallPrivate('OnDaemonEvent', [{
+      \ 'type': 'error', 'buf': s:nav, 'op': 'symbols',
+      \ 'request_id': s:late_error_token,
+      \ 'message': 'stale symbol failure',
+      \ }])
+let s:after_late_error = s:State()
+call assert_equal(s:expected_symbol_request,
+      \ get(s:after_late_error.s_symbol_request_ids, string(s:nav), 0),
+      \ 'late symbols error cleared the current token')
+call assert_true(get(s:after_late_error.s_inflight_syms, string(s:nav), v:false),
+      \ 'late symbols error cleared current inflight state')
+call assert_equal(s:pending_jump, s:after_late_error.s_symbol_jump_pending[string(s:nav)],
+      \ 'late symbols error consumed the current jump')
+
 sleep 300m
 call assert_equal(3, line('.'), 'queued NextSymbol calls did not coalesce or jump to gamma')
+call assert_false(has_key(s:State().s_symbol_request_ids, string(s:nav)),
+      \ 'matching symbols response left its request token behind')
 call simpletreesitter#NextSymbol()
 sleep 300m
 call assert_equal(1, line('.'), 'NextSymbol did not wrap to alpha')
