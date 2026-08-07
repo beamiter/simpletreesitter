@@ -62,6 +62,18 @@ Build or update the daemon from the plugin directory: >
                                                 *:TsHlOutlineRefresh*
 :TsHlOutlineRefresh     Refresh symbols for the current Outline source.
 
+                                                *:TsHlOutlineFilter*
+:TsHlOutlineFilter [query]
+                        Filter the Outline by a case-insensitive literal
+                        substring of symbol name, kind, or container name.
+                        With no query, clear the filter. Filtering projects the
+                        last revision/request-validated raw symbols before the
+                        render limit, sends no request, and preserves a still
+                        visible selected symbol plus caller focus. A query set
+                        while symbols are in flight is applied when the guarded
+                        response arrives. Switching or closing the source
+                        clears both query and raw payload.
+
                                                 *:TsHlDumpAST*
 :TsHlDumpAST            Show the AST for the current buffer revision.
 
@@ -102,7 +114,8 @@ are never replaced.  For custom mappings use: >
   nmap ]s <Plug>(simpletreesitter-next-symbol)
   nmap [s <Plug>(simpletreesitter-prev-symbol)
 <
-Inside the Outline, <CR> jumps, o and za toggle a node, and q closes it.
+Inside the Outline, <CR> jumps, o and za toggle a node, / prompts for a local
+filter (empty clears it), and q closes it.
 
 ===============================================================================
 5. OPTIONS                                   *simpletreesitter-options*

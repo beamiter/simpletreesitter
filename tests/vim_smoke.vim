@@ -37,6 +37,7 @@ for s:auto_ft in ['lua', 'html', 'css', 'markdown']
 endfor
 call assert_equal(2, exists(':TsHlNextSymbol'))
 call assert_equal(2, exists(':TsHlPrevSymbol'))
+call assert_equal(2, exists(':TsHlOutlineFilter'))
 call assert_match('simpletreesitter_user_mapping_won', maparg('<leader>th', 'n'))
 call assert_notequal('', maparg('<Plug>(simpletreesitter-toggle)', 'n'))
 call assert_notequal('', maparg('<Plug>(simpletreesitter-next-symbol)', 'n'))
@@ -70,12 +71,110 @@ sleep 100m
 call assert_equal(s:window_count, winnr('$'))
 call assert_equal(1, len(win_findbuf(s:outline)))
 
+" Outline filtering projects the last raw response locally, before the render
+" limit, and does not allocate/send another symbols request. Selection in the
+" outline and focus in the source split survive filtering and clearing.
+let s:outline_win = win_findbuf(s:outline)[0]
+call win_execute(s:outline_win, 'let g:simpletreesitter_filter_map = maparg("/", "n")')
+call assert_match('OutlinePromptFilter', g:simpletreesitter_filter_map,
+      \ 'Outline / mapping does not open the filter prompt')
+call assert_false(s:CallPrivate('OutlineItemMatches', [
+      \ {'name': 17, 'kind': 23, 'container_name': 42}, '17']),
+      \ 'outline filter stringified malformed numeric symbol fields')
+call assert_true(s:CallPrivate('OutlineItemMatches', [
+      \ {'name': 17, 'kind': 23, 'container_name': 'Module'}, 'module']),
+      \ 'outline filter lost a valid string field beside malformed fields')
+call simpletreesitter#OutlineFilter('needle')
+let s:malformed_symbols = [
+      \ {'name': 17, 'kind': ['needle'], 'container_name': 42,
+      \  'lnum': 1, 'col': 1, 'end_lnum': 1, 'end_col': 2},
+      \ {'name': 'needle_survivor', 'kind': 'method', 'container_name': '',
+      \  'lnum': 2, 'col': 1, 'end_lnum': 2, 'end_col': 2},
+      \ ]
+call s:CallPrivate('ApplySymbols', [s:source, s:malformed_symbols])
+let s:malformed_lines = join(getbufline(s:outline, 1, '$'), "\n")
+call assert_match('needle_survivor', s:malformed_lines,
+      \ 'active filter lost the valid symbol beside malformed fields')
+call assert_notmatch('17\|\[''needle''\]', s:malformed_lines,
+      \ 'active filter stringified a malformed number/list field')
+let s:normalized_raw = s:State().s_outline_raw_items
+call assert_equal('', s:normalized_raw[0].name)
+call assert_equal('', s:normalized_raw[0].kind)
+call assert_equal('', s:normalized_raw[0].container_name)
+call assert_equal(v:t_string, type(s:normalized_raw[0].name))
+call assert_equal(v:t_string, type(s:normalized_raw[0].kind))
+call assert_equal(v:t_string, type(s:normalized_raw[0].container_name))
+call assert_equal(17, s:malformed_symbols[0].name,
+      \ 'outline normalization mutated the accepted caller payload')
+call assert_equal(['needle'], s:malformed_symbols[0].kind,
+      \ 'outline normalization reused the malformed kind list in place')
+call simpletreesitter#OutlineFilter('')
+let s:filter_symbols = [
+      \ {'name': 'alpha_symbol', 'kind': 'function', 'lnum': 1, 'col': 1,
+      \  'end_lnum': 1, 'end_col': 5},
+      \ {'name': 'beta_symbol', 'kind': 'function', 'lnum': 2, 'col': 1,
+      \  'end_lnum': 2, 'end_col': 5},
+      \ ]
+let s:old_outline_limit = g:simpletreesitter_outline_max_items
+let g:simpletreesitter_outline_max_items = 1
+call s:CallPrivate('ApplySymbols', [s:source, s:filter_symbols])
+let s:filter_state_before = s:State()
+let s:filter_request_counter = s:filter_state_before.s_next_symbol_request_id
+let s:filter_request_ids = deepcopy(s:filter_state_before.s_symbol_request_ids)
+let s:source_win_before_filter = win_getid()
+call simpletreesitter#OutlineFilter('BETA')
+call assert_equal(s:source_win_before_filter, win_getid(), 'Outline filter stole source focus')
+let s:filtered_lines = getbufline(s:outline, 1, '$')
+call assert_match('beta_symbol', join(s:filtered_lines, "\n"))
+call assert_notmatch('alpha_symbol', join(s:filtered_lines, "\n"),
+      \ 'filter ran after the one-item render limit')
+let s:filtered_state = s:State()
+call assert_equal(2, len(s:filtered_state.s_outline_raw_items),
+      \ 'filter discarded the unfiltered symbols payload')
+call assert_equal('BETA', s:filtered_state.s_outline_filter)
+call assert_equal(s:filter_request_counter, s:filtered_state.s_next_symbol_request_id,
+      \ 'filter allocated a symbols request')
+call assert_equal(s:filter_request_ids, s:filtered_state.s_symbol_request_ids,
+      \ 'filter changed in-flight request correlation state')
+
+let g:simpletreesitter_outline_max_items = s:old_outline_limit
+call win_execute(s:outline_win, 'call cursor(1, 1)')
+call simpletreesitter#OutlineFilter('')
+let s:restored_lines = getbufline(s:outline, 1, '$')
+call assert_match('alpha_symbol', join(s:restored_lines, "\n"))
+call assert_match('beta_symbol', join(s:restored_lines, "\n"))
+call assert_equal(s:source_win_before_filter, win_getid(), 'clearing filter stole source focus')
+let s:beta_line = match(s:restored_lines, 'beta_symbol') + 1
+call assert_equal(s:beta_line, getcurpos(s:outline_win)[1],
+      \ 'clearing filter did not preserve the selected symbol')
+
+" An accepted empty payload is still a valid raw snapshot; clearing a filter
+" must replace the filtered-empty message without issuing a request.
+call simpletreesitter#OutlineFilter('nothing')
+call s:CallPrivate('ApplySymbols', [s:source, []])
+call assert_match('no symbols matching', getbufline(s:outline, 1)[0])
+call simpletreesitter#OutlineFilter('')
+call assert_equal('<no symbols>', getbufline(s:outline, 1)[0])
+
+" A remembered query applies to the next accepted response without a Send.
+call simpletreesitter#OutlineFilter('late_result')
+call s:CallPrivate('ApplySymbols', [s:source, [
+      \ {'name': 'ignored', 'kind': 'function', 'lnum': 1, 'col': 1},
+      \ {'name': 'late_result', 'kind': 'method', 'lnum': 2, 'col': 1},
+      \ ]])
+call assert_match('late_result', join(getbufline(s:outline, 1, '$'), "\n"))
+call assert_notmatch('ignored', join(getbufline(s:outline, 1, '$'), "\n"))
+
 " Switching to an unsupported buffer clears every old outline line and jump map.
 enew
 setfiletype text
 sleep 100m
 call assert_equal(['<outline unsupported for this filetype>'], getbufline(s:outline, 1, '$'))
 call assert_equal(s:window_count, winnr('$'))
+call assert_equal('', s:State().s_outline_filter,
+      \ 'switching Outline source retained the previous query')
+call assert_equal([], s:State().s_outline_raw_items,
+      \ 'switching Outline source retained the previous raw symbols')
 
 execute 'buffer ' . s:source
 sleep 300m

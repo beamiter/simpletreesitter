@@ -30,6 +30,12 @@ var s_outline_win: number = 0
 var s_outline_buf: number = 0
 var s_outline_src_buf: number = 0
 var s_outline_src_win: number = 0
+# The last accepted daemon payload stays unfiltered. Interactive filtering can
+# therefore run before the render limit and clear instantly without sending a
+# new symbols request.
+var s_outline_raw_items: list<dict<any>> = []
+var s_outline_raw_valid: bool = false
+var s_outline_filter: string = ''
 var s_outline_items: list<dict<any>> = []
 var s_outline_linemap: list<number> = []  # 每一可见行对应 s_outline_items 的下标，-1 表示不可跳转
 var s_outline_idx_to_lnum: dict<number> = {}  # s_outline_items 下标 -> outline 行号（光标跟随 O(1) 反查）
@@ -2103,6 +2109,9 @@ export def OnBufEvent(buf: number)
     if IsSupportedLang(buf)
       if s_outline_state_buf != buf
         s_outline_collapsed = {}
+        s_outline_filter = ''
+        s_outline_raw_items = []
+        s_outline_raw_valid = false
         s_outline_state_buf = buf
       endif
       s_outline_src_buf = buf
@@ -2112,6 +2121,9 @@ export def OnBufEvent(buf: number)
     else
       s_outline_src_buf = 0
       s_outline_src_win = 0
+      s_outline_filter = ''
+      s_outline_raw_items = []
+      s_outline_raw_valid = false
       s_outline_items = []
       s_outline_linemap = [-1]
       s_outline_idx_to_lnum = {}
@@ -2188,6 +2200,9 @@ export def OnBufClose(buf: number)
   if buf == s_outline_src_buf
     s_outline_src_buf = 0
     s_outline_src_win = 0
+    s_outline_filter = ''
+    s_outline_raw_items = []
+    s_outline_raw_valid = false
     s_outline_items = []
     s_outline_linemap = [-1]
     s_outline_idx_to_lnum = {}
@@ -2584,6 +2599,73 @@ export def DumpAST()
 enddef
 
 # =============== 渲染符号侧边栏（树形 + 高亮） ===============
+def OutlineSymbolKey(symbol: dict<any>): string
+  return string([
+    get(symbol, 'kind', ''),
+    get(symbol, 'name', ''),
+    get(symbol, 'lnum', 0),
+    get(symbol, 'col', 0),
+  ])
+enddef
+
+def OutlineSelectedKey(): string
+  if s_outline_win == 0 || empty(getwininfo(s_outline_win))
+    return ''
+  endif
+  var outline_pos = getcurpos(s_outline_win)
+  var row = outline_pos[1] - 1
+  if row < 0 || row >= len(s_outline_linemap)
+    return ''
+  endif
+  var item_index = s_outline_linemap[row]
+  return item_index >= 0 && item_index < len(s_outline_items)
+    ? OutlineSymbolKey(s_outline_items[item_index])
+    : ''
+enddef
+
+def RestoreOutlineSelection(key: string)
+  if key ==# '' || s_outline_win == 0 || empty(getwininfo(s_outline_win))
+    return
+  endif
+  for i in range(len(s_outline_items))
+    if OutlineSymbolKey(s_outline_items[i]) ==# key
+      var outline_line = get(s_outline_idx_to_lnum, i, 0)
+      if outline_line > 0
+        call win_execute(s_outline_win, 'call cursor(' .. outline_line .. ', 1)')
+      endif
+      return
+    endif
+  endfor
+enddef
+
+def OutlineStringField(symbol: dict<any>, field: string): string
+  var value = get(symbol, field, '')
+  return type(value) == v:t_string ? value : ''
+enddef
+
+def NormalizeOutlineSymbols(symbols: list<dict<any>>): list<dict<any>>
+  var normalized: list<dict<any>> = []
+  for symbol in symbols
+    var item = copy(symbol)
+    item.name = OutlineStringField(symbol, 'name')
+    item.kind = OutlineStringField(symbol, 'kind')
+    item.container_name = OutlineStringField(symbol, 'container_name')
+    normalized->add(item)
+  endfor
+  return normalized
+enddef
+
+def OutlineItemMatches(symbol: dict<any>, query: string): bool
+  if query ==# ''
+    return true
+  endif
+  var name = OutlineStringField(symbol, 'name')
+  var kind = OutlineStringField(symbol, 'kind')
+  var container = OutlineStringField(symbol, 'container_name')
+  var searchable = name .. "\n" .. kind .. "\n" .. container
+  return stridx(tolower(searchable), query) >= 0
+enddef
+
 def ApplySymbols(buf: number, syms: list<dict<any>>)
   if s_outline_win == 0 || s_outline_buf == 0 || s_outline_src_buf != buf
     return
@@ -2591,11 +2673,18 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
   if !bufexists(s_outline_buf)
     return
   endif
+  var selected_key = OutlineSelectedKey()
+  # Normalize the complete accepted payload once at the outline boundary.
+  # Raw cache, signature, filtering, tree building and rendering must all see
+  # the same safe string fields instead of diverging on malformed daemon data.
+  var accepted = NormalizeOutlineSymbols(syms)
+  s_outline_raw_items = copy(accepted)
+  s_outline_raw_valid = true
 
   # 符号 + 折叠状态 + 影响渲染的配置都没变时，跳过整树重建/setline/逐行 prop。
   # symbols 事件常以相同内容重复触发，这一步避免无谓的全量重绘。
-  var sig_parts: list<string> = ['buf=' .. buf, string(len(syms))]
-  for s in syms
+  var sig_parts: list<string> = ['buf=' .. buf, string(len(accepted))]
+  for s in accepted
     sig_parts->add(get(s, 'kind', '') .. ':' .. get(s, 'name', '')
       .. ':' .. string(get(s, 'lnum', 0)) .. ':' .. string(get(s, 'col', 0))
       .. ':' .. string(get(s, 'end_lnum', 0)) .. ':' .. string(get(s, 'end_col', 0))
@@ -2616,6 +2705,7 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
     get(g:, 'simpletreesitter_outline_max_items', 300),
     get(g:, 'simpletreesitter_outline_exclude_patterns', []),
     get(g:, 'simpletreesitter_outline_disable_props', 1),
+    s_outline_filter,
   ]))
   var sig = join(sig_parts, '|')
   if sig ==# s_last_outline_sig
@@ -2623,7 +2713,7 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
   endif
   s_last_outline_sig = sig
 
-  var items: list<dict<any>> = syms
+  var items: list<dict<any>> = copy(accepted)
 
   var hide_inner = get(g:, 'simpletreesitter_outline_hide_inner_functions', 1) ? true : false
   if hide_inner
@@ -2674,6 +2764,21 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
       tmp2->add(s)
     endfor
     items = tmp2
+  endif
+
+  # User filtering is deliberately applied to the complete accepted payload,
+  # after static visibility rules but before the viewport-aware render limit.
+  # A matching child keeps its container through BuildTreeByContainer's
+  # synthetic-parent path, so hierarchy remains intelligible.
+  var normalized_filter = tolower(s_outline_filter)
+  if normalized_filter !=# ''
+    var filtered3: list<dict<any>> = []
+    for symbol in items
+      if OutlineItemMatches(symbol, normalized_filter)
+        filtered3->add(symbol)
+      endif
+    endfor
+    items = filtered3
   endif
 
   var max_items = get(g:, 'simpletreesitter_outline_max_items', 300)
@@ -2764,7 +2869,9 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
     if win_gotoid(s_outline_win)
       setlocal modifiable
       if len(lines) == 0
-        lines = ['<no symbols>']
+        lines = [s_outline_filter ==# ''
+          ? '<no symbols>'
+          : '<no symbols matching "' .. s_outline_filter .. '">']
         s_outline_linemap = [-1]
       endif
       call setline(1, lines)
@@ -2822,6 +2929,7 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
       s_outline_idx_to_lnum[string(sidx)] = i + 1
     endif
   endfor
+  RestoreOutlineSelection(selected_key)
 enddef
 
 # =============== 侧边栏窗口管理 ===============
@@ -2844,6 +2952,9 @@ export def OutlineOpen()
   if s_outline_win != 0 && win_id2win(s_outline_win) != 0
     if s_outline_state_buf != src
       s_outline_collapsed = {}
+      s_outline_filter = ''
+      s_outline_raw_items = []
+      s_outline_raw_valid = false
       s_outline_state_buf = src
     endif
     s_outline_src_buf = src
@@ -2880,6 +2991,7 @@ export def OutlineOpen()
       nnoremap <silent><buffer> q :call simpletreesitter#OutlineClose()<CR>
       nnoremap <silent><buffer> o :call simpletreesitter#OutlineToggleFold()<CR>
       nnoremap <silent><buffer> za :call simpletreesitter#OutlineToggleFold()<CR>
+      nnoremap <silent><buffer> / :call simpletreesitter#OutlinePromptFilter()<CR>
     endif
 
     s_outline_win = win_getid()
@@ -2915,6 +3027,9 @@ export def OutlineClose()
   endif
   s_outline_win = 0
   s_outline_buf = 0
+  s_outline_filter = ''
+  s_outline_raw_items = []
+  s_outline_raw_valid = false
   s_outline_items = []
   s_outline_linemap = []
   s_outline_idx_to_lnum = {}
@@ -2944,6 +3059,37 @@ export def OutlineRefresh()
     return
   endif
   ScheduleSymbols(s_outline_src_buf)
+enddef
+
+export def OutlineFilter(query: string = '')
+  if s_outline_win == 0 || s_outline_src_buf == 0 || !bufexists(s_outline_buf)
+    echo '[ts-hl] open the Outline before filtering'
+    return
+  endif
+  var normalized = trim(query)
+  s_outline_filter = normalized
+  s_last_outline_sig = ''
+  # Filtering is a pure projection of the latest accepted payload. If a
+  # symbols request is still in flight, remembering the query is sufficient:
+  # its guarded response will pass through ApplySymbols when it arrives.
+  if s_outline_raw_valid
+    ApplySymbols(s_outline_src_buf, s_outline_raw_items)
+  endif
+  if normalized ==# ''
+    echo '[ts-hl] outline filter cleared'
+  else
+    echo '[ts-hl] outline filter: ' .. normalized
+  endif
+enddef
+
+export def OutlinePromptFilter()
+  var query = ''
+  try
+    query = input('Outline filter (empty to clear): ', s_outline_filter)
+  catch
+    return
+  endtry
+  OutlineFilter(query)
 enddef
 
 export def OutlineJump()
@@ -3003,10 +3149,10 @@ export def OutlineToggleFold()
   var it = s_outline_items[sym_idx]
   var ckey = it.kind .. '::' .. it.name .. '@' .. it.lnum
   s_outline_collapsed[ckey] = !get(s_outline_collapsed, ckey, false)
-  # 用缓存的 items 重新渲染
-  var save_cursor = line('.')
-  ApplySymbols(s_outline_src_buf, s_outline_items)
-  cursor(min([save_cursor, line('$')]), 1)
+  # Re-render from the unfiltered accepted payload so filtering and clearing
+  # never compound against an already limited list. ApplySymbols preserves the
+  # selected symbol and caller focus.
+  ApplySymbols(s_outline_src_buf, s_outline_raw_items)
 enddef
 
 # 新增：WinClosed 事件回调（导出），用于判断关闭的是否为 outline 窗口

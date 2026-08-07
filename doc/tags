@@ -6,6 +6,7 @@
 :TsHlLog	simpletreesitter.txt	/*:TsHlLog*
 :TsHlNextSymbol	simpletreesitter.txt	/*:TsHlNextSymbol*
 :TsHlOutlineClose	simpletreesitter.txt	/*:TsHlOutlineClose*
+:TsHlOutlineFilter	simpletreesitter.txt	/*:TsHlOutlineFilter*
 :TsHlOutlineOpen	simpletreesitter.txt	/*:TsHlOutlineOpen*
 :TsHlOutlineRefresh	simpletreesitter.txt	/*:TsHlOutlineRefresh*
 :TsHlOutlineToggle	simpletreesitter.txt	/*:TsHlOutlineToggle*

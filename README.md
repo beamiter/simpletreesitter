@@ -83,6 +83,7 @@ install -m 0755 target/release/ts-hl-daemon lib/ts-hl-daemon
 | `:TsHlOutlineOpen` / `:TsHlOutlineClose` | 打开或关闭大纲 |
 | `:TsHlOutlineToggle` | 切换大纲 |
 | `:TsHlOutlineRefresh` | 刷新当前大纲 |
+| `:TsHlOutlineFilter [query]` | 即时过滤大纲；省略 query 清除过滤 |
 | `:TsHlDumpAST` | 打开当前 revision 的 AST 视图 |
 | `:TsHlStatus` | 显示 daemon 协议、cache 和解析统计；不会启动 daemon |
 | `:TsHlSymbols` | 当前 buffer 符号送入 location list 并打开 |
@@ -105,7 +106,11 @@ nmap ]s <Plug>(simpletreesitter-next-symbol)
 nmap [s <Plug>(simpletreesitter-prev-symbol)
 ```
 
-大纲窗口内：`<CR>` 跳转，`o`/`za` 折叠或展开，`q` 关闭。
+大纲窗口内：`<CR>` 跳转，`o`/`za` 折叠或展开，`/` 输入过滤词，`q` 关闭。
+过滤对符号名、kind 与容器名做不区分大小写的字面子串匹配；它直接投影最近一次
+通过 revision/request 校验的原始 symbols，在条数上限之前执行，因此无需新请求，
+清除后也能立即恢复完整大纲。重绘会保持仍可见的选中符号和调用方窗口焦点；
+切换或关闭 source buffer 会清掉 query 与原始缓存，避免跨 buffer 串用。
 
 ## 配置
 

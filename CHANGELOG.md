@@ -2,6 +2,16 @@
 
 ## Unreleased - 2026-08-05
 
+### Outline 即时过滤
+
+- 新增 `:TsHlOutlineFilter [query]` 与 Outline 内 `/`：按符号名、kind、容器名做
+  不区分大小写的字面过滤；空 query 立即恢复。过滤基于最后一次通过
+  revision/request_id 守卫的未过滤 raw symbols，并发生在 render limit 之前，
+  不发送新请求，也不会漏掉原本被条数上限裁掉的匹配项。
+- query 可先于在途响应记忆，匹配响应到达后自动生效；重绘保持仍可见的选中符号与
+  调用方焦点。切换/关闭 source 会同时清 query/raw；畸形响应里的非字符串名称、
+  kind 或容器字段按空值处理，v4 回退与 v5 token 路径不变。
+
 ### Protocol v5：异步 symbols 精确关联
 
 - 每个 partial/full symbols 请求新增单调 `request_id`，daemon 在成功与 error 中
