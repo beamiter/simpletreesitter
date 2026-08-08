@@ -17,14 +17,38 @@ jobs:
   # newly used language feature can quietly break it, because every other job
   # runs on stable.  This is the check that caught `ignore` pulling in
   # let-chains and two crates whose own sources had outgrown their declared
-  # MSRV.  Keep the toolchain here in step with rust-version in Cargo.toml.
+  # MSRV.  The toolchain is read out of Cargo.toml rather than written here:
+  # six repositories in this suite pinned a version their own manifest had
+  # already outgrown, and `cargo check --locked` hard-errors on that, so CI was
+  # red on every push until someone noticed.  Deriving the pin makes the two
+  # incapable of diverging.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Read the MSRV declared in Cargo.toml
+        id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          if [ -z "$version" ]; then
+            echo "Cargo.toml declares no rust-version" >&2
+            exit 1
+          fi
+          echo "Declared MSRV: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
       - name: Build on the declared minimum supported Rust
         run: cargo check --all-targets --locked
+
+  # `make check` is the gate, here and on a developer's machine.  Listing
+  # individual targets here instead lets the two drift, and it did: core-verify,
+  # which fails the build when a vendored simplecore file is edited in place,
+  # never ran in CI at all.
   quality:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -41,28 +65,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes vim-nox
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Lint
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --locked --all-targets
-
-      - name: Build daemon and run Vim smoke test
-        run: |
-          cargo build --locked
-          vim -Nu NONE -i NONE -n -es -X -S tests/vim_smoke.vim
+      - name: make check
+        run: make check
 
       - name: Build release artifact
         run: cargo build --release --locked
 
       - name: Validate installer syntax
         run: bash -n install.sh
-
-      - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
-        run: make defcompile
-
-      - name: simplecore supervisor regression suite
-        run: make vim-core
