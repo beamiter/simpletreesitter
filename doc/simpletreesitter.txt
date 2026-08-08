@@ -8,6 +8,7 @@ CONTENTS                                                *simpletreesitter*
 3. Commands.................................|simpletreesitter-commands|
 4. Mappings.................................|simpletreesitter-mappings|
 5. Text objects.............................|simpletreesitter-textobjects|
+   Language injections......................|simpletreesitter-injections|
 6. Options..................................|simpletreesitter-options|
 7. Troubleshooting..........................|simpletreesitter-troubleshooting|
 
@@ -322,6 +323,32 @@ Disable one buffer with: >
   let b:simpletreesitter_disable = 1
   let b:simpletreesitter_max_buffer_bytes = 0
 <
+LANGUAGE INJECTIONS                          *simpletreesitter-injections*
+
+Some documents embed another language.  Those regions are parsed with the
+embedded grammar and highlighted as that language, in the host document's own
+line and column coordinates:
+
+  markdown    prose runs (emphasis, links, code spans) and fenced code blocks
+              whose info string names a bundled grammar, e.g. ```rust
+  html        <script> bodies as javascript, <style> bodies as css
+
+A fence tag that does not resolve to a bundled grammar -- an unlabelled fence,
+or ```brainfuck -- is left alone and keeps the host's own literal highlighting.
+Common aliases are understood (rs, js, ts, py, sh, yml, c++, ...).
+
+Where an injected grammar owns the text, the host's own capture for the same
+text is dropped, so a rust fence is coloured like rust instead of being flooded
+with markdown's flat @text.literal.  |:TsHlInspect| reports which grammar a
+capture came from and applies the same rule, so it always names the colour the
+screen actually shows.
+
+Injection depth is one: a fence inside a fence belongs to the outer grammar.
+Each injected language is parsed once per sync over all of its ranges at once,
+so a document with forty rust fences costs one rust parse.
+
+Injections need a daemon advertising the "injections" capability.
+
 ===============================================================================
 7. TROUBLESHOOTING                          *simpletreesitter-troubleshooting*
 

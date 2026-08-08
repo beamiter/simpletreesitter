@@ -796,6 +796,24 @@ only
 let g:simpletreesitter_breadcrumb = 0
 call simpletreesitter#Disable()
 
+" =============== Language injections ===============
+" A fenced code block is the first thing anyone notices about markdown
+" highlighting. Assert it end to end, through a real daemon and real text
+" properties, because the daemon-side test cannot see whether the spans
+" survived the Vim-side range filtering and prop application.
+enew
+call setline(1, ['Prose above the fence.', '', '```rust', 'fn main() { let x = 1; }', '```'])
+setfiletype markdown
+let s:inj = bufnr()
+call simpletreesitter#Enable()
+sleep 400m
+let s:inj_types = map(prop_list(4, {'bufnr': s:inj}), 'v:val.type')
+call assert_true(index(s:inj_types, 'SimpleTreeSitter_TSKeyword') >= 0,
+      \ 'a ```rust fence was not highlighted by the rust grammar: ' . string(s:inj_types))
+call assert_equal([], filter(copy(s:inj_types), 'v:val ==# "SimpleTreeSitter_TSLiteral"'),
+      \ 'the host flat literal survived on top of the injected fence')
+call simpletreesitter#Disable()
+
 " =============== Text objects and incremental selection ===============
 " [lnum, col] ordering; Vim's < on lists is an error, not a comparison.
 function! s:PosLE(left, right) abort

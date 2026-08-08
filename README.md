@@ -16,6 +16,10 @@
   `g:simpletreesitter_selection_maps`）。
 - 符号跳转：`:TsHlSymbols` 把当前 buffer 符号送入 location list。
 - 异步符号导航：`:TsHlNextSymbol` / `:TsHlPrevSymbol` 支持计数、循环与连续按键合并，不必打开 Outline。
+- 语言注入：markdown 的行内语法与带语言标记的围栏代码块（```rust 等）、HTML 的
+  `<script>`/`<style>` 分别用对应语法解析并高亮，坐标仍在宿主文档里；注入区间内
+  宿主自己的 capture 会被丢弃，围栏不再被一整片 `@text.literal` 盖住。未知或无标记
+  的围栏保持原样。注入深度为 1，每种语言每次同步只解析一遍。
 - 协议 v6 作用域链：一次应答同时喂饱文本对象与增量选择，且对整个 token 有效，
   故算子等待里无需往返即可同步作答；旧 daemon 缺 `scope` 能力时给出可执行提示。
 - 协议 v5 请求关联：每次 symbols 请求携带单调 token；迟到的 full/partial 成功或
@@ -45,9 +49,9 @@
 | YAML | `yaml` | ✅ | ✅ |
 | TOML | `toml` | ✅ | ✅ |
 | Lua | `lua` | ✅ | ✅ |
-| HTML | `html` | ✅ | ✅ |
+| HTML | `html` | ✅（`<script>`/`<style>` 注入） | ✅ |
 | CSS | `css` | ✅ | ✅ |
-| Markdown (GFM) | `markdown` | ✅ | ✅（标题大纲） |
+| Markdown (GFM) | `markdown` | ✅（行内 + 围栏注入） | ✅（标题大纲） |
 
 ## 环境要求
 

@@ -26,6 +26,7 @@ simpletreesitter	simpletreesitter.txt	/*simpletreesitter*
 simpletreesitter-commands	simpletreesitter.txt	/*simpletreesitter-commands*
 simpletreesitter-daemon	simpletreesitter.txt	/*simpletreesitter-daemon*
 simpletreesitter-daemon-cli	simpletreesitter.txt	/*simpletreesitter-daemon-cli*
+simpletreesitter-injections	simpletreesitter.txt	/*simpletreesitter-injections*
 simpletreesitter-introduction	simpletreesitter.txt	/*simpletreesitter-introduction*
 simpletreesitter-mappings	simpletreesitter.txt	/*simpletreesitter-mappings*
 simpletreesitter-options	simpletreesitter.txt	/*simpletreesitter-options*

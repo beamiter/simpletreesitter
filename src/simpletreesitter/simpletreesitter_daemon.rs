@@ -42,6 +42,10 @@ const LINE_INDEX_STRIDE: usize = 256;
 /// and shallow enough that a pathological tree cannot make an interactive
 /// keystroke serialise an unbounded payload.
 const MAX_SCOPE_CHAIN: usize = 256;
+/// Injected ranges per buffer. Generous because markdown emits one `inline`
+/// range per paragraph, and stingy enough that a pathological document cannot
+/// make one sync parse an unbounded number of keyholes.
+const MAX_INJECTED_RANGES: usize = 8_192;
 
 fn default_true() -> bool {
     true
@@ -346,14 +350,29 @@ struct Symbol {
     container_col: Option<u32>,
 }
 
+/// A second grammar parsed over a subset of the host document.
+///
+/// One tree per injected language, parsed once with `set_included_ranges` over
+/// all of that language's ranges — a markdown file with forty rust fences costs
+/// one rust parse, not forty.
+struct InjectedTree {
+    lang: &'static str,
+    tree: tree_sitter::Tree,
+}
+
 // 缓存：每个 buf 保存 lang/text/tree
 struct BufCache {
     lang: String,
     text: String,
     tree: tree_sitter::Tree,
-    // Markdown 内联语法树：用 included_ranges 限定在块树的 inline 节点上，
-    // 每次同步整体重建（inline 解析本身很快，无需增量）。
-    inline_tree: Option<tree_sitter::Tree>,
+    // 注入语法树：markdown 的 inline 与围栏代码块、HTML 的 <script>/<style>。
+    // 每次同步整体重建：注入解析很快，而注入区间会随宿主的任何编辑整体平移，
+    // 维护它们的增量复用不值当。
+    injections: Vec<InjectedTree>,
+    // 上面那些树占据的字节区间，按文档顺序排列且互不重叠。落在其中的宿主
+    // capture 会被丢弃 —— markdown 把整段围栏内容捕获成 @text.literal，注入
+    // 之后那一段应当由被注入的语法说了算。
+    injected_ranges: Vec<ops::Range<usize>>,
     revision: u64,
     line_index: SparseLineIndex,
 }
@@ -377,9 +396,16 @@ struct LangQueries {
     language: tree_sitter::Language,
     hl_query: tree_sitter::Query,
     sym_query: tree_sitter::Query,
-    // 第二语法（目前仅 markdown 的 inline 语法）及其高亮查询。
-    inline_language: Option<tree_sitter::Language>,
-    inline_hl_query: Option<tree_sitter::Query>,
+}
+
+/// A grammar compiled only to highlight injected content.
+///
+/// Kept apart from `LangQueries` because an injection target need not be a
+/// filetype anyone can open: `markdown_inline` has no symbol query, no fold
+/// kinds and no entry in `SUPPORTED_LANGUAGES`.
+struct InjectionQuery {
+    language: tree_sitter::Language,
+    hl_query: tree_sitter::Query,
 }
 
 struct Server {
@@ -389,6 +415,8 @@ struct Server {
     parsers: HashMap<String, tree_sitter::Parser>,
     // 预编译查询缓存（按语言）
     queries: HashMap<String, LangQueries>,
+    // 注入语法的查询缓存（按注入语言名，含 markdown_inline）
+    injection_queries: HashMap<String, InjectionQuery>,
     full_parses: u64,
     incremental_parses: u64,
     unchanged_syncs: u64,
@@ -417,6 +445,7 @@ impl Server {
             cache: HashMap::new(),
             parsers: HashMap::new(),
             queries: HashMap::new(),
+            injection_queries: HashMap::new(),
             full_parses: 0,
             incremental_parses: 0,
             unchanged_syncs: 0,
@@ -521,25 +550,43 @@ impl Server {
             let (language, hl_src, sym_src) = Self::lang_info(lang)?;
             let hl_query = tree_sitter::Query::new(&language, hl_src)?;
             let sym_query = tree_sitter::Query::new(&language, sym_src)?;
-            let (inline_language, inline_hl_query) = if lang == "markdown" {
-                let inline_language: tree_sitter::Language = tree_sitter_md::INLINE_LANGUAGE.into();
-                let inline_hl_query =
-                    tree_sitter::Query::new(&inline_language, queries::MD_INLINE_QUERY)?;
-                (Some(inline_language), Some(inline_hl_query))
-            } else {
-                (None, None)
-            };
             self.queries.insert(
                 lang.to_string(),
                 LangQueries {
                     language,
                     hl_query,
                     sym_query,
-                    inline_language,
-                    inline_hl_query,
                 },
             );
         }
+        // Compile the fixed injection targets now rather than on first sight of
+        // an injected range: `--self-test` only calls this, and it is what makes
+        // a broken injected query fail at install time instead of silently
+        // leaving `<script>` bodies uncoloured for the one user who has one.
+        for rule in injection_rules(lang) {
+            if let InjectionTarget::Fixed(target) = rule.target {
+                self.ensure_injection_query(target)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_injection_query(&mut self, name: &str) -> Result<()> {
+        if self.injection_queries.contains_key(name) {
+            return Ok(());
+        }
+        let (language, hl_src): (tree_sitter::Language, &str) = if name == "markdown_inline" {
+            (
+                tree_sitter_md::INLINE_LANGUAGE.into(),
+                queries::MD_INLINE_QUERY,
+            )
+        } else {
+            let (language, hl_src, _) = Self::lang_info(name)?;
+            (language, hl_src)
+        };
+        let hl_query = tree_sitter::Query::new(&language, hl_src)?;
+        self.injection_queries
+            .insert(name.to_string(), InjectionQuery { language, hl_query });
         Ok(())
     }
 
@@ -603,7 +650,7 @@ impl Server {
             self.full_parses += 1;
             ParseMode::Full
         };
-        let inline_tree = self.parse_inline_tree(lang, &tree, &text)?;
+        let (injections, injected_ranges) = self.parse_injections(lang, &tree, &text)?;
         self.reserve_cache_capacity(buf, text.len());
         let line_index = SparseLineIndex::new(&text);
         self.cache.insert(
@@ -612,7 +659,8 @@ impl Server {
                 lang: lang.to_string(),
                 text,
                 tree,
-                inline_tree,
+                injections,
+                injected_ranges,
                 revision,
                 line_index,
             },
@@ -620,35 +668,63 @@ impl Server {
         Ok(mode)
     }
 
-    /// Markdown 专用：收集块树里的 inline 节点区间，用 inline 语法在这些
-    /// included_ranges 上整体解析出第二棵树。其他语言返回 None。
-    fn parse_inline_tree(
+    /// Parse every language injected into `host_tree`, one tree per language.
+    ///
+    /// Returns the trees plus the union of the byte ranges they own, in
+    /// document order, which the highlighter uses to let an injected grammar
+    /// win over the host's own capture for the same text.
+    fn parse_injections(
         &mut self,
         lang: &str,
-        block_tree: &tree_sitter::Tree,
+        host_tree: &tree_sitter::Tree,
         text: &str,
-    ) -> Result<Option<tree_sitter::Tree>> {
-        let Some(inline_language) = self
-            .queries
-            .get(lang)
-            .and_then(|q| q.inline_language.clone())
-        else {
-            return Ok(None);
-        };
-        let mut ranges: Vec<tree_sitter::Range> = Vec::new();
-        collect_named_ranges(block_tree.root_node(), "inline", &mut ranges);
-        if ranges.is_empty() {
-            return Ok(None);
+    ) -> Result<(Vec<InjectedTree>, Vec<ops::Range<usize>>)> {
+        let rules = injection_rules(lang);
+        if rules.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
         }
-        let key = format!("{lang}-inline");
-        let p = self.parser_for(&key, inline_language)?;
-        p.set_included_ranges(&ranges)?;
-        let result = p
-            .parse(text, None)
-            .ok_or_else(|| anyhow!("inline parse failed"));
-        // 无条件恢复默认（整篇）解析区间，避免污染复用的 parser。
-        p.set_included_ranges(&[])?;
-        Ok(Some(result?))
+        let mut found: Vec<(&'static str, tree_sitter::Range)> = Vec::new();
+        collect_injection_ranges(host_tree.root_node(), rules, text, &mut found);
+        if found.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Group by target language while preserving document order: a parser
+        // wants all of one language's ranges in one `set_included_ranges` call,
+        // ascending and non-overlapping.
+        let mut grouped: Vec<(&'static str, Vec<tree_sitter::Range>)> = Vec::new();
+        let mut injected_ranges: Vec<ops::Range<usize>> = Vec::with_capacity(found.len());
+        for (target, range) in found {
+            injected_ranges.push(range.start_byte..range.end_byte);
+            match grouped.iter_mut().find(|(name, _)| *name == target) {
+                Some((_, ranges)) => ranges.push(range),
+                None => grouped.push((target, vec![range])),
+            }
+        }
+
+        let mut injections = Vec::with_capacity(grouped.len());
+        for (target, ranges) in grouped {
+            // An injected grammar that fails to compile its query must not take
+            // the host buffer down with it; drop that language and carry on.
+            if self.ensure_injection_query(target).is_err() {
+                continue;
+            }
+            let language = self.injection_queries[target].language.clone();
+            // Keyed apart from the host parser of the same language: a rust
+            // fence inside markdown must not clobber the parser a rust buffer
+            // is reusing, included ranges and all.
+            let key = format!("injection-{target}");
+            let parser = self.parser_for(&key, language)?;
+            parser.set_included_ranges(&ranges)?;
+            let parsed = parser.parse(text, None);
+            // Restore the default (whole-document) range unconditionally, or the
+            // next user of this pooled parser silently parses a keyhole.
+            parser.set_included_ranges(&[])?;
+            if let Some(tree) = parsed {
+                injections.push(InjectedTree { lang: target, tree });
+            }
+        }
+        Ok((injections, injected_ranges))
     }
 
     /// Apply a line-range splice reported by the editor, then reuse the normal
@@ -1188,6 +1264,7 @@ fn serve() -> Result<()> {
                             "symbol_request_id",
                             "inspect",
                             "scope",
+                            "injections",
                         ],
                     },
                 )?;
@@ -1341,13 +1418,13 @@ fn run_highlight_cached(
     let root = cache.tree.root_node();
     let lang_queries = server.queries.get(&cache.lang).unwrap();
 
-    // 主查询之外，markdown 还有一棵内联树要跑第二遍高亮。
-    let mut passes: Vec<(&tree_sitter::Query, tree_sitter::Node)> =
-        vec![(&lang_queries.hl_query, root)];
-    if let (Some(inline_query), Some(inline_tree)) =
-        (&lang_queries.inline_hl_query, &cache.inline_tree)
-    {
-        passes.push((inline_query, inline_tree.root_node()));
+    // 宿主查询之外，每棵注入树再跑一遍它自己语言的高亮查询。
+    let mut passes: Vec<(&tree_sitter::Query, tree_sitter::Node, bool)> =
+        vec![(&lang_queries.hl_query, root, false)];
+    for injected in &cache.injections {
+        if let Some(query) = server.injection_queries.get(injected.lang) {
+            passes.push((&query.hl_query, injected.tree.root_node(), true));
+        }
     }
 
     let mut spans = Vec::with_capacity(4096);
@@ -1357,7 +1434,7 @@ fn run_highlight_cached(
     // Dedup by an explicit semantic priority. Capture iteration is ordered by
     // source position, but same-range pattern ordering is not an API contract.
     let mut seen = HashMap::<(u32, u32, u32, u32), (usize, u8)>::new();
-    'passes: for (query, pass_root) in passes {
+    'passes: for (query, pass_root, injected) in passes {
         let mut cursor = tree_sitter::QueryCursor::new();
         if let Some((ls, le)) = lrange {
             let b_range = expand_range_for_multiline_token(
@@ -1371,6 +1448,12 @@ fn run_highlight_cached(
             let cap = m.captures[*cap_ix];
             let node = cap.node;
             if node.start_byte() >= node.end_byte() {
+                continue;
+            }
+            // Inside an injected range the injected grammar has the last word:
+            // markdown captures a whole fence as @text.literal, and leaving that
+            // in place would paint one flat colour over the rust underneath it.
+            if !injected && covered_by_injection(&cache.injected_ranges, node) {
                 continue;
             }
             let sp = node.start_position();
@@ -2449,14 +2532,14 @@ fn inspect_cached(
     // show up here exactly when they show up on screen.
     let mut passes: Vec<(&tree_sitter::Query, tree_sitter::Node, Option<&'static str>)> =
         vec![(&lang_queries.hl_query, root, None)];
-    if let (Some(inline_query), Some(inline_tree)) =
-        (&lang_queries.inline_hl_query, &cache.inline_tree)
-    {
-        passes.push((
-            inline_query,
-            inline_tree.root_node(),
-            Some("markdown_inline"),
-        ));
+    for injected in &cache.injections {
+        if let Some(query) = server.injection_queries.get(injected.lang) {
+            passes.push((
+                &query.hl_query,
+                injected.tree.root_node(),
+                Some(injected.lang),
+            ));
+        }
     }
 
     let mut captures: Vec<InspectCapture> = Vec::new();
@@ -2469,6 +2552,11 @@ fn inspect_cached(
             // set_byte_range only bounds which patterns are considered; a match
             // may still report a capture that does not cover the point.
             if node.start_byte() > offset || node.end_byte() <= offset {
+                continue;
+            }
+            // The renderer drops these, so the report must too, or :TsHlInspect
+            // would name a group the screen does not show.
+            if injected_lang.is_none() && covered_by_injection(&cache.injected_ranges, node) {
                 continue;
             }
             let sp = node.start_position();
@@ -3093,14 +3181,148 @@ fn node_text(node: tree_sitter::Node, bytes: &[u8]) -> String {
 }
 
 /// 收集树中指定 kind 的全部节点区间（不递归进匹配到的节点内部）。
-fn collect_named_ranges(node: tree_sitter::Node, kind: &str, out: &mut Vec<tree_sitter::Range>) {
-    if node.kind() == kind {
-        out.push(node.range());
+/// True when an injected grammar owns every byte of `node`.
+///
+/// The ranges are in document order, so a binary search finds the only
+/// candidate; a highlight pass calls this once per host capture.
+fn covered_by_injection(ranges: &[ops::Range<usize>], node: tree_sitter::Node) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    let start = node.start_byte();
+    let index = match ranges.binary_search_by_key(&start, |range| range.start) {
+        Ok(index) => index,
+        Err(0) => return false,
+        Err(index) => index - 1,
+    };
+    ranges[index].start <= start && node.end_byte() <= ranges[index].end
+}
+
+/// Which grammar an injection rule hands its content to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionTarget {
+    /// Always this grammar, whatever the content says.
+    Fixed(&'static str),
+    /// Read it off the fence's info string, e.g. ```` ```rust ````. Unknown or
+    /// absent languages are skipped, which is why an unlabelled fence keeps the
+    /// host's own `@text.literal`.
+    InfoString,
+}
+
+/// One "this node's content is another language" rule.
+struct InjectionRule {
+    /// Node kind that introduces the injection.
+    host: &'static str,
+    /// Named descendant holding the injected text; `None` injects the host node
+    /// itself, which is what markdown's `inline` needs.
+    content: Option<&'static str>,
+    target: InjectionTarget,
+}
+
+/// Injection rules for a host language.
+///
+/// Depth is capped at one by construction: `collect_injection_ranges` does not
+/// descend into a node it has already matched, so a fence inside a fence is
+/// left to the outer grammar and the cost of a sync stays linear.
+fn injection_rules(lang: &str) -> &'static [InjectionRule] {
+    match lang {
+        "markdown" => &[
+            // The block grammar leaves every span of prose as one opaque
+            // `inline` node; without this, emphasis and links are invisible.
+            InjectionRule {
+                host: "inline",
+                content: None,
+                target: InjectionTarget::Fixed("markdown_inline"),
+            },
+            InjectionRule {
+                host: "fenced_code_block",
+                content: Some("code_fence_content"),
+                target: InjectionTarget::InfoString,
+            },
+        ],
+        "html" => &[
+            InjectionRule {
+                host: "script_element",
+                content: Some("raw_text"),
+                target: InjectionTarget::Fixed("javascript"),
+            },
+            InjectionRule {
+                host: "style_element",
+                content: Some("raw_text"),
+                target: InjectionTarget::Fixed("css"),
+            },
+        ],
+        _ => &[],
+    }
+}
+
+/// Map a fence info string to a bundled grammar, or `None`.
+///
+/// The aliases are the ones people actually write in fences; anything not
+/// resolving to a linked grammar is skipped rather than guessed at.
+fn injection_language_for_tag(tag: &str) -> Option<&'static str> {
+    let normalized = tag.trim().to_ascii_lowercase();
+    let name = match normalized.as_str() {
+        "rs" => "rust",
+        "js" | "jsx" | "mjs" | "cjs" | "node" => "javascript",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "py" | "python3" => "python",
+        "sh" | "shell" | "zsh" | "console" => "bash",
+        "golang" => "go",
+        "c++" | "cxx" | "hpp" => "cpp",
+        "h" => "c",
+        "yml" => "yaml",
+        "vim9" | "viml" => "vim",
+        "md" => "markdown",
+        other => other,
+    };
+    SUPPORTED_LANGUAGES
+        .iter()
+        .copied()
+        .find(|supported| *supported == name)
+}
+
+/// Read the language tag out of a `fenced_code_block`'s info string.
+fn fence_info_language(node: tree_sitter::Node, text: &str) -> Option<&'static str> {
+    let info = descendant_by_kind(node, "info_string")?;
+    // tree-sitter-md wraps the tag in a `language` node; older trees leave the
+    // whole info string bare, so fall back to its first word.
+    let tag = descendant_by_kind(info, "language").unwrap_or(info);
+    let raw = text.get(tag.start_byte()..tag.end_byte())?;
+    injection_language_for_tag(raw.split_whitespace().next().unwrap_or(""))
+}
+
+fn collect_injection_ranges(
+    node: tree_sitter::Node,
+    rules: &'static [InjectionRule],
+    text: &str,
+    out: &mut Vec<(&'static str, tree_sitter::Range)>,
+) {
+    if out.len() >= MAX_INJECTED_RANGES {
+        return;
+    }
+    if let Some(rule) = rules.iter().find(|rule| rule.host == node.kind()) {
+        let target = match rule.target {
+            InjectionTarget::Fixed(name) => Some(name),
+            InjectionTarget::InfoString => fence_info_language(node, text),
+        };
+        let content = match rule.content {
+            Some(kind) => descendant_by_kind(node, kind),
+            None => Some(node),
+        };
+        if let (Some(target), Some(content)) = (target, content)
+            && content.end_byte() > content.start_byte()
+        {
+            out.push((target, content.range()));
+        }
+        // Matched or not, this subtree belongs to the host rule: not descending
+        // is what caps injection depth at one.
         return;
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_named_ranges(child, kind, out);
+        collect_injection_ranges(child, rules, text, out);
     }
 }
 
@@ -3557,29 +3779,33 @@ mod tests {
                     "{lang} symbol query pattern {pattern} has an unhandled general predicate"
                 );
             }
-            if let Some(inline_query) = &queries.inline_hl_query {
-                for capture in inline_query.capture_names() {
-                    assert!(
-                        !map_capture_to_group(capture).is_empty(),
-                        "{lang} has unmapped inline highlight capture @{capture}"
-                    );
-                }
-                for pattern in 0..inline_query.pattern_count() {
-                    assert!(
-                        inline_query.general_predicates(pattern).is_empty(),
-                        "{lang} inline query pattern {pattern} has an unhandled general predicate"
-                    );
-                }
-            }
         }
         assert_eq!(server.queries.len(), SUPPORTED_LANGUAGES.len());
-        assert!(
-            server
-                .queries
-                .get("markdown")
-                .is_some_and(|q| q.inline_hl_query.is_some()),
-            "markdown must compile an inline highlight query"
-        );
+
+        // ensure_queries() compiles every fixed injection target too, so a
+        // broken injected query fails --self-test rather than silently leaving
+        // one construct uncoloured.
+        for (name, injection) in &server.injection_queries {
+            for capture in injection.hl_query.capture_names() {
+                assert!(
+                    !map_capture_to_group(capture).is_empty(),
+                    "injection {name} has unmapped highlight capture @{capture}"
+                );
+            }
+            for pattern in 0..injection.hl_query.pattern_count() {
+                assert!(
+                    injection.hl_query.general_predicates(pattern).is_empty(),
+                    "injection {name} pattern {pattern} has an unhandled general predicate"
+                );
+            }
+        }
+        for required in ["markdown_inline", "javascript", "css"] {
+            assert!(
+                server.injection_queries.contains_key(required),
+                "no compiled injection query for {required}: {:?}",
+                server.injection_queries.keys().collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
@@ -3592,9 +3818,21 @@ mod tests {
         server
             .set_text(9, "markdown", source.to_string(), 1)
             .expect("markdown parse");
+        let injected: Vec<&str> = server
+            .cache
+            .get(&9)
+            .unwrap()
+            .injections
+            .iter()
+            .map(|injection| injection.lang)
+            .collect();
         assert!(
-            server.cache.get(&9).unwrap().inline_tree.is_some(),
-            "inline tree must be built for markdown"
+            injected.contains(&"markdown_inline"),
+            "inline tree must be built for markdown: {injected:?}"
+        );
+        assert!(
+            injected.contains(&"rust"),
+            "a ```rust fence must inject the rust grammar: {injected:?}"
         );
 
         let (_, spans) =
@@ -3604,7 +3842,7 @@ mod tests {
             "TSTitle",    // headings (block)
             "TSEmphasis", // *emphasis* (inline)
             "TSStrong",   // **strong** (inline)
-            "TSLiteral",  // `code span` + fenced content
+            "TSLiteral",  // `code span` (the fence content is injected instead)
             "TSLink",     // [a link]
             "TSURI",      // (https://example.com)
             "TSType",     // fence info string "rust"
@@ -3630,6 +3868,147 @@ mod tests {
         let (_, spans) =
             run_highlight_cached(&mut server, 9, "markdown", None, false, None).unwrap();
         assert!(spans.iter().any(|s| s.group == "TSTitle"));
+    }
+
+    /// A fenced block is the first thing anyone notices about markdown
+    /// highlighting, and getting it half right is worse than not doing it: the
+    /// host query paints the whole fence `@text.literal`, so if that span
+    /// survived the injection the user would see one flat colour with tokens
+    /// fighting underneath it.
+    #[test]
+    fn a_labelled_fence_is_parsed_by_its_own_grammar_in_host_coordinates() {
+        let mut server = Server::new();
+        let source = "Prose with a héllo before it.\n\n```rust\nfn main() { let x = 1; }\n```\n\n\
+                      ```\nplain fence, no language\n```\n";
+        server
+            .set_text(11, "markdown", source.to_string(), 1)
+            .unwrap();
+
+        let (_, spans) =
+            run_highlight_cached(&mut server, 11, "markdown", None, false, None).unwrap();
+
+        // `fn` is on line 4, column 1 of the *host* document: set_included_ranges
+        // keeps injected positions in the host's coordinate space, and the
+        // multi-byte character above must not shift them.
+        let keyword = spans
+            .iter()
+            .find(|span| span.group == "TSKeyword" && span.lnum == 4)
+            .unwrap_or_else(|| panic!("rust fence produced no keyword: {spans:?}"));
+        assert_eq!((keyword.col, keyword.end_col), (1, 3));
+
+        // The host's flat literal over the injected fence is gone...
+        assert!(
+            !spans
+                .iter()
+                .any(|span| span.group == "TSLiteral" && span.lnum == 4),
+            "the host @text.literal survived on top of the injected fence: {spans:?}"
+        );
+        // ...but an unlabelled fence keeps it, because nothing replaced it.
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.group == "TSLiteral" && span.lnum == 8),
+            "an unlabelled fence lost its literal highlighting: {spans:?}"
+        );
+
+        // :TsHlInspect has to agree with the screen, or it answers "why is this
+        // token this colour" with a colour that is not drawn.
+        let (_, captures, _) = inspect_cached(&mut server, 11, "markdown", 4, 1).unwrap();
+        assert!(
+            captures.iter().any(
+                |capture| capture.group == "TSKeyword" && capture.injected_lang == Some("rust")
+            ),
+            "inspect did not attribute the capture to the injected grammar: {captures:?}"
+        );
+        assert!(
+            captures.iter().all(|capture| capture.group != "TSLiteral"),
+            "inspect reported a host capture the renderer drops: {captures:?}"
+        );
+    }
+
+    #[test]
+    fn html_injects_javascript_and_css() {
+        let mut server = Server::new();
+        let source = "<html>\n<style>\nbody { color: red; }\n</style>\n\
+                      <script>\nfunction go() { return 1; }\n</script>\n</html>\n";
+        server.set_text(12, "html", source.to_string(), 1).unwrap();
+        let injected: Vec<&str> = server
+            .cache
+            .get(&12)
+            .unwrap()
+            .injections
+            .iter()
+            .map(|injection| injection.lang)
+            .collect();
+        assert!(injected.contains(&"css"), "{injected:?}");
+        assert!(injected.contains(&"javascript"), "{injected:?}");
+
+        let (_, spans) = run_highlight_cached(&mut server, 12, "html", None, false, None).unwrap();
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.lnum == 6 && span.group == "TSKeyword"),
+            "<script> body was not highlighted as javascript: {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|span| span.lnum == 3),
+            "<style> body produced no highlighting at all: {spans:?}"
+        );
+    }
+
+    /// Unknown fence tags are skipped rather than guessed at, and a fence inside
+    /// a fence must not start a second level of injection.
+    #[test]
+    fn injections_skip_unknown_languages_and_do_not_nest() {
+        assert_eq!(injection_language_for_tag("rs"), Some("rust"));
+        assert_eq!(injection_language_for_tag("  Python3 "), Some("python"));
+        assert_eq!(injection_language_for_tag("brainfuck"), None);
+        assert_eq!(injection_language_for_tag(""), None);
+
+        let mut server = Server::new();
+        let source = "````markdown\n```rust\nfn inner() {}\n```\n````\n";
+        server
+            .set_text(13, "markdown", source.to_string(), 1)
+            .unwrap();
+        let injected: Vec<&str> = server
+            .cache
+            .get(&13)
+            .unwrap()
+            .injections
+            .iter()
+            .map(|injection| injection.lang)
+            .collect();
+        assert!(
+            injected.contains(&"markdown"),
+            "the outer fence did not inject markdown: {injected:?}"
+        );
+        assert!(
+            !injected.contains(&"rust"),
+            "an injected fence started a second level of injection: {injected:?}"
+        );
+    }
+
+    #[test]
+    fn covered_by_injection_only_swallows_fully_contained_spans() {
+        let mut server = Server::new();
+        server
+            .set_text(14, "markdown", "```rust\nfn f() {}\n```\n".to_string(), 1)
+            .unwrap();
+        let cache = server.cache.get(&14).unwrap();
+        let ranges = &cache.injected_ranges;
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+
+        let block = cache
+            .tree
+            .root_node()
+            .child(0)
+            .expect("a fenced code block");
+        assert!(
+            !covered_by_injection(ranges, block),
+            "the fence itself must survive: its delimiters are not injected"
+        );
+        let content = descendant_by_kind(block, "code_fence_content").expect("fence content");
+        assert!(covered_by_injection(ranges, content));
     }
 
     #[test]

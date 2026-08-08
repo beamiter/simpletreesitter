@@ -2,6 +2,26 @@
 
 ## Unreleased - 2026-08-08
 
+### 新增：通用语言注入，markdown 围栏与 HTML `<script>`/`<style>` 都按本语言高亮
+
+- 原先只有一条写死的 markdown-inline 分支：`BufCache.inline_tree` 一棵树、
+  `LangQueries.inline_*` 一对字段、`parse_inline_tree()` 里一个 `lang == "markdown"`
+  判断。于是围栏代码块整段是扁平的 `@text.literal`，HTML 的 `<script>`/`<style>`
+  干脆什么颜色都没有——两者都是打开文件第一眼就会看到的东西。
+- 改为一张规则表 `injection_rules(lang)`：宿主节点种类 + 取内容的子节点 + 目标语言
+  （固定，或从围栏 info string 读取并按别名表映射到已链接的语法）。`BufCache` 换成
+  `injections: Vec<InjectedTree>`，每种被注入的语言只解析一次（一次
+  `set_included_ranges` 吃下它的全部区间），四十个 rust 围栏也只是一次 rust 解析。
+- 注入区间内宿主自己的 capture 会被丢弃。不这么做的话，markdown 那条
+  `(code_fence_content) @text.literal` 会把整段围栏刷成一个颜色，注入出来的 token
+  只能在底下打架。无标记或语言未知的围栏则原样保留 —— 没有东西来替换它。
+- `:TsHlInspect` 用同一条规则过滤，并给每个 capture 标注来自哪个被注入的语法，
+  因此它报出来的颜色永远是屏幕上真的画出来的那个。
+- 注入深度固定为 1：匹配到宿主节点就不再往下走，围栏里的围栏归外层语法管。
+- `ensure_queries()` 现在会把固定注入目标的查询一并编译，所以一个写坏的注入查询在
+  `--self-test`（安装时）就失败，而不是等到某个用户恰好打开一个带 `<script>` 的文件
+  才发现那一段没有颜色。
+
 ### 新增：Tree-sitter 文本对象与增量选择（protocol v6）
 
 - daemon 新增 `scope` 请求：对一个点回一条由内向外的具名祖先链，每项带 outer 与
