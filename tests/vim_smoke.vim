@@ -709,6 +709,47 @@ endif
 redraw
 call assert_false(exists('g:pwned'),
       \ 'breadcrumb evaluated a %{} payload taken from a symbol name')
+
+" A breadcrumb describes one window's cursor. Every window's 'winbar' holds the
+" same fixed %{simpletreesitter#Breadcrumb()} expression, so caching the text in
+" a single script-global made each window render whichever window was updated
+" last: with a file split, leaving the cursor in the top symbol and moving into
+" the bottom one relabelled the top window too.
+" The headings are named after the injected symbols so that a debounced symbols
+" reply landing mid-block cannot change what the assertions expect.
+call setline(1, ['# top_symbol', 'top body', '# bottom_symbol', 'bottom body'])
+call s:CallPrivate('SetBreadcrumbItems', [s:bc, [
+      \ {'name': 'top_symbol', 'kind': 'namespace', 'lnum': 1, 'col': 1,
+      \  'end_lnum': 2, 'end_col': 1},
+      \ {'name': 'bottom_symbol', 'kind': 'namespace', 'lnum': 3, 'col': 1,
+      \  'end_lnum': 4, 'end_col': 1}]])
+split
+let s:bc_top_win = win_getid()
+call cursor(1, 1)
+call s:CallPrivate('UpdateBreadcrumb', [])
+call assert_match('top_symbol', simpletreesitter#Breadcrumb(),
+      \ 'breadcrumb did not pick up the top window symbol')
+wincmd w
+let s:bc_bottom_win = win_getid()
+call assert_notequal(s:bc_top_win, s:bc_bottom_win, 'split did not create a second window')
+call cursor(3, 1)
+call s:CallPrivate('UpdateBreadcrumb', [])
+call assert_match('bottom_symbol', simpletreesitter#Breadcrumb(),
+      \ 'breadcrumb did not pick up the second window symbol')
+call win_gotoid(s:bc_top_win)
+call assert_match('top_symbol', simpletreesitter#Breadcrumb(),
+      \ 'a window advertised another window''s breadcrumb')
+call assert_notmatch('bottom_symbol', simpletreesitter#Breadcrumb(),
+      \ 'a window advertised another window''s breadcrumb')
+" Closing a window must not leave its breadcrumb behind for a recycled window id.
+call win_gotoid(s:bc_bottom_win)
+close
+call assert_false(has_key(s:State().s_breadcrumb_cache, string(s:bc_bottom_win)),
+      \ 'breadcrumb cache kept an entry for a closed window')
+call assert_match('top_symbol', simpletreesitter#Breadcrumb(),
+      \ 'closing a window discarded the surviving window breadcrumb')
+only
+
 let g:simpletreesitter_breadcrumb = 0
 call simpletreesitter#Disable()
 

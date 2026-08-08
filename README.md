@@ -181,6 +181,7 @@ g:simpletreesitter_breadcrumb_separator = ' > '
 " set statusline+=%{simpletreesitter#Breadcrumb()}
 " 'winbar' 也只放这一个固定表达式，符号名永远按字面渲染：
 " 两个选项都按 'statusline' 格式解析，名字里的 %{...} 否则会在每次重绘时求值。
+" 面包屑按窗口缓存：同一文件的两个窗口各自显示自己光标所在的符号。
 
 " 打开 Outline 时可选暂停高亮
 g:simpletreesitter_suspend_highlight_on_outline = 0

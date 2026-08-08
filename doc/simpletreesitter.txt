@@ -213,6 +213,11 @@ Both options are parsed as |'statusline'| formats, so a symbol name containing
 '%' or '%{...}' would otherwise be interpreted -- and evaluated -- on every
 redraw. Symbol names are always rendered as literal text.
 
+The breadcrumb belongs to the window whose cursor produced it.  Vim evaluates a
+%{} item with the window being drawn temporarily current (see |stl-%{|), so two
+windows showing the same file each report their own enclosing symbol, and a
+window keeps its own breadcrumb while you work in another one.
+
 Disable one buffer with: >
 
   let b:simpletreesitter_disable = 1

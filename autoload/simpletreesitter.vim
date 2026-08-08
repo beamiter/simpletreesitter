@@ -140,7 +140,14 @@ const s_language_by_filetype = {
 var s_bc_items: list<dict<any>> = []
 var s_bc_buf: number = 0
 var s_bc_timer: number = 0
-var s_breadcrumb_cache: string = ''
+# winid (as a string key) -> the breadcrumb that window's own cursor produced.
+# Every window's 'winbar' holds the same fixed %{simpletreesitter#Breadcrumb()}
+# expression, so a single script-global string made all of them render whichever
+# window was updated last: split a file, leave the cursor in `foo` above and move
+# into `bar` below, and the top window started advertising `bar`.  Vim evaluates
+# %{} with the drawn window temporarily current (see |stl-%{|), so keying on
+# win_getid() gives each window back its own text.
+var s_breadcrumb_cache: dict<string> = {}
 # =============== Outline 跟随状态 ===============
 var s_outline_cursor_line: number = 0
 # =============== Outline 折叠状态 ===============
@@ -2003,6 +2010,24 @@ def SetWinbar(text: string)
   endtry
 enddef
 
+# SetWinbar() only ever touches the current window, but the expression has been
+# installed in every window a breadcrumb was ever computed in — and an installed
+# expression that evaluates to nothing still costs each of those windows a screen
+# line.  Disabling the plugin must therefore sweep them all, across tabpages.
+def ClearAllWinbars()
+  if !exists('+winbar')
+    return
+  endif
+  for info in getwininfo()
+    if getwinvar(info.winid, '&winbar', '') ==# s_winbar_expr
+      try
+        setwinvar(info.winid, '&winbar', '')
+      catch
+      endtry
+    endif
+  endfor
+enddef
+
 # The single entry point for symbol payloads reaching the breadcrumb, so the
 # untrusted-name path has one place to test and one place to guard.
 def SetBreadcrumbItems(buf: number, syms: list<dict<any>>)
@@ -2018,9 +2043,12 @@ def UpdateBreadcrumb()
     return
   endif
   var buf = bufnr('%')
+  # The breadcrumb describes *this* window's cursor, so it is cached against
+  # this window and never against the plugin as a whole.
+  var wkey = string(win_getid())
   if buf != s_bc_buf || empty(s_bc_items)
-    if s_breadcrumb_cache !=# ''
-      s_breadcrumb_cache = ''
+    if get(s_breadcrumb_cache, wkey, '') !=# ''
+      remove(s_breadcrumb_cache, wkey)
       SetWinbar('')
     endif
     return
@@ -2053,10 +2081,14 @@ def UpdateBreadcrumb()
     parts->add(icon .. ' ' .. item.name)
   endfor
   var text = join(parts, sep)
-  if text ==# s_breadcrumb_cache
+  if text ==# get(s_breadcrumb_cache, wkey, '')
     return
   endif
-  s_breadcrumb_cache = text
+  if text ==# ''
+    remove(s_breadcrumb_cache, wkey)
+  else
+    s_breadcrumb_cache[wkey] = text
+  endif
   SetWinbar(text)
 enddef
 
@@ -2260,12 +2292,12 @@ export def Disable()
   DisableIndentGuides()
   # 清理面包屑
   s_bc_items = []
-  s_breadcrumb_cache = ''
+  s_breadcrumb_cache = {}
   if s_bc_timer != 0
     try | timer_stop(s_bc_timer) | catch | endtry
     s_bc_timer = 0
   endif
-  SetWinbar('')
+  ClearAllWinbars()
   echo '[ts-hl] disabled'
 enddef
 
@@ -2292,8 +2324,12 @@ export def Status()
 enddef
 
 # 可用于 Vim 的 statusline：%{simpletreesitter#Breadcrumb()}
+# Returns the breadcrumb of the window this is evaluated for: Vim makes the
+# window whose 'statusline'/'winbar' is being drawn temporarily current while it
+# evaluates a %{} item (|stl-%{|), so win_getid() names the right window both
+# during a redraw and when called directly.
 export def Breadcrumb(): string
-  return s_breadcrumb_cache
+  return get(s_breadcrumb_cache, string(win_getid()), '')
 enddef
 
 def ShowOutlineMessage(message: string)
@@ -3624,6 +3660,13 @@ export def OnWinClosed(wid_str: string)
   endtry
   if wid == 0
     return
+  endif
+  # The breadcrumb cache is keyed by window id; drop the entry with the window so
+  # a long session does not accumulate one string per window ever opened, and so
+  # a recycled id cannot inherit a dead window's breadcrumb.
+  var wkey = string(wid)
+  if has_key(s_breadcrumb_cache, wkey)
+    remove(s_breadcrumb_cache, wkey)
   endif
   SyncOutlineContext()
   if wid == s_outline_win
