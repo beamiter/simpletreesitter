@@ -2,6 +2,17 @@
 
 ## Unreleased - 2026-08-08
 
+### 修复：`make check` 自己构建它要测的 daemon
+
+- `tests/vim_smoke.vim` 把 daemon 固定在 `target/debug/ts-hl-daemon`，而 `check`
+  里没有任何一个 target 会产出这个二进制：`cargo test` 只构建 bin 的单元测试，不构建
+  bin 本身（本 crate 没有会选中 bin target 的集成测试或 bench）。`lib/` 和 `target/`
+  都在 .gitignore 里，所以在干净检出上 `FindExe()` 什么也找不到，冒烟测试的行为断言
+  全线失败；而在开发者机器上它会静默回退到 `lib/` 或 `target/release/` 里那份陈旧的
+  二进制——用上个月的 daemon 测这个月的 Vim 代码。现在 `vim-test` 依赖新的 `daemon`
+  target（`cargo build --locked`），`make check` 在干净树上自洽。
+- 冒烟测试同时断言这个二进制存在，把"静默跑了别的 daemon"变成一句明确的失败。
+
 ### 修复：发送失败不再永久冻结一个 buffer；可自愈的错误不再打断输入
 
 - `core#Send()` 在 job 仍存活但 `ch_sendraw` 抛出时返回 false（管道满、daemon

@@ -6,6 +6,14 @@ call delete('/tmp/simpletreesitter-vim-errors.log')
 let s:root = getcwd()
 execute 'set runtimepath^=' . fnameescape(s:root)
 let g:simpletreesitter_daemon_path = s:root . '/target/debug/ts-hl-daemon'
+" Pinning the path is not enough: simpletreesitter#core#FindExe() falls back to
+" lib/, target/release/ and then $PATH when the pinned binary is missing.  On a
+" clean checkout that produced dozens of unrelated assertion failures, and on a
+" developer tree it silently exercised whatever stale daemon was still lying
+" around in lib/.  `make vim-test` builds this binary first; say so plainly when
+" the suite is run without it.
+call assert_true(filereadable(g:simpletreesitter_daemon_path),
+      \ 'target/debug/ts-hl-daemon is missing -- run `make vim-test`, not vim directly')
 let g:simpletreesitter_debounce = 10
 let g:simpletreesitter_scroll_debounce = 10
 let g:simpletreesitter_outline_fancy = 0

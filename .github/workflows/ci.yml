@@ -48,7 +48,9 @@ jobs:
   # `make check` is the gate, here and on a developer's machine.  Listing
   # individual targets here instead lets the two drift, and it did: core-verify,
   # which fails the build when a vendored simplecore file is edited in place,
-  # never ran in CI at all.
+  # never ran in CI at all.  For that to be safe `check` has to be self-contained
+  # on a bare checkout, so `vim-test` builds the daemon it drives rather than
+  # relying on a binary an earlier step -- or an earlier decade -- left behind.
   quality:
     runs-on: ubuntu-latest
     timeout-minutes: 20

@@ -1,4 +1,4 @@
-.PHONY: check fmt clippy test vim-test vim-core defcompile core-verify
+.PHONY: check fmt clippy test daemon vim-test vim-core defcompile core-verify
 
 check: core-verify fmt clippy test defcompile vim-core vim-test
 
@@ -11,7 +11,18 @@ clippy:
 test:
 	cargo test --locked
 
-vim-test:
+# tests/vim_smoke.vim drives the *real* daemon, pinned to target/debug/ts-hl-daemon.
+# Nothing else in `check` produces that binary: `cargo test` builds the bin's unit
+# tests, not the bin itself, because this crate has no integration test or bench
+# that would select the bin target.  Both lib/ and target/ are gitignored, so on a
+# clean checkout FindExe() found nothing and every behavioural assertion failed --
+# and on a developer's tree it silently fell back to whatever stale daemon was
+# lying around in lib/ or target/release/, so the suite tested last month's binary
+# against this month's Vim code.  `check` must build what it tests.
+daemon:
+	cargo build --locked
+
+vim-test: daemon
 	vim -Nu NONE -n -i NONE -es -S tests/vim_smoke.vim
 
 # ---------------------------------------------------------------------------
