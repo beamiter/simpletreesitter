@@ -796,6 +796,136 @@ only
 let g:simpletreesitter_breadcrumb = 0
 call simpletreesitter#Disable()
 
+" =============== Text objects and incremental selection ===============
+" [lnum, col] ordering; Vim's < on lists is an error, not a comparison.
+function! s:PosLE(left, right) abort
+  return a:left[0] < a:right[0] || (a:left[0] == a:right[0] && a:left[1] <= a:right[1])
+endfunction
+
+" plugin/ repeats the spec list so that installing the mappings does not source
+" the autoload script at startup; the two must not drift apart, or a <Plug> map
+" advertised in the docs would simply not exist.
+for s:spec in simpletreesitter#TEXTOBJECT_SPECS
+  let s:plug = '<Plug>(simpletreesitter-textobj-' . substitute(s:spec, '\.', '-', '') . ')'
+  call assert_match('TextObject', maparg(s:plug, 'o'),
+        \ 'no operator-pending <Plug> mapping for ' . s:spec)
+  call assert_match('TextObject', maparg(s:plug, 'x'),
+        \ 'no visual <Plug> mapping for ' . s:spec)
+endfor
+for s:lhs in ['af', 'if', 'ac', 'ic', 'aa', 'ia']
+  call assert_match('simpletreesitter-textobj', maparg(s:lhs, 'o'),
+        \ s:lhs . ' is not installed as an operator-pending text object')
+endfor
+" Incremental selection must not take <CR>/<BS> without being asked to.
+call assert_equal('', maparg('<CR>', 'x'), 'selection maps were installed by default')
+call assert_notequal('', maparg('<Plug>(simpletreesitter-select-expand)', 'x'))
+
+enew
+call setline(1, ['fn outer(first: i32, second: i32) -> i32 {',
+      \ '    let total = first + second;', '    total', '}'])
+setfiletype rust
+let s:to = bufnr()
+call simpletreesitter#Enable()
+sleep 300m
+
+" The prefetch is what makes an operator-pending text object answerable without
+" a round trip: the cursor settles, OnScroll schedules the scope request, and by
+" the time the operator arrives the chain is cached against this revision.
+call cursor(2, 9)
+call simpletreesitter#OnScroll(s:to)
+sleep 300m
+let s:scope = get(s:State().s_scope_cache, s:to, {})
+call assert_false(empty(s:scope), 'cursor idle did not prefetch a scope chain')
+call assert_equal(getbufinfo(s:to)[0].changedtick, s:scope.revision,
+      \ 'prefetched scope chain is not keyed by the live changedtick')
+call assert_true(len(s:scope.chain) >= 3, 'scope chain is implausibly short')
+
+call cursor(2, 9)
+call simpletreesitter#TextObject('function.outer')
+execute "normal! \<Esc>"
+call assert_equal([1, 1], getpos("'<")[1:2], 'af did not start at the function')
+call assert_equal([4, 1], getpos("'>")[1:2], 'af did not end at the closing brace')
+
+" The inner half is the body with its braces and the whitespace they left
+" behind removed -- not the block node, which would take the braces too.
+call cursor(2, 9)
+call simpletreesitter#TextObject('function.inner')
+execute "normal! \<Esc>"
+call assert_equal([2, 5], getpos("'<")[1:2], 'if kept the brace or its newline')
+call assert_equal([3, 9], getpos("'>")[1:2], 'if did not stop at the last statement')
+
+" Through the real mapping, with a real operator.
+call cursor(2, 9)
+normal yaf
+call assert_match('^fn outer(', @", 'yaf did not yank the whole function')
+call assert_match('}\n\=$', @", 'yaf stopped before the closing brace')
+
+" A parameter takes its separator with it, so the argument list stays valid.
+call cursor(1, 10)
+call simpletreesitter#OnScroll(s:to)
+sleep 300m
+normal daa
+call assert_equal('fn outer(second: i32) -> i32 {', getline(1),
+      \ 'daa left the separator behind')
+
+" A cold cache must not half-apply an operator: with no chain for this revision
+" the mapping selects nothing and the buffer is untouched.
+call simpletreesitter#Disable()
+let s:before = getline(1, '$')
+let s:cold_tick = getbufinfo(s:to)[0].changedtick
+call cursor(2, 9)
+normal daf
+call assert_equal(s:before, getline(1, '$'), 'a cold scope cache still edited the buffer')
+call assert_equal(s:cold_tick, getbufinfo(s:to)[0].changedtick,
+      \ 'a cold scope cache changed the buffer')
+
+call simpletreesitter#Enable()
+sleep 300m
+call cursor(2, 9)
+call simpletreesitter#OnScroll(s:to)
+sleep 300m
+
+" One reply serves a whole token: moving inside the anchor must not invalidate
+" the cache, and leaving it must.
+let s:anchor = s:State().s_scope_cache[s:to].anchor
+call assert_true(s:CallPrivate('ScopeCacheValid', [s:to, s:anchor[0], s:anchor[1]]),
+      \ 'the anchor start is not inside the anchor')
+call assert_true(s:CallPrivate('ScopeCacheValid', [s:to, s:anchor[2], s:anchor[3] - 1]),
+      \ 'the last column of the anchor is not inside the anchor')
+call assert_false(s:CallPrivate('ScopeCacheValid', [s:to, s:anchor[2], s:anchor[3]]),
+      \ 'end_col is one past the last byte and must fall outside the anchor')
+
+" A chain describes one revision of the text. Editing must retire it even
+" though the cursor never moved, or a text object would act on stale ranges.
+call setline(2, '    let total = first;')
+call assert_false(s:CallPrivate('ScopeCacheValid', [s:to, 2, 9]),
+      \ 'an edited buffer kept its scope chain')
+
+" Incremental selection walks the same chain outward and back.
+call cursor(2, 9)
+call simpletreesitter#OnScroll(s:to)
+sleep 300m
+call simpletreesitter#SelectInit()
+execute "normal! \<Esc>"
+let s:grow0 = [getpos("'<")[1:2], getpos("'>")[1:2]]
+call simpletreesitter#SelectExpand()
+execute "normal! \<Esc>"
+let s:grow1 = [getpos("'<")[1:2], getpos("'>")[1:2]]
+call assert_notequal(s:grow0, s:grow1, 'expand did not grow the selection')
+call assert_true(s:PosLE(s:grow1[0], s:grow0[0]) && s:PosLE(s:grow0[1], s:grow1[1]),
+      \ 'expand produced a selection that does not contain the previous one')
+call simpletreesitter#SelectShrink()
+execute "normal! \<Esc>"
+call assert_equal(s:grow0, [getpos("'<")[1:2], getpos("'>")[1:2]],
+      \ 'shrink did not return to the previous step')
+
+" :TsHlSelect rejects a spec that has no mapping rather than selecting nothing.
+call assert_equal(2, exists(':TsHlSelect'))
+call assert_equal(['function.inner', 'function.outer'],
+      \ sort(simpletreesitter#SelectComplete('function', '', 0)))
+
+call simpletreesitter#Disable()
+
 if !empty(v:errors)
   call writefile(v:errors, '/tmp/simpletreesitter-vim-errors.log')
   cquit

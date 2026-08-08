@@ -26,7 +26,7 @@ const SUPPORTED_LANGUAGES: &[&str] = &[
     "css",
     "markdown",
 ];
-const PROTOCOL_VERSION: u32 = 5;
+const PROTOCOL_VERSION: u32 = 6;
 
 const MAX_AST_NODES: usize = 50_000;
 const MAX_AST_DEPTH: usize = 512;
@@ -38,6 +38,10 @@ const MAX_HIGHLIGHT_SPANS: usize = 100_000;
 const MAX_SYMBOLS: usize = 100_000;
 const MAX_FOLDS: usize = 50_000;
 const LINE_INDEX_STRIDE: usize = 256;
+/// Ancestors reported for one `scope` request. Deep enough for any real nesting
+/// and shallow enough that a pathological tree cannot make an interactive
+/// keystroke serialise an unbounded payload.
+const MAX_SCOPE_CHAIN: usize = 256;
 
 fn default_true() -> bool {
     true
@@ -124,6 +128,19 @@ enum Request {
         lnum: u32,
         col: u32,
     },
+    /// Report the named-ancestor chain at one point, each entry carrying an
+    /// outer and an inner range. One request serves both text objects (pick the
+    /// innermost entry of the wanted class) and incremental selection (step
+    /// outward through the chain), so growing a selection never needs a second
+    /// round trip.
+    #[serde(rename = "scope")]
+    Scope {
+        buf: i64,
+        lang: String,
+        /// 1-based line and byte column, matching Vim's line()/col().
+        lnum: u32,
+        col: u32,
+    },
     #[serde(rename = "close_buffer")]
     CloseBuffer { buf: i64 },
     #[serde(rename = "status")]
@@ -171,6 +188,22 @@ enum Event {
         col: u32,
         captures: Vec<InspectCapture>,
         node_chain: Vec<InspectNode>,
+    },
+    #[serde(rename = "scope")]
+    Scope {
+        buf: i64,
+        revision: u64,
+        lnum: u32,
+        col: u32,
+        /// Range of the node the point resolved to, anonymous ones included.
+        /// Every point inside it resolves to that same node and therefore to
+        /// this same chain, which lets a client cache one reply for a whole
+        /// token instead of re-asking on every column the cursor crosses.
+        anchor_lnum: u32,
+        anchor_col: u32,
+        anchor_end_lnum: u32,
+        anchor_end_col: u32,
+        chain: Vec<ScopeNode>,
     },
     #[serde(rename = "ok")]
     Ok {
@@ -261,6 +294,32 @@ struct InspectNode {
     /// The field name this node occupies in its parent, when it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     field: Option<String>,
+}
+
+/// One named ancestor of an inspected point, innermost first.
+///
+/// Both ranges are 1-based and use byte columns, like every other position on
+/// this wire; `end_col` is one past the last byte, so an empty range has
+/// `col == end_col` on the same line.
+#[derive(Debug, Serialize, Clone)]
+struct ScopeNode {
+    /// Grammar node kind, e.g. "function_item". Reported so a user can see what
+    /// a text object actually matched without dumping the whole AST.
+    node: &'static str,
+    /// Text-object class this node answers to, absent when the node is only a
+    /// step for incremental selection. A node has at most one class on purpose:
+    /// a closure passed as an argument is a function, not a parameter, and a
+    /// node that claimed both would need two contradictory outer ranges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    lnum: u32,
+    col: u32,
+    end_lnum: u32,
+    end_col: u32,
+    inner_lnum: u32,
+    inner_col: u32,
+    inner_end_lnum: u32,
+    inner_end_col: u32,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -1055,6 +1114,36 @@ fn serve() -> Result<()> {
                     },
                 )?,
             },
+            Request::Scope {
+                buf,
+                lang,
+                lnum,
+                col,
+            } => match scope_chain_cached(&server, buf, &lang, lnum, col) {
+                Ok(answer) => send(
+                    &mut out,
+                    &Event::Scope {
+                        buf,
+                        revision: answer.revision,
+                        lnum,
+                        col,
+                        anchor_lnum: answer.anchor[0],
+                        anchor_col: answer.anchor[1],
+                        anchor_end_lnum: answer.anchor[2],
+                        anchor_end_col: answer.anchor[3],
+                        chain: answer.chain,
+                    },
+                )?,
+                Err(e) => send(
+                    &mut out,
+                    &Event::Error {
+                        message: e.to_string(),
+                        buf: Some(buf),
+                        op: Some("scope"),
+                        request_id: None,
+                    },
+                )?,
+            },
             Request::CloseBuffer { buf } => {
                 server.cache.remove(&buf);
                 send(
@@ -1098,6 +1187,7 @@ fn serve() -> Result<()> {
                             "error_op",
                             "symbol_request_id",
                             "inspect",
+                            "scope",
                         ],
                     },
                 )?;
@@ -1161,6 +1251,34 @@ impl SparseLineIndex {
             offset += relative_newline + 1;
         }
         offset
+    }
+
+    /// Byte offset -> tree-sitter `Point` (0-based row, byte column).
+    ///
+    /// Text objects need points for offsets no node starts at — an inner range
+    /// trimmed in past a brace, a parameter's trailing comma — and this runs on
+    /// a key the user holds down, so a scan from byte 0 is not affordable.
+    /// Binary-searching the checkpoints bounds the scan to one stride of lines
+    /// however far into the file the offset is.
+    fn point_at_byte(&self, text: &str, offset: usize) -> tree_sitter::Point {
+        let offset = offset.min(text.len());
+        let checkpoint_index = match self.checkpoints.binary_search(&offset) {
+            Ok(index) => index,
+            Err(index) => index.saturating_sub(1),
+        };
+        let base = self.checkpoints[checkpoint_index];
+        let mut row = checkpoint_index * LINE_INDEX_STRIDE;
+        let mut line_start = base;
+        for (index, byte) in text.as_bytes()[base..offset].iter().enumerate() {
+            if *byte == b'\n' {
+                row += 1;
+                line_start = base + index + 1;
+            }
+        }
+        tree_sitter::Point {
+            row,
+            column: offset - line_start,
+        }
     }
 }
 
@@ -2399,6 +2517,381 @@ fn inspect_cached(
     Ok((cache.revision, captures, node_chain))
 }
 
+/// Grammar node kind -> text-object class, per language.
+///
+/// A table and not a name heuristic: `block` is a lexical block in Rust and a
+/// mapping entry in other grammars, `class` is a JavaScript class expression
+/// and a C++ storage specifier. A text object that matches the wrong node
+/// silently edits the wrong text, which is far worse than not answering.
+fn scope_table(lang: &str) -> &'static [(&'static str, &'static str)] {
+    match lang {
+        "rust" => &[
+            ("function_item", "function"),
+            ("function_signature_item", "function"),
+            ("closure_expression", "function"),
+            ("struct_item", "class"),
+            ("enum_item", "class"),
+            ("union_item", "class"),
+            ("trait_item", "class"),
+            ("impl_item", "class"),
+            ("mod_item", "class"),
+            ("block", "block"),
+            ("call_expression", "call"),
+            ("macro_invocation", "call"),
+            ("if_expression", "conditional"),
+            ("match_expression", "conditional"),
+            ("for_expression", "loop"),
+            ("while_expression", "loop"),
+            ("loop_expression", "loop"),
+        ],
+        "c" | "cpp" => &[
+            ("function_definition", "function"),
+            ("lambda_expression", "function"),
+            ("struct_specifier", "class"),
+            ("union_specifier", "class"),
+            ("enum_specifier", "class"),
+            ("class_specifier", "class"),
+            ("namespace_definition", "class"),
+            ("compound_statement", "block"),
+            ("call_expression", "call"),
+            ("if_statement", "conditional"),
+            ("switch_statement", "conditional"),
+            ("for_statement", "loop"),
+            ("for_range_loop", "loop"),
+            ("while_statement", "loop"),
+            ("do_statement", "loop"),
+        ],
+        // One table for the whole JavaScript family: the TypeScript-only kinds
+        // simply never appear in a JavaScript tree, so splitting it would only
+        // create two places to forget an entry.
+        "javascript" | "typescript" | "tsx" => &[
+            ("function_declaration", "function"),
+            ("function_expression", "function"),
+            ("generator_function", "function"),
+            ("generator_function_declaration", "function"),
+            ("arrow_function", "function"),
+            ("method_definition", "function"),
+            ("class_declaration", "class"),
+            ("class", "class"),
+            ("abstract_class_declaration", "class"),
+            ("interface_declaration", "class"),
+            ("enum_declaration", "class"),
+            ("type_alias_declaration", "class"),
+            ("internal_module", "class"),
+            ("statement_block", "block"),
+            ("call_expression", "call"),
+            ("new_expression", "call"),
+            ("if_statement", "conditional"),
+            ("switch_statement", "conditional"),
+            ("ternary_expression", "conditional"),
+            ("for_statement", "loop"),
+            ("for_in_statement", "loop"),
+            ("while_statement", "loop"),
+            ("do_statement", "loop"),
+        ],
+        "python" => &[
+            ("function_definition", "function"),
+            ("lambda", "function"),
+            ("class_definition", "class"),
+            ("block", "block"),
+            ("call", "call"),
+            ("if_statement", "conditional"),
+            ("match_statement", "conditional"),
+            ("for_statement", "loop"),
+            ("while_statement", "loop"),
+        ],
+        "go" => &[
+            ("function_declaration", "function"),
+            ("method_declaration", "function"),
+            ("func_literal", "function"),
+            ("type_declaration", "class"),
+            ("type_spec", "class"),
+            ("block", "block"),
+            ("call_expression", "call"),
+            ("if_statement", "conditional"),
+            ("expression_switch_statement", "conditional"),
+            ("type_switch_statement", "conditional"),
+            ("for_statement", "loop"),
+        ],
+        "bash" => &[
+            ("function_definition", "function"),
+            ("compound_statement", "block"),
+            ("command", "call"),
+            ("if_statement", "conditional"),
+            ("case_statement", "conditional"),
+            ("for_statement", "loop"),
+            ("while_statement", "loop"),
+        ],
+        "lua" => &[
+            ("function_declaration", "function"),
+            ("function_definition", "function"),
+            ("block", "block"),
+            ("function_call", "call"),
+            ("if_statement", "conditional"),
+            ("for_statement", "loop"),
+            ("while_statement", "loop"),
+            ("repeat_statement", "loop"),
+        ],
+        "vim" => &[
+            ("def_function", "function"),
+            ("function_definition", "function"),
+            ("if_statement", "conditional"),
+            ("for_statement", "loop"),
+            ("while_statement", "loop"),
+        ],
+        "css" => &[("rule_set", "class"), ("block", "block")],
+        _ => &[],
+    }
+}
+
+/// True for nodes whose named children are individually addressable as
+/// parameters or arguments.
+///
+/// Classifying by the container and not by a per-language list of parameter
+/// node kinds, because a JavaScript parameter is a bare `identifier` — a kind
+/// that means something else in every other position in the tree.
+fn is_parameter_container(kind: &str) -> bool {
+    matches!(
+        kind,
+        "parameters"
+            | "formal_parameters"
+            | "parameter_list"
+            | "lambda_parameters"
+            | "type_parameters"
+            | "type_parameter_list"
+            | "arguments"
+            | "argument_list"
+            | "type_arguments"
+    )
+}
+
+fn scope_kind(lang: &str, node: tree_sitter::Node) -> Option<&'static str> {
+    let kind = node.kind();
+    // Spelled the same in every bundled grammar, so it does not earn a row in
+    // seventeen tables.
+    if matches!(kind, "comment" | "line_comment" | "block_comment") {
+        return Some("comment");
+    }
+    if let Some((_, class)) = scope_table(lang).iter().find(|(k, _)| *k == kind) {
+        return Some(class);
+    }
+    // Reached only when the node has no class of its own, which is what keeps a
+    // closure argument answering to `af` rather than to `aa`.
+    if node.is_named()
+        && let Some(parent) = node.parent()
+        && is_parameter_container(parent.kind())
+    {
+        return Some("parameter");
+    }
+    None
+}
+
+/// Byte range of the "inner" half of a text object: the node's body with its
+/// delimiters and the whitespace they left behind removed.
+///
+/// `consequence` and `arguments` are listed beside `body` because a conditional
+/// and a call keep their interesting child in a differently named field, and
+/// falling back to the node itself is what makes a delimiter-only node such as
+/// a Rust `block` still produce a useful inner range.
+fn inner_byte_range(node: tree_sitter::Node, text: &str) -> (usize, usize) {
+    let target = ["body", "consequence", "arguments"]
+        .into_iter()
+        .find_map(|field| node.child_by_field_name(field))
+        .unwrap_or(node);
+    let mut start = target.start_byte();
+    let mut end = target.end_byte();
+    let count = target.child_count().min(u32::MAX as usize);
+    if count >= 2
+        && let (Some(first), Some(last)) = (target.child(0), target.child(count as u32 - 1))
+        && !first.is_named()
+        && !last.is_named()
+        && matches!(first.kind(), "{" | "(" | "[")
+        && matches!(last.kind(), "}" | ")" | "]")
+    {
+        start = first.end_byte();
+        end = last.start_byte();
+    }
+    // Without this, `dif` on a function body deletes the newline the opening
+    // brace sat on and leaves the closing brace hanging off the signature.
+    let bytes = text.as_bytes();
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    (start, end)
+}
+
+/// Outer range of a parameter or argument: the node plus the separator that
+/// would otherwise be left behind.
+///
+/// `daa` on the middle argument of `f(a, b, c)` has to leave `f(a, c)` and not
+/// `f(a, , c)`; on the last one there is no following comma, so the preceding
+/// one is taken instead.
+fn parameter_outer_byte_range(node: tree_sitter::Node, text: &str) -> (usize, usize) {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let mut sibling = node.next_sibling();
+    while let Some(next) = sibling {
+        if next.is_named() {
+            break;
+        }
+        if next.kind() == "," {
+            // Whitespace is not in the tree, so swallow the run after the comma
+            // by hand or `f(a, b)` loses `a,` and keeps its space.
+            let mut after = next.end_byte();
+            let bytes = text.as_bytes();
+            while after < text.len() && (bytes[after] == b' ' || bytes[after] == b'\t') {
+                after += 1;
+            }
+            return (start, after);
+        }
+        sibling = next.next_sibling();
+    }
+    let mut previous = node.prev_sibling();
+    while let Some(prior) = previous {
+        if prior.is_named() {
+            break;
+        }
+        if prior.kind() == "," {
+            return (prior.start_byte(), end);
+        }
+        previous = prior.prev_sibling();
+    }
+    (start, end)
+}
+
+fn scope_node(node: tree_sitter::Node, cache: &BufCache) -> ScopeNode {
+    let kind = scope_kind(&cache.lang, node);
+    let is_parameter = kind == Some("parameter");
+    // The common case is the node's own range, and the node already knows its
+    // points; only the parameter form has to be located in the text.
+    let (outer_sp, outer_ep) = if is_parameter {
+        let (start, end) = parameter_outer_byte_range(node, &cache.text);
+        (
+            cache.line_index.point_at_byte(&cache.text, start),
+            cache.line_index.point_at_byte(&cache.text, end),
+        )
+    } else {
+        (node.start_position(), node.end_position())
+    };
+    // A parameter has no body to reach into, so its inner half is the node
+    // itself — that is exactly the difference `daa` vs `dia` is asked to make.
+    let (inner_start, inner_end) = if is_parameter {
+        (node.start_byte(), node.end_byte())
+    } else {
+        inner_byte_range(node, &cache.text)
+    };
+    let inner_sp = cache.line_index.point_at_byte(&cache.text, inner_start);
+    let inner_ep = cache.line_index.point_at_byte(&cache.text, inner_end);
+    ScopeNode {
+        node: node.kind(),
+        kind,
+        lnum: outer_sp.row as u32 + 1,
+        col: outer_sp.column as u32 + 1,
+        end_lnum: outer_ep.row as u32 + 1,
+        end_col: outer_ep.column as u32 + 1,
+        inner_lnum: inner_sp.row as u32 + 1,
+        inner_col: inner_sp.column as u32 + 1,
+        inner_end_lnum: inner_ep.row as u32 + 1,
+        inner_end_col: inner_ep.column as u32 + 1,
+    }
+}
+
+/// One `scope` answer.
+struct ScopeAnswer {
+    revision: u64,
+    /// 1-based `[lnum, col, end_lnum, end_col]` of the region in which every
+    /// point resolves to the same node and therefore to this same chain.
+    anchor: [u32; 4],
+    chain: Vec<ScopeNode>,
+}
+
+/// Byte range around `offset` in which `descendant_for_byte_range` keeps
+/// answering `node`.
+///
+/// This is *not* the node's own range: at a column of leading indentation the
+/// resolved node is the whole enclosing block, and a client that cached the
+/// block's range would keep serving that coarse chain after the cursor moved
+/// onto a statement inside it. `descendant_for_byte_range` returns the smallest
+/// node containing the point, so no child of `node` covers `offset` and the
+/// answer holds exactly across the gap between its neighbouring children.
+fn stable_byte_range(node: tree_sitter::Node, offset: usize) -> (usize, usize) {
+    let mut low = node.start_byte();
+    let mut high = node.end_byte();
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.end_byte() <= offset {
+                low = low.max(child.end_byte());
+            } else if child.start_byte() > offset {
+                high = high.min(child.start_byte());
+                break;
+            } else {
+                // A child covering the point should have been the descendant.
+                // Zero-width error/missing nodes can still land here; refuse to
+                // let the client cache anything rather than guess.
+                return (offset, offset);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    (low, high)
+}
+
+fn scope_chain_cached(
+    server: &Server,
+    buf: i64,
+    lang: &str,
+    lnum: u32,
+    col: u32,
+) -> Result<ScopeAnswer> {
+    let cache = server.get_cache(buf, lang)?;
+    let offset = point_byte_offset(cache, lnum, col);
+    let resolved = cache
+        .tree
+        .root_node()
+        .descendant_for_byte_range(offset, offset);
+    let anchor = match resolved {
+        Some(node) => {
+            let (low, high) = stable_byte_range(node, offset);
+            let start = cache.line_index.point_at_byte(&cache.text, low);
+            let end = cache.line_index.point_at_byte(&cache.text, high);
+            [
+                start.row as u32 + 1,
+                start.column as u32 + 1,
+                end.row as u32 + 1,
+                end.column as u32 + 1,
+            ]
+        }
+        // No node at all: an empty range, so a client can only ever treat the
+        // reply as immediately stale rather than caching it forever.
+        None => [lnum, col, lnum, col],
+    };
+    let mut chain: Vec<ScopeNode> = Vec::new();
+    let mut current = resolved;
+    while let Some(node) = current {
+        // Anonymous nodes are punctuation: never a text object, and never a
+        // step a user would recognise while growing a selection.
+        if node.is_named() {
+            chain.push(scope_node(node, cache));
+            if chain.len() >= MAX_SCOPE_CHAIN {
+                break;
+            }
+        }
+        current = node.parent();
+    }
+    Ok(ScopeAnswer {
+        revision: cache.revision,
+        anchor,
+        chain,
+    })
+}
+
 fn dump_ast_cached(server: &mut Server, buf: i64, lang: &str) -> Result<(u64, Vec<String>)> {
     let cache = server.get_cache(buf, lang)?;
     let root = cache.tree.root_node();
@@ -3313,6 +3806,270 @@ mod tests {
         assert!(
             chain.iter().all(|node| node.lnum <= 1),
             "clamped column escaped its line: {chain:?}"
+        );
+    }
+
+    /// `point_at_byte` is the only byte -> position conversion the text objects
+    /// have, and it is the one place a checkpoint off-by-one would put every
+    /// inner range on the wrong line without any other test noticing. Compare
+    /// it against a naive scan at every byte of a text that crosses several
+    /// checkpoint strides and carries multi-byte characters.
+    #[test]
+    fn point_at_byte_agrees_with_a_naive_scan_across_checkpoint_strides() {
+        let mut text = String::new();
+        for line in 0..(LINE_INDEX_STRIDE * 3 + 7) {
+            text.push_str(&format!("line {line} héllo\n"));
+        }
+        text.push_str("no trailing newline");
+        let index = SparseLineIndex::new(&text);
+
+        let mut row = 0_usize;
+        let mut line_start = 0_usize;
+        for offset in 0..=text.len() {
+            let expected = tree_sitter::Point {
+                row,
+                column: offset - line_start,
+            };
+            assert_eq!(
+                index.point_at_byte(&text, offset),
+                expected,
+                "byte {offset} mapped to the wrong point"
+            );
+            if text.as_bytes().get(offset) == Some(&b'\n') {
+                row += 1;
+                line_start = offset + 1;
+            }
+        }
+        // Past the end clamps rather than panicking on the slice.
+        assert_eq!(
+            index.point_at_byte(&text, text.len() + 500),
+            index.point_at_byte(&text, text.len())
+        );
+    }
+
+    #[test]
+    fn scope_chain_separates_outer_and_inner_ranges() {
+        let mut server = Server::new();
+        let source = "fn outer(first: i32, second: i32) -> i32 {\n    \
+                      let total = first + second;\n    total\n}\n";
+        server.set_text(3, "rust", source.to_string(), 12).unwrap();
+
+        // Cursor on `total` inside the body.
+        let answer = scope_chain_cached(&server, 3, "rust", 2, 9).unwrap();
+        let (revision, chain) = (answer.revision, answer.chain);
+        assert_eq!(revision, 12);
+        assert_eq!(
+            chain.last().map(|node| node.node),
+            Some("source_file"),
+            "chain does not reach the root: {chain:?}"
+        );
+        let function = chain
+            .iter()
+            .find(|node| node.kind == Some("function"))
+            .unwrap_or_else(|| panic!("no enclosing function: {chain:?}"));
+        assert_eq!(function.node, "function_item");
+        // Outer spans the whole item; inner is the body with braces and the
+        // whitespace they left behind removed.
+        assert_eq!(
+            (
+                function.lnum,
+                function.col,
+                function.end_lnum,
+                function.end_col
+            ),
+            (1, 1, 4, 2)
+        );
+        assert_eq!(
+            (
+                function.inner_lnum,
+                function.inner_col,
+                function.inner_end_lnum,
+                function.inner_end_col
+            ),
+            (2, 5, 3, 10)
+        );
+
+        // A parameter's outer range swallows the separator that would otherwise
+        // be left behind; the last one takes the comma in front of it instead.
+        let at_second = scope_chain_cached(&server, 3, "rust", 1, 22).unwrap().chain;
+        let second = at_second
+            .iter()
+            .find(|node| node.kind == Some("parameter"))
+            .unwrap_or_else(|| panic!("no parameter at the cursor: {at_second:?}"));
+        assert_eq!(
+            (second.col, second.end_col),
+            (20, 33),
+            "last parameter did not take the preceding comma"
+        );
+        assert_eq!((second.inner_col, second.inner_end_col), (22, 33));
+
+        let at_first = scope_chain_cached(&server, 3, "rust", 1, 10).unwrap().chain;
+        let first = at_first
+            .iter()
+            .find(|node| node.kind == Some("parameter"))
+            .unwrap_or_else(|| panic!("no parameter at the cursor: {at_first:?}"));
+        assert_eq!(
+            (first.col, first.end_col),
+            (10, 22),
+            "parameter outer did not swallow the trailing comma and space"
+        );
+        assert_eq!((first.inner_col, first.inner_end_col), (10, 20));
+    }
+
+    /// A node carries exactly one class, so a closure passed as an argument is
+    /// reachable with `af`/`if` and does not also masquerade as a parameter with
+    /// a contradictory outer range.
+    #[test]
+    fn a_closure_argument_is_classified_as_a_function_not_a_parameter() {
+        let mut server = Server::new();
+        let source = "fn main() {\n    let v = items.map(|x| x + 1);\n}\n";
+        server.set_text(4, "rust", source.to_string(), 1).unwrap();
+        // Column 27 is inside `|x| x + 1`.
+        let chain = scope_chain_cached(&server, 4, "rust", 2, 27).unwrap().chain;
+        let closure = chain
+            .iter()
+            .find(|node| node.node == "closure_expression")
+            .unwrap_or_else(|| panic!("no closure in the chain: {chain:?}"));
+        assert_eq!(closure.kind, Some("function"));
+        assert!(
+            chain
+                .iter()
+                .take_while(|node| node.node != "closure_expression")
+                .all(|node| node.kind != Some("parameter")),
+            "the closure argument was also reported as a parameter: {chain:?}"
+        );
+    }
+
+    /// Incremental selection walks the chain outward, so it must be ordered
+    /// innermost-first and every step must contain the previous one.
+    #[test]
+    fn scope_chain_is_ordered_innermost_first_and_nests() {
+        let mut server = Server::new();
+        let source = "def f(a, b):\n    x = a + b\n    return x\n";
+        server.set_text(5, "python", source.to_string(), 1).unwrap();
+        let chain = scope_chain_cached(&server, 5, "python", 2, 9)
+            .unwrap()
+            .chain;
+        assert!(chain.len() >= 3, "chain is too short: {chain:?}");
+        for pair in chain.windows(2) {
+            let (inner, outer) = (&pair[0], &pair[1]);
+            assert!(
+                (outer.lnum, outer.col) <= (inner.lnum, inner.col)
+                    && (outer.end_lnum, outer.end_col) >= (inner.end_lnum, inner.end_col),
+                "chain step is not nested: {outer:?} does not contain {inner:?}"
+            );
+        }
+
+        // Python has no braces: the inner half of a function is its suite, and
+        // the delimiter-stripping must not eat anything it should not.
+        let function = chain
+            .iter()
+            .find(|node| node.kind == Some("function"))
+            .unwrap_or_else(|| panic!("no enclosing function: {chain:?}"));
+        assert_eq!(
+            (
+                function.inner_lnum,
+                function.inner_col,
+                function.inner_end_lnum,
+                function.inner_end_col
+            ),
+            (2, 5, 3, 13)
+        );
+    }
+
+    /// The client caches one reply for the whole anchor range and asks again
+    /// only when the cursor leaves it, so the anchor has to be exactly the set
+    /// of columns that produce this chain. Were it ever too wide, a text object
+    /// would silently act on a chain belonging to a different token.
+    #[test]
+    fn every_column_inside_the_anchor_reproduces_the_same_chain() {
+        let mut server = Server::new();
+        let source = "fn main() {\n    let answer = compute(1, 2);\n}\n";
+        server.set_text(7, "rust", source.to_string(), 1).unwrap();
+
+        // Every (line, column) of the source, so the leading-indentation case —
+        // where the resolved node is the whole enclosing block and its own
+        // range would be far too wide an anchor — is covered by construction.
+        let lines: Vec<&str> = source.lines().collect();
+        let mut anchors_narrower_than_their_node = 0;
+        for (row, line) in lines.iter().enumerate() {
+            let lnum = row as u32 + 1;
+            for col in 1..=(line.len() as u32 + 1) {
+                let answer = scope_chain_cached(&server, 7, "rust", lnum, col).unwrap();
+                let shape: Vec<&str> = answer.chain.iter().map(|node| node.node).collect();
+                let [alnum, acol, aelnum, aecol] = answer.anchor;
+                if answer.chain.first().is_some_and(|node| {
+                    (node.lnum, node.col) < (alnum, acol)
+                        || (node.end_lnum, node.end_col) > (aelnum, aecol)
+                }) {
+                    anchors_narrower_than_their_node += 1;
+                }
+                // An anchor may end on the phantom line after the final newline.
+                for probe_lnum in alnum..=aelnum.min(lines.len() as u32) {
+                    let width = lines[probe_lnum as usize - 1].len() as u32;
+                    let first = if probe_lnum == alnum { acol } else { 1 };
+                    let last = if probe_lnum == aelnum {
+                        aecol - 1
+                    } else {
+                        width
+                    };
+                    for probe in first..=last.min(width) {
+                        let probed = scope_chain_cached(&server, 7, "rust", probe_lnum, probe)
+                            .unwrap()
+                            .chain;
+                        assert_eq!(
+                            probed.iter().map(|node| node.node).collect::<Vec<_>>(),
+                            shape,
+                            "{probe_lnum}:{probe} is inside the anchor \
+                             [{alnum}:{acol}-{aelnum}:{aecol}] reported for {lnum}:{col} \
+                             but produces a different chain"
+                        );
+                    }
+                }
+            }
+        }
+        // The indentation columns are exactly the case a node-range anchor gets
+        // wrong, so the test is worthless if it never reached one.
+        assert!(
+            anchors_narrower_than_their_node > 0,
+            "no column resolved to a node wider than its anchor, so this test \
+             never exercised the case a node-range anchor would break on"
+        );
+    }
+
+    /// Every bundled language must at least classify a comment, so that `ac`
+    /// on an unlisted grammar degrades to "no match here" and never to a match
+    /// on the wrong node.
+    #[test]
+    fn scope_tables_only_name_kinds_and_comments_are_universal() {
+        for lang in SUPPORTED_LANGUAGES {
+            for (node_kind, class) in scope_table(lang) {
+                assert!(
+                    matches!(
+                        *class,
+                        "function"
+                            | "class"
+                            | "parameter"
+                            | "block"
+                            | "call"
+                            | "comment"
+                            | "conditional"
+                            | "loop"
+                    ),
+                    "{lang}: {node_kind} maps to unknown text-object class {class}"
+                );
+            }
+        }
+
+        let mut server = Server::new();
+        server
+            .set_text(6, "rust", "// a note\nfn f() {}\n".to_string(), 1)
+            .unwrap();
+        let chain = scope_chain_cached(&server, 6, "rust", 1, 4).unwrap().chain;
+        assert_eq!(
+            chain.first().map(|node| node.kind),
+            Some(Some("comment")),
+            "a comment is not a comment text object: {chain:?}"
         );
     }
 

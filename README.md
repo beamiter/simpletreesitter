@@ -9,8 +9,15 @@
   `Tree::edit` + 旧语法树增量重解析；行数校验失配自动回退全量同步。
 - 代码大纲：层级容器、折叠、跳转、光标跟随、ASCII/Nerd Font 两套图标。
 - Tree-sitter 折叠：`:TsHlFoldsToggle` 由语法树驱动 `foldexpr`，支持嵌套层级。
+- Tree-sitter 文本对象：`af`/`if`（函数）、`ac`/`ic`（类型容器）、`aa`/`ia`（参数/实参），
+  另有 block/call/comment/conditional/loop 共 8 类的 `<Plug>` 映射与 `:TsHlSelect`。
+  参数的 outer 连分隔符一起选，`daa` 之后实参表仍然合法。
+- 增量选择：从光标处最内层节点开始按语法节点逐层扩展/收缩（默认不占键，见
+  `g:simpletreesitter_selection_maps`）。
 - 符号跳转：`:TsHlSymbols` 把当前 buffer 符号送入 location list。
 - 异步符号导航：`:TsHlNextSymbol` / `:TsHlPrevSymbol` 支持计数、循环与连续按键合并，不必打开 Outline。
+- 协议 v6 作用域链：一次应答同时喂饱文本对象与增量选择，且对整个 token 有效，
+  故算子等待里无需往返即可同步作答；旧 daemon 缺 `scope` 能力时给出可执行提示。
 - 协议 v5 请求关联：每次 symbols 请求携带单调 token；迟到的 full/partial 成功或
   error 都不能清掉新请求状态、污染 full cache 或触发旧跳转，v4 后台仍按原有
   revision / op / kind 守卫兼容运行。
@@ -86,6 +93,7 @@ install -m 0755 target/release/ts-hl-daemon lib/ts-hl-daemon
 | `:TsHlOutlineFilter [query]` | 即时过滤大纲；省略 query 清除过滤 |
 | `:TsHlDumpAST` | 打开当前 revision 的 AST 视图 |
 | `:TsHlInspect[!]` | 报告光标处匹配到的 capture、映射到的高亮组与 link 链、以及节点链；`!` 连同未被采用的 capture 一起解析 |
+| `:TsHlSelect {object}` | 选中光标处的文本对象，如 `:TsHlSelect function.inner`（支持补全） |
 | `:TsHlStatus` | 显示 daemon 协议、cache 和解析统计；不会启动 daemon |
 | `:TsHlSymbols` | 当前 buffer 符号送入 location list 并打开 |
 | `:[count]TsHlNextSymbol` / `:[count]TsHlPrevSymbol` | 在结构符号间前后跳转，到头循环 |
@@ -102,6 +110,9 @@ install -m 0755 target/release/ts-hl-daemon lib/ts-hl-daemon
 |---|---|
 | `<leader>th` | 切换插件 |
 | `<leader>to` | 切换大纲 |
+| `af` / `if` | 函数整体 / 函数体（可视与算子等待模式） |
+| `ac` / `ic` | 类型容器整体 / 其成员 |
+| `aa` / `ia` | 参数（连分隔符） / 参数本身 |
 
 插件不会覆盖已有 leader 映射，并提供标准 `<Plug>` 接口：
 
@@ -110,7 +121,19 @@ nmap <leader>x <Plug>(simpletreesitter-toggle)
 nmap <leader>s <Plug>(simpletreesitter-outline-toggle)
 nmap ]s <Plug>(simpletreesitter-next-symbol)
 nmap [s <Plug>(simpletreesitter-prev-symbol)
+
+" 文本对象共 8 类 × outer/inner，每个都有 <Plug>：
+xmap am <Plug>(simpletreesitter-textobj-call-outer)
+omap am <Plug>(simpletreesitter-textobj-call-outer)
+
+" 增量选择默认不占键（<CR>/<BS> 在可视模式里本来就有含义）：
+let g:simpletreesitter_selection_maps =
+      \ {'init': 'gnn', 'expand': '<CR>', 'shrink': '<BS>'}
 ```
+
+算子等待模式里没有等待 daemon 回包的机会，所以文本对象只吃缓存：光标停下时预取
+一次作用域链，一次应答对整个 token 有效。缓存冷（刚编辑完、或首次预取还没回来）时
+**什么也不选、不做任何编辑**，再按一次即可。详见 `:help simpletreesitter-textobjects`。
 
 大纲窗口内：`<CR>` 跳转，`o`/`za` 折叠或展开，`/` 输入过滤词，`q` 关闭。
 过滤对符号名、kind 与容器名做不区分大小写的字面子串匹配；它直接投影最近一次
@@ -167,6 +190,17 @@ g:simpletreesitter_symbol_jump_kinds = [
   'function', 'method', 'class', 'struct', 'enum',
   'namespace', 'type', 'module', 'macro'
 ]  " [] 表示全部；Markdown/结构化数据自动导航全部层级
+
+" 文本对象与增量选择
+g:simpletreesitter_textobjects = {
+  'af': 'function.outer', 'if': 'function.inner',
+  'ac': 'class.outer',    'ic': 'class.inner',
+  'aa': 'parameter.outer','ia': 'parameter.inner',
+}                                    " {} 表示一个默认键都不装
+g:simpletreesitter_textobject_maps = 1
+g:simpletreesitter_selection_maps = {}   " init/expand/shrink，默认不占键
+g:simpletreesitter_scope_prefetch = 1    " 0 表示不预取；文本对象只在重按时才命中
+g:simpletreesitter_scope_debounce = 50
 
 " :TsHlInspect 渲染方式：1 = 光标处 popup，0 = ts-hl-inspect scratch split
 g:simpletreesitter_inspect_popup = 1

@@ -13,10 +13,15 @@
 :TsHlOutlineToggle	simpletreesitter.txt	/*:TsHlOutlineToggle*
 :TsHlPrevSymbol	simpletreesitter.txt	/*:TsHlPrevSymbol*
 :TsHlRestart	simpletreesitter.txt	/*:TsHlRestart*
+:TsHlSelect	simpletreesitter.txt	/*:TsHlSelect*
 :TsHlStatus	simpletreesitter.txt	/*:TsHlStatus*
 :TsHlSymbols	simpletreesitter.txt	/*:TsHlSymbols*
 :TsHlToggle	simpletreesitter.txt	/*:TsHlToggle*
 g:simpletreesitter_inspect_popup	simpletreesitter.txt	/*g:simpletreesitter_inspect_popup*
+g:simpletreesitter_scope_debounce	simpletreesitter.txt	/*g:simpletreesitter_scope_debounce*
+g:simpletreesitter_scope_prefetch	simpletreesitter.txt	/*g:simpletreesitter_scope_prefetch*
+g:simpletreesitter_textobject_maps	simpletreesitter.txt	/*g:simpletreesitter_textobject_maps*
+g:simpletreesitter_textobjects	simpletreesitter.txt	/*g:simpletreesitter_textobjects*
 simpletreesitter	simpletreesitter.txt	/*simpletreesitter*
 simpletreesitter-commands	simpletreesitter.txt	/*simpletreesitter-commands*
 simpletreesitter-daemon	simpletreesitter.txt	/*simpletreesitter-daemon*
@@ -25,6 +30,9 @@ simpletreesitter-introduction	simpletreesitter.txt	/*simpletreesitter-introducti
 simpletreesitter-mappings	simpletreesitter.txt	/*simpletreesitter-mappings*
 simpletreesitter-options	simpletreesitter.txt	/*simpletreesitter-options*
 simpletreesitter-requirements	simpletreesitter.txt	/*simpletreesitter-requirements*
+simpletreesitter-selection	simpletreesitter.txt	/*simpletreesitter-selection*
 simpletreesitter-simplecore	simpletreesitter.txt	/*simpletreesitter-simplecore*
+simpletreesitter-textobject-cold	simpletreesitter.txt	/*simpletreesitter-textobject-cold*
+simpletreesitter-textobjects	simpletreesitter.txt	/*simpletreesitter-textobjects*
 simpletreesitter-troubleshooting	simpletreesitter.txt	/*simpletreesitter-troubleshooting*
 simpletreesitter.txt	simpletreesitter.txt	/*simpletreesitter.txt*

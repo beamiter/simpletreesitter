@@ -7,8 +7,9 @@ CONTENTS                                                *simpletreesitter*
 2. Requirements.............................|simpletreesitter-requirements|
 3. Commands.................................|simpletreesitter-commands|
 4. Mappings.................................|simpletreesitter-mappings|
-5. Options..................................|simpletreesitter-options|
-6. Troubleshooting..........................|simpletreesitter-troubleshooting|
+5. Text objects.............................|simpletreesitter-textobjects|
+6. Options..................................|simpletreesitter-options|
+7. Troubleshooting..........................|simpletreesitter-troubleshooting|
 
 ===============================================================================
 1. INTRODUCTION                              *simpletreesitter-introduction*
@@ -99,6 +100,13 @@ Build or update the daemon from the plugin directory: >
                         Requires a daemon advertising the "inspect" capability;
                         rebuild with ./install.sh and :TsHlRestart otherwise.
 
+                                                *:TsHlSelect*
+:TsHlSelect {object}    Visually select a Tree-sitter text object at the
+                        cursor, e.g. :TsHlSelect function.inner.  Completion
+                        lists every object.  See
+                        |simpletreesitter-textobjects| for the full list and
+                        for why an object can decline to select anything.
+
                                                 *:TsHlStatus*
 :TsHlStatus             Show protocol, cache and parse statistics.  This
                         command does not start a stopped daemon.
@@ -147,7 +155,90 @@ them.  The first sidebar is named ts-hl-outline and later ones are suffixed,
 because Vim buffer names must be unique.
 
 ===============================================================================
-5. OPTIONS                                   *simpletreesitter-options*
+5. TEXT OBJECTS                            *simpletreesitter-textobjects*
+
+Tree-sitter text objects select by syntax node rather than by pattern.  Each
+object names a class and a half: >
+
+  function.outer    function.inner      the whole definition / its body
+  class.outer       class.inner         class, struct, enum, impl, trait, ...
+  parameter.outer   parameter.inner     one parameter or call argument
+  block.outer       block.inner         a lexical block or suite
+  call.outer        call.inner          a call expression / its arguments
+  comment.outer     comment.inner
+  conditional.outer conditional.inner   if / match / switch
+  loop.outer        loop.inner          for / while / loop
+<
+The outer half is the node; the inner half is its body with the delimiters and
+the whitespace they left behind removed.  A parameter is the exception: its
+outer half also takes the separator that would otherwise be left behind, so
+`daa` on the middle argument of f(a, b, c) leaves f(a, c).
+
+A node belongs to exactly one class.  A closure passed as an argument is a
+function, reachable with af/if, and not also a parameter.
+
+These mappings are installed by default in Visual and Operator-pending mode,
+and never replace a mapping you already have: >
+
+  af  function.outer      if  function.inner
+  ac  class.outer         ic  class.inner
+  aa  parameter.outer     ia  parameter.inner
+<
+                                        *g:simpletreesitter_textobjects*
+Change or extend the set with a dictionary of key to object, or set it to an
+empty dictionary to install none: >
+
+  let g:simpletreesitter_textobjects = {
+        \ 'af': 'function.outer', 'if': 'function.inner',
+        \ 'am': 'call.outer',     'im': 'call.inner',
+        \ }
+<
+                                *g:simpletreesitter_textobject_maps*
+Set to zero to install no default keys at all.  The <Plug> mappings exist
+either way, one per object: >
+
+  xmap am <Plug>(simpletreesitter-textobj-call-outer)
+  omap am <Plug>(simpletreesitter-textobj-call-outer)
+<
+INCREMENTAL SELECTION                        *simpletreesitter-selection*
+
+Start a selection at the innermost named node under the cursor, then grow it
+one syntax node at a time and shrink it back.  No keys are taken by default,
+because the natural ones already mean something in Visual mode: >
+
+  let g:simpletreesitter_selection_maps =
+        \ {'init': 'gnn', 'expand': '<CR>', 'shrink': '<BS>'}
+<
+'init' is a Normal-mode key; 'expand' and 'shrink' are Visual-mode keys.  The
+<Plug> mappings are <Plug>(simpletreesitter-select-init) in Normal mode and
+<Plug>(simpletreesitter-select-expand) / -shrink in Visual mode.  Ancestors
+covering exactly the same range are skipped, so a step always changes the
+selection.  A selection you made yourself restarts the walk from the cursor.
+
+WHEN AN OBJECT DECLINES                *simpletreesitter-textobject-cold*
+
+An operator cannot wait for the daemon, so a text object is answered from a
+cached scope chain and never blocks Vim.  The chain is prefetched when the
+cursor comes to rest, and one reply covers the whole token the cursor is in.
+
+If no chain is cached for the buffer's current text -- immediately after an
+edit, or before the first prefetch has landed -- the object selects nothing and
+the operator is abandoned with the buffer untouched.  It never half-applies an
+edit.  Repeat the key and it will work.
+
+                                *g:simpletreesitter_scope_prefetch*
+                                *g:simpletreesitter_scope_debounce*
+Prefetching is g:simpletreesitter_scope_prefetch (default 1), debounced by
+g:simpletreesitter_scope_debounce milliseconds (default 50).  Setting the
+first to zero stops all prefetching; text objects then only work on a repeat.
+Nothing is prefetched while both g:simpletreesitter_textobjects and
+g:simpletreesitter_selection_maps are empty.
+
+Text objects need a daemon advertising the "scope" capability (protocol v6).
+Rebuild with ./install.sh and :TsHlRestart otherwise.
+
+===============================================================================
+6. OPTIONS                                   *simpletreesitter-options*
 
 Set global options before loading the plugin.  Defaults are shown below.
 
@@ -199,6 +290,14 @@ g:simpletreesitter_inspect_popup             1
 Render |:TsHlInspect| in a popup at the cursor.  Set to zero for a
 ts-hl-inspect scratch split you can search, yank and keep on screen.
 
+g:simpletreesitter_textobjects               af/if/ac/ic/aa/ia (see
+                                             |simpletreesitter-textobjects|)
+g:simpletreesitter_textobject_maps           1
+g:simpletreesitter_selection_maps            {} (see
+                                             |simpletreesitter-selection|)
+g:simpletreesitter_scope_prefetch            1
+g:simpletreesitter_scope_debounce            50
+
 g:simpletreesitter_indent_guides             0
 g:simpletreesitter_indent_guide_char         '│'
 g:simpletreesitter_breadcrumb                0
@@ -224,7 +323,7 @@ Disable one buffer with: >
   let b:simpletreesitter_max_buffer_bytes = 0
 <
 ===============================================================================
-6. TROUBLESHOOTING                          *simpletreesitter-troubleshooting*
+7. TROUBLESHOOTING                          *simpletreesitter-troubleshooting*
 
 "daemon not found"          Run ./install.sh or set the daemon path.
 "protocol is outdated"      Rebuild the daemon after updating the plugin.

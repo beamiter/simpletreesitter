@@ -76,6 +76,27 @@ g:simpletreesitter_folds = get(g:, 'simpletreesitter_folds', 0)
 # 1: 光标处弹出 popup；0: 用底部的 ts-hl-inspect scratch split（可复制/搜索）。
 g:simpletreesitter_inspect_popup = get(g:, 'simpletreesitter_inspect_popup', 1)
 
+# =============== 文本对象与增量选择 ===============
+# 键 -> 类别.半边（见 :help simpletreesitter-textobjects）。设成 {} 则一个也不装。
+g:simpletreesitter_textobjects = get(g:, 'simpletreesitter_textobjects', {
+  af: 'function.outer',
+  if: 'function.inner',
+  ac: 'class.outer',
+  ic: 'class.inner',
+  aa: 'parameter.outer',
+  ia: 'parameter.inner',
+})
+g:simpletreesitter_textobject_maps = get(g:, 'simpletreesitter_textobject_maps', 1)
+# 增量选择默认不占键：expand/shrink 只在可视模式下有意义，而 <CR> 与 <BS> 在
+# 可视模式里本来就有含义，默认抢过来属于意外行为。<Plug> 映射始终可用，想要的
+# 人填这个字典即可，例如
+#   g:simpletreesitter_selection_maps = {init: 'gnn', expand: '<CR>', shrink: '<BS>'}
+g:simpletreesitter_selection_maps = get(g:, 'simpletreesitter_selection_maps', {})
+# 光标停下后预取作用域链的防抖毫秒数。算子等待里没有等待回包的机会，预取正是
+# 文本对象能同步作答的原因；把 prefetch 设为 0 则完全不预取。
+g:simpletreesitter_scope_prefetch = get(g:, 'simpletreesitter_scope_prefetch', 1)
+g:simpletreesitter_scope_debounce = get(g:, 'simpletreesitter_scope_debounce', 50)
+
 # =============== 面包屑导航 ===============
 g:simpletreesitter_breadcrumb = get(g:, 'simpletreesitter_breadcrumb', 0)
 g:simpletreesitter_breadcrumb_separator = get(g:, 'simpletreesitter_breadcrumb_separator', ' > ')
@@ -107,6 +128,8 @@ command! TsHlSymbols        call simpletreesitter#SymbolsToLoclist()
 command! -count=1 TsHlNextSymbol call simpletreesitter#NextSymbol(<count>)
 command! -count=1 TsHlPrevSymbol call simpletreesitter#PrevSymbol(<count>)
 command! TsHlFoldsToggle    call simpletreesitter#FoldsToggle()
+command! -nargs=1 -complete=customlist,simpletreesitter#SelectComplete TsHlSelect
+  \ call simpletreesitter#Select(<q-args>)
 command! TsHlHealth  call simpletreesitter#Health()
 command! TsHlRestart call simpletreesitter#Restart()
 command! TsHlLog     call simpletreesitter#ShowLog()
@@ -116,6 +139,64 @@ nnoremap <silent> <Plug>(simpletreesitter-toggle) <Cmd>TsHlToggle<CR>
 nnoremap <silent> <Plug>(simpletreesitter-outline-toggle) <Cmd>TsHlOutlineToggle<CR>
 nnoremap <silent> <Plug>(simpletreesitter-next-symbol) <Cmd>call simpletreesitter#NextSymbol(v:count1)<CR>
 nnoremap <silent> <Plug>(simpletreesitter-prev-symbol) <Cmd>call simpletreesitter#PrevSymbol(v:count1)<CR>
+
+# 文本对象类别。与 simpletreesitter#TEXTOBJECT_SPECS 由 tests/vim_smoke.vim 校对；
+# 在这里重列一份，是为了装映射时不必在启动阶段 source 整个 autoload 脚本。
+const TEXTOBJECT_SPECS = [
+  'function.outer', 'function.inner',
+  'class.outer', 'class.inner',
+  'parameter.outer', 'parameter.inner',
+  'block.outer', 'block.inner',
+  'call.outer', 'call.inner',
+  'comment.outer', 'comment.inner',
+  'conditional.outer', 'conditional.inner',
+  'loop.outer', 'loop.inner',
+]
+
+def TextObjectPlug(spec: string): string
+  return '<Plug>(simpletreesitter-textobj-' .. substitute(spec, '\.', '-', '') .. ')'
+enddef
+
+# 每个类别都给 <Plug>，不用默认键的人也能自己接。
+# 用 :<C-u>call 而不是 <Cmd>：函数要把用户带进可视模式，<Cmd> 映射不许换模式。
+for spec in TEXTOBJECT_SPECS
+  var rhs = printf(':<C-u>call simpletreesitter#TextObject(%s)<CR>', string(spec))
+  execute 'xnoremap <silent> ' .. TextObjectPlug(spec) .. ' ' .. rhs
+  execute 'onoremap <silent> ' .. TextObjectPlug(spec) .. ' ' .. rhs
+endfor
+
+nnoremap <silent> <Plug>(simpletreesitter-select-init) :<C-u>call simpletreesitter#SelectInit()<CR>
+xnoremap <silent> <Plug>(simpletreesitter-select-expand) :<C-u>call simpletreesitter#SelectExpand()<CR>
+xnoremap <silent> <Plug>(simpletreesitter-select-shrink) :<C-u>call simpletreesitter#SelectShrink()<CR>
+
+if get(g:, 'simpletreesitter_textobject_maps', 1)
+    && type(g:simpletreesitter_textobjects) == v:t_dict
+  for [lhs, spec] in items(g:simpletreesitter_textobjects)
+    # 一个拼错的 spec 会静默装成一个什么都不选的键；说出来比让人去猜好。
+    if type(spec) != v:t_string || index(TEXTOBJECT_SPECS, spec) < 0
+      echohl WarningMsg
+      echom '[ts-hl] g:simpletreesitter_textobjects[' .. string(lhs) .. ']: unknown text object ' .. string(spec)
+      echohl None
+      continue
+    endif
+    for mode in ['x', 'o']
+      if maparg(lhs, mode) ==# '' && !hasmapto(TextObjectPlug(spec), mode)
+        execute mode .. 'map <silent> ' .. lhs .. ' ' .. TextObjectPlug(spec)
+      endif
+    endfor
+  endfor
+endif
+
+if type(g:simpletreesitter_selection_maps) == v:t_dict
+  for [action, mode] in [['init', 'n'], ['expand', 'x'], ['shrink', 'x']]
+    var key = get(g:simpletreesitter_selection_maps, action, '')
+    var plug = '<Plug>(simpletreesitter-select-' .. action .. ')'
+    if type(key) == v:t_string && key !=# ''
+        && maparg(key, mode) ==# '' && !hasmapto(plug, mode)
+      execute mode .. 'map <silent> ' .. key .. ' ' .. plug
+    endif
+  endfor
+endif
 
 if maparg('<leader>th', 'n') ==# '' && !hasmapto('<Plug>(simpletreesitter-toggle)', 'n')
   nmap <silent> <leader>th <Plug>(simpletreesitter-toggle)

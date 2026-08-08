@@ -25,6 +25,16 @@ var s_pending_ast: dict<bool> = {}
 # 位置与 bang，避免用响应到达时"碰巧"的光标位置作答。
 # buf -> {lnum, col, verbose}
 var s_pending_inspect: dict<dict<any>> = {}
+# =============== 文本对象 / 增量选择（protocol v6 scope） ===============
+# 一次 scope 应答给出光标处由内向外的具名祖先链，每项带 outer/inner 两个区间；
+# 文本对象取链上第一个匹配类别的项，增量选择沿链往外走，二者共用同一份缓存。
+# buf -> {revision, anchor: [lnum, col, end_lnum, end_col], chain}
+var s_scope_cache: dict<dict<any>> = {}
+var s_inflight_scope: dict<bool> = {}
+var s_scope_timer: number = 0
+# winid -> {buf, revision, lnum, col, index}：增量选择在链上的当前位置。
+# 按窗口存：同一 buffer 的两个分屏各自在扩展自己的选区。
+var s_selection: dict<dict<any>> = {}
 # daemon 在 hello 里通告的能力集合。加法式请求（inspect）用它做门控，这样一个
 # 未重建的旧 daemon 得到的是一句可执行的提示，而不是 "unknown variant"。
 var s_daemon_capabilities: dict<bool> = {}
@@ -466,7 +476,7 @@ enddef
 def OnDaemonStart()
   InvalidateDaemonSession()
   EnsureHlGroupsAndProps()
-  simpletreesitter#core#Send({type: 'hello', client_protocol: 5})
+  simpletreesitter#core#Send({type: 'hello', client_protocol: 6})
 enddef
 
 def OnDaemonExit(code: number, restarting: bool)
@@ -675,6 +685,10 @@ def ResetProtocolState()
   s_symbol_request_ids = {}
   s_full_symbol_cache = {}
   s_symbol_jump_pending = {}
+  # 作用域链描述的是上一次会话的解析树；留着会让文本对象作用在陈旧的区间上。
+  s_inflight_scope = {}
+  s_scope_cache = {}
+  s_selection = {}
   s_protocol_version = 0
 enddef
 
@@ -814,6 +828,20 @@ def OnDaemonEvent(ev: dict<any>)
     endif
     remove(s_pending_inspect, string(buf))
     ShowInspect(InspectReportLines(ev, DetectLang(buf), get(req, 'verbose', false)))
+  elseif ev.type ==# 'scope'
+    var buf = get(ev, 'buf', 0)
+    s_inflight_scope[buf] = false
+    if !EventRevisionIsCurrent(ev, buf)
+      # 描述的是已经不存在的文本；丢掉，下一次预取会带着新位置重问。
+      Log('Discarded stale scope chain for buffer ' .. buf)
+      return
+    endif
+    s_scope_cache[buf] = {
+      revision: get(ev, 'revision', 0),
+      anchor: [get(ev, 'anchor_lnum', 0), get(ev, 'anchor_col', 0),
+               get(ev, 'anchor_end_lnum', 0), get(ev, 'anchor_end_col', 0)],
+      chain: get(ev, 'chain', []),
+    }
   elseif ev.type ==# 'folds'
     var buf = get(ev, 'buf', 0)
     var retry = get(s_pending_folds, buf, false)
@@ -875,6 +903,8 @@ def OnDaemonEvent(ev: dict<any>)
       if has_key(s_pending_inspect, buf)
         RequestInspectNow(buf)
       endif
+      # 文本刚变过，作用域链一定过期；趁光标还在原处把它取回来。
+      ScheduleScopePrefetch()
     endif
   elseif ev.type ==# 'hello'
     s_protocol_version = get(ev, 'protocol_version', 0)
@@ -903,6 +933,11 @@ def OnDaemonEvent(ev: dict<any>)
       s_protocol_notice_shown = true
       echohl WarningMsg
       echom '[ts-hl] daemon protocol is v4; run install.sh for correlated symbol responses'
+      echohl None
+    elseif s_protocol_version == 5 && !s_protocol_notice_shown
+      s_protocol_notice_shown = true
+      echohl WarningMsg
+      echom '[ts-hl] daemon protocol is v5; run install.sh for tree-sitter text objects'
       echohl None
     endif
   elseif ev.type ==# 'status'
@@ -963,6 +998,9 @@ def OnDaemonEvent(ev: dict<any>)
         if has_key(s_pending_inspect, buf)
           remove(s_pending_inspect, string(buf))
         endif
+      elseif op ==# 'scope'
+        # 不解除在途标记的话，这个 buffer 的文本对象就再也不会预取了。
+        s_inflight_scope[buf] = false
       elseif op ==# 'set_text' || op ==# 'edit_lines'
         s_inflight_sync[buf] = false
         if has_key(s_inflight_revision, buf)
@@ -2236,8 +2274,8 @@ export def Health()
   for line in simpletreesitter#core#HealthLines()
     echo '  ' .. line
   endfor
-  echo printf('  [%s] protocol: v%d (plugin speaks v5)',
-    s_protocol_version >= 5 ? 'OK' : 'WARN', s_protocol_version)
+  echo printf('  [%s] protocol: v%d (plugin speaks v6)',
+    s_protocol_version >= 6 ? 'OK' : 'WARN', s_protocol_version)
   echo printf('  [%s] text properties: %s',
     has('textprop') ? 'OK' : 'ERROR',
     has('textprop') ? 'available' : 'missing +textprop — highlighting disabled')
@@ -2298,6 +2336,14 @@ export def Disable()
     s_bc_timer = 0
   endif
   ClearAllWinbars()
+  # 清理文本对象/增量选择状态
+  s_scope_cache = {}
+  s_inflight_scope = {}
+  s_selection = {}
+  if s_scope_timer != 0
+    try | timer_stop(s_scope_timer) | catch | endtry
+    s_scope_timer = 0
+  endif
   echo '[ts-hl] disabled'
 enddef
 
@@ -2429,6 +2475,8 @@ export def OnScroll(buf: number)
   ScheduleBreadcrumbUpdate()
   # Outline 光标跟随（防抖）
   ScheduleOutlineCursorUpdate()
+  # 文本对象要在算子等待里同步作答，故光标停下就预取这一处的作用域链。
+  ScheduleScopePrefetch()
 enddef
 
 export def OnBufClose(buf: number)
@@ -2446,7 +2494,8 @@ export def OnBufClose(buf: number)
   for state in [s_inflight_sync, s_pending_ast, s_inflight_syms, s_inflight_hl,
       s_pending_syms, s_pending_hl, s_oversized_notified,
       s_inflight_folds, s_pending_folds, s_loclist_pending, s_symbol_request_purpose,
-      s_symbol_request_kinds, s_symbol_request_ids, s_full_symbol_cache]
+      s_symbol_request_kinds, s_symbol_request_ids, s_full_symbol_cache,
+      s_inflight_scope, s_scope_cache]
     if has_key(state, buf)
       remove(state, string(buf))
     endif
@@ -3047,6 +3096,296 @@ export def Inspect(verbose: bool = false)
   # 位置在按键时刻确定：响应可能要等一次同步往返，届时光标早已不在这里。
   s_pending_inspect[buf] = {lnum: line('.'), col: col('.'), verbose: verbose}
   RequestInspectNow(buf)
+enddef
+
+# =============== 文本对象与增量选择 ===============
+# 算子等待（operator-pending）里没有等待回包的机会：把编辑挂起、等 daemon 回话
+# 再重放按键，既要求期间光标一动不动，又要在失败时回滚一个已经开始的算子——
+# 代价远大于收益。这里改为"先取到再用"：光标停下就预取当前位置的链，未命中时
+# 只是不选中（Vim 自己会中止算子），绝不半应用一次编辑。
+# 应答对整个 anchor 区间有效，所以在一个 token 内移动不会打掉缓存。
+export const TEXTOBJECT_SPECS: list<string> = [
+  'function.outer', 'function.inner',
+  'class.outer', 'class.inner',
+  'parameter.outer', 'parameter.inner',
+  'block.outer', 'block.inner',
+  'call.outer', 'call.inner',
+  'comment.outer', 'comment.inner',
+  'conditional.outer', 'conditional.inner',
+  'loop.outer', 'loop.inner',
+]
+
+def ScopeMapsWanted(): bool
+  var objects = get(g:, 'simpletreesitter_textobjects', {})
+  var selection = get(g:, 'simpletreesitter_selection_maps', {})
+  return (type(objects) == v:t_dict && !empty(objects))
+    || (type(selection) == v:t_dict && !empty(selection))
+enddef
+
+# 缓存有效当且仅当：revision 未变，且光标仍在 daemon 报告的 anchor 区间内。
+# anchor 是"解析到同一个节点"的最大区间，不是那个节点自己的范围——在缩进里
+# 解析到的是整个 block，用它的范围做缓存会让光标移到语句上后仍返回粗链。
+def ScopeCacheValid(buf: number, lnum: number, col: number): bool
+  var entry = get(s_scope_cache, buf, {})
+  if empty(entry) || get(entry, 'revision', -1) != GetChangedTick(buf)
+    return false
+  endif
+  if empty(get(entry, 'chain', []))
+    return false
+  endif
+  var anchor = get(entry, 'anchor', [])
+  if type(anchor) != v:t_list || len(anchor) != 4
+    return false
+  endif
+  if lnum < anchor[0] || lnum > anchor[2]
+    return false
+  endif
+  if lnum == anchor[0] && col < anchor[1]
+    return false
+  endif
+  # end_col 是最后一个字节之后一列，故右端开区间。
+  if lnum == anchor[2] && col >= anchor[3]
+    return false
+  endif
+  return true
+enddef
+
+def RequestScopeNow(buf: number, lnum: number, col: number)
+  if !s_enabled || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+    return
+  endif
+  # 握手完成后才有能力集可查；旧 daemon 不认识 scope，静默不发即可——
+  # 面向用户的提示留给 TextObject()，它知道这次是不是用户按的键。
+  if s_protocol_version > 0 && !get(s_daemon_capabilities, 'scope', false)
+    return
+  endif
+  if get(s_inflight_scope, buf, false)
+    return
+  endif
+  if !EnsureDaemon()
+    return
+  endif
+  var lang = DetectLang(buf)
+  if lang ==# ''
+    return
+  endif
+  var ct = GetChangedTick(buf)
+  if get(s_skipped_changedtick, buf, -1) == ct
+    return
+  endif
+  if ct != get(s_sent_changedtick, buf, -1) || get(s_inflight_sync, buf, false)
+    # 文本还没送到；同步完成后光标多半仍在这里，届时预取会再跑一次。
+    ScheduleSync(buf)
+    return
+  endif
+  s_inflight_scope[buf] = true
+  if !Send({type: 'scope', buf: buf, lang: lang, lnum: lnum, col: col})
+    # 发送失败不解除在途标记，这个 buffer 的文本对象就再也不会更新了。
+    s_inflight_scope[buf] = false
+  endif
+enddef
+
+# 光标停下就预取，好让紧接着按下的 daf 走同步的缓存路径。
+def ScheduleScopePrefetch()
+  if !get(g:, 'simpletreesitter_scope_prefetch', 1) || !ScopeMapsWanted()
+    return
+  endif
+  var buf = bufnr()
+  if !IsSupportedLang(buf) || ScopeCacheValid(buf, line('.'), col('.'))
+    return
+  endif
+  if s_scope_timer != 0
+    try | timer_stop(s_scope_timer) | catch | endtry
+    s_scope_timer = 0
+  endif
+  var delay = get(g:, 'simpletreesitter_scope_debounce', 50)
+  s_scope_timer = timer_start(delay > 0 ? delay : 1, (_) => {
+    s_scope_timer = 0
+    RequestScopeNow(bufnr(), line('.'), col('.'))
+  })
+enddef
+
+# 把 [lnum, col, end_lnum, end_col)（end_col 为最后一个字节之后一列）变成一次
+# 字符可视选择。区间为空时返回 false —— 宁可什么都不选，也不要让算子作用在一个
+# 靠猜出来的位置上。
+def SelectRangeInBuffer(lnum: number, col: number, end_lnum: number, end_col: number): bool
+  if lnum <= 0 || end_lnum <= 0 || lnum > line('$')
+    return false
+  endif
+  var last_lnum = end_lnum > line('$') ? line('$') : end_lnum
+  var last_col = end_lnum > line('$') ? strlen(getline(last_lnum)) : end_col - 1
+  # 结束列落在行首，说明区间实际结束于上一行行尾。
+  while last_col < 1 && last_lnum > lnum
+    last_lnum -= 1
+    last_col = strlen(getline(last_lnum))
+  endwhile
+  if last_col < 1 || last_lnum < lnum || (last_lnum == lnum && last_col < col)
+    return false
+  endif
+  # 'selection' 为 exclusive 时右端点不含最后一个字符。临时切回 inclusive，
+  # 并在算子执行完（本轮事件循环之后）恢复。
+  var saved = &selection
+  if saved !=# 'inclusive'
+    &selection = 'inclusive'
+    timer_start(0, (_) => {
+      try | &selection = saved | catch | endtry
+    })
+  endif
+  cursor(lnum, col)
+  normal! v
+  cursor(last_lnum, last_col)
+  return true
+enddef
+
+def SelectScopeNode(node: dict<any>, half: string): bool
+  var prefix = half ==# 'inner' ? 'inner_' : ''
+  return SelectRangeInBuffer(
+    get(node, prefix .. 'lnum', 0),
+    get(node, prefix .. 'col', 0),
+    get(node, prefix .. 'end_lnum', 0),
+    get(node, prefix .. 'end_col', 0))
+enddef
+
+def SameOuterRange(left: dict<any>, right: dict<any>): bool
+  for field in ['lnum', 'col', 'end_lnum', 'end_col']
+    if get(left, field, -1) != get(right, field, -2)
+      return false
+    endif
+  endfor
+  return true
+enddef
+
+# spec 形如 'function.outer'：类别 + outer/inner。
+export def TextObject(spec: string)
+  var parts = split(spec, '\.')
+  if len(parts) != 2
+    return
+  endif
+  var want = parts[0]
+  var half = parts[1]
+  var buf = bufnr()
+  var lnum = line('.')
+  var col = col('.')
+  if !ScopeCacheValid(buf, lnum, col)
+    # 冷缓存：把这次位置取回来给下一次按键用，本次什么都不选。
+    RequestScopeNow(buf, lnum, col)
+    return
+  endif
+  for node in s_scope_cache[buf].chain
+    # inner 可能是空区间（例如 `{}` 的函数体）；那就继续往外找同类节点，
+    # 而不是选中一个由空区间猜出来的位置。
+    if get(node, 'kind', '') ==# want && SelectScopeNode(node, half)
+      return
+    endif
+  endfor
+enddef
+
+# 增量选择：从光标处最内层的具名节点开始，沿链往外扩。
+export def SelectInit()
+  var buf = bufnr()
+  var lnum = line('.')
+  var col = col('.')
+  if !ScopeCacheValid(buf, lnum, col)
+    RequestScopeNow(buf, lnum, col)
+    return
+  endif
+  var chain = s_scope_cache[buf].chain
+  if empty(chain) || !SelectScopeNode(chain[0], 'outer')
+    return
+  endif
+  s_selection[string(win_getid())] = {
+    buf: buf, revision: GetChangedTick(buf), lnum: lnum, col: col, index: 0,
+  }
+enddef
+
+# 取回本窗口仍然有效的扩展状态；用户自己划的选区或改过的文本都不算数。
+def LiveSelectionState(): dict<any>
+  var state = get(s_selection, string(win_getid()), {})
+  if empty(state)
+    return {}
+  endif
+  var buf = bufnr()
+  if get(state, 'buf', -1) != buf || get(state, 'revision', -1) != GetChangedTick(buf)
+    return {}
+  endif
+  if !ScopeCacheValid(buf, get(state, 'lnum', 0), get(state, 'col', 0))
+    return {}
+  endif
+  return state
+enddef
+
+def ApplySelectionStep(state: dict<any>, index: number): bool
+  var chain = s_scope_cache[state.buf].chain
+  if index < 0 || index >= len(chain) || !SelectScopeNode(chain[index], 'outer')
+    return false
+  endif
+  state.index = index
+  s_selection[string(win_getid())] = state
+  return true
+enddef
+
+export def SelectExpand()
+  var state = LiveSelectionState()
+  if empty(state)
+    SelectInit()
+    return
+  endif
+  var chain = s_scope_cache[state.buf].chain
+  var index: number = get(state, 'index', 0)
+  # 与当前项同界的祖先要跳过，否则这一下看起来毫无反应。
+  var next = index + 1
+  while next < len(chain) && SameOuterRange(chain[next], chain[index])
+    next += 1
+  endwhile
+  if !ApplySelectionStep(state, next)
+    # 已经到根，或那一层选不出区间：保持用户当前的选区不动。
+    normal! gv
+  endif
+enddef
+
+export def SelectShrink()
+  var state = LiveSelectionState()
+  if empty(state)
+    normal! gv
+    return
+  endif
+  var chain = s_scope_cache[state.buf].chain
+  var index: number = get(state, 'index', 0)
+  var previous = index - 1
+  while previous >= 0 && SameOuterRange(chain[previous], chain[index])
+    previous -= 1
+  endwhile
+  if !ApplySelectionStep(state, previous)
+    normal! gv
+  endif
+enddef
+
+# :TsHlSelect {spec} —— 供脚本与手工使用，效果与对应的文本对象映射相同。
+export def Select(spec: string)
+  var buf = bufnr()
+  if DetectLang(buf) ==# ''
+    echo '[ts-hl] text objects unsupported for this &filetype'
+    return
+  endif
+  if index(TEXTOBJECT_SPECS, spec) < 0
+    echo '[ts-hl] unknown text object: ' .. spec .. ' (see :help simpletreesitter-textobjects)'
+    return
+  endif
+  if !s_enabled
+    Enable()
+  endif
+  if !s_enabled
+    return
+  endif
+  if s_protocol_version > 0 && !get(s_daemon_capabilities, 'scope', false)
+    echo '[ts-hl] this daemon predates text objects; run ./install.sh, then :TsHlRestart'
+    return
+  endif
+  TextObject(spec)
+enddef
+
+export def SelectComplete(arg: string, _line: string, _pos: number): list<string>
+  return TEXTOBJECT_SPECS->copy()->filter((_, spec) => stridx(spec, arg) == 0)
 enddef
 
 # =============== 渲染符号侧边栏（树形 + 高亮） ===============
@@ -3667,6 +4006,11 @@ export def OnWinClosed(wid_str: string)
   var wkey = string(wid)
   if has_key(s_breadcrumb_cache, wkey)
     remove(s_breadcrumb_cache, wkey)
+  endif
+  # 增量选择的位置同样按窗口存；不清掉的话，被回收的窗口 id 会继承一段
+  # 早已不存在的选区历史。
+  if has_key(s_selection, wkey)
+    remove(s_selection, wkey)
   endif
   SyncOutlineContext()
   if wid == s_outline_win
