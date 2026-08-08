@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased - 2026-08-08
+
+### 修复：breadcrumb 不再把符号名当作 'statusline' 格式串
+
+- `'winbar'` 与 `'statusline'` 用同一套格式解析：裸 `%` 开启一个 item，`%{expr}`
+  会在每次重绘时求值。此前 breadcrumb 把符号名内插进 `'winbar'`，只转义了空格、
+  反斜杠、`|` 和 `"`，于是一个 markdown 标题 `# %{system("…")}` 会在光标移到该
+  小节时被求值——打开不受信任的文件即可执行任意代码；而无害的 `# 100% coverage`
+  只会触发 E539，breadcrumb 直接消失。
+- 现在 `'winbar'` 在窗口生命周期内只保存一个固定表达式
+  `%{simpletreesitter#Breadcrumb()}`，变化的只是它读取的缓存字符串。Vim 不会
+  重新解析普通 `%{}` 的结果（那是 `%{% %}` 的语义），所以符号名一律按字面渲染，
+  与文档里早已安全的 statusline 用法同源。写选项改用 `setwinvar()`，不再需要
+  当初出错的那套选项值转义。
+
 ## Unreleased - 2026-08-05
 
 ### Outline 即时过滤

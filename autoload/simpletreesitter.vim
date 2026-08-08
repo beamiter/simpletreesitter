@@ -619,10 +619,7 @@ def OnDaemonEvent(ev: dict<any>)
     endif
     var syms = get(ev, 'symbols', [])
     # 面包屑：保存符号数据
-    if buf == s_bc_buf && get(g:, 'simpletreesitter_breadcrumb', 0)
-      s_bc_items = syms
-      ScheduleBreadcrumbUpdate()
-    endif
+    SetBreadcrumbItems(buf, syms)
     if was_full
       s_full_symbol_cache[buf] = {
         revision: GetChangedTick(buf),
@@ -1770,14 +1767,44 @@ def BreadcrumbIcon(kind: string): string
   return get(icons, kind, '')
 enddef
 
+# Vim parses 'winbar' exactly like 'statusline': a bare '%' opens a format item
+# and '%{expr}' is *evaluated* on every redraw.  Interpolating a symbol name into
+# the option therefore handed a markdown heading such as
+# `# %{system("curl … | sh")}` straight to the expression evaluator — code
+# execution from moving the cursor in an untrusted file — while an innocent
+# `# 100% coverage` raised E539 and lost the breadcrumb entirely.  So the option
+# holds one fixed expression for the lifetime of the window and only the cached
+# string it reads ever changes: Vim renders the *result* of a plain %{} item
+# literally (re-parsing is what the separate %{% %} form is for), which is why
+# the documented statusline usage was already safe.
+const s_winbar_expr = '%{simpletreesitter#Breadcrumb()}'
+
+# A set-but-empty 'winbar' still costs the window a screen line, so an empty
+# breadcrumb must clear the option rather than evaluate to an empty string.
+def WinbarValue(text: string): string
+  return text ==# '' ? '' : s_winbar_expr
+enddef
+
 def SetWinbar(text: string)
   if !exists('+winbar')
     return
   endif
+  # setwinvar() stores the value verbatim; ':setlocal winbar=' would need the
+  # option-value escaping whose incompleteness caused the bug described above.
   try
-    execute 'setlocal winbar=' .. escape(text, ' \|"')
+    setwinvar(0, '&winbar', WinbarValue(text))
   catch
   endtry
+enddef
+
+# The single entry point for symbol payloads reaching the breadcrumb, so the
+# untrusted-name path has one place to test and one place to guard.
+def SetBreadcrumbItems(buf: number, syms: list<dict<any>>)
+  if buf != s_bc_buf || !get(g:, 'simpletreesitter_breadcrumb', 0)
+    return
+  endif
+  s_bc_items = syms
+  ScheduleBreadcrumbUpdate()
 enddef
 
 def UpdateBreadcrumb()

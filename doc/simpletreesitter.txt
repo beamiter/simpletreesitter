@@ -173,6 +173,11 @@ Use this expression in 'statusline' when Vim has no 'winbar': >
 
   %{simpletreesitter#Breadcrumb()}
 <
+'winbar' is set to that same fixed expression, never to the breadcrumb text.
+Both options are parsed as |'statusline'| formats, so a symbol name containing
+'%' or '%{...}' would otherwise be interpreted -- and evaluated -- on every
+redraw. Symbol names are always rendered as literal text.
+
 Disable one buffer with: >
 
   let b:simpletreesitter_disable = 1

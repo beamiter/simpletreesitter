@@ -504,6 +504,44 @@ call assert_false(s:CallPrivate('BufferTextExceedsLimit', [bufnr(), 6]))
 call assert_true(s:CallPrivate('BufferTextExceedsLimit', [bufnr(), 5]))
 call delete(s:size_file)
 
+" Breadcrumb text is data, never a statusline format string. Vim parses 'winbar'
+" like 'statusline', so a container symbol whose name contains %{...} used to be
+" evaluated on the next redraw -- code execution from moving the cursor in an
+" untrusted file -- and a plain '%' raised E539 and lost the breadcrumb.
+let g:simpletreesitter_breadcrumb = 1
+enew
+call setline(1, ['# 100% %{execute("let g:pwned = 1")} coverage', 'body text'])
+setfiletype markdown
+let s:bc = bufnr()
+call simpletreesitter#Enable()
+sleep 200m
+call s:CallPrivate('ScheduleSymbols', [s:bc])
+call assert_equal(s:bc, s:State().s_bc_buf, 'breadcrumb did not adopt the current buffer')
+let s:hostile = '100% %{execute("let g:pwned = 1")} coverage'
+call s:CallPrivate('SetBreadcrumbItems', [s:bc, [
+      \ {'name': s:hostile, 'kind': 'namespace', 'lnum': 1, 'col': 1,
+      \  'end_lnum': 2, 'end_col': 1}]])
+call cursor(2, 1)
+call s:CallPrivate('UpdateBreadcrumb', [])
+call assert_match('100% ', simpletreesitter#Breadcrumb(),
+      \ 'breadcrumb dropped the literal symbol name')
+call assert_match('coverage', simpletreesitter#Breadcrumb(),
+      \ 'breadcrumb truncated the symbol name at the % item')
+call assert_equal('%{simpletreesitter#Breadcrumb()}',
+      \ s:CallPrivate('WinbarValue', [simpletreesitter#Breadcrumb()]),
+      \ 'breadcrumb text was interpolated into the winbar format string')
+call assert_equal('', s:CallPrivate('WinbarValue', ['']),
+      \ 'an empty breadcrumb must clear winbar, not evaluate to an empty bar')
+if exists('+winbar')
+  call assert_equal('%{simpletreesitter#Breadcrumb()}', &l:winbar,
+        \ 'winbar does not hold the fixed breadcrumb expression')
+endif
+redraw
+call assert_false(exists('g:pwned'),
+      \ 'breadcrumb evaluated a %{} payload taken from a symbol name')
+let g:simpletreesitter_breadcrumb = 0
+call simpletreesitter#Disable()
+
 if !empty(v:errors)
   call writefile(v:errors, '/tmp/simpletreesitter-vim-errors.log')
   cquit
