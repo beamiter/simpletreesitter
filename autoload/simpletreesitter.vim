@@ -21,6 +21,13 @@ var s_skipped_changedtick: dict<number> = {}
 var s_oversized_notified: dict<bool> = {}
 # AST 请求需要等待对应 revision 同步完成
 var s_pending_ast: dict<bool> = {}
+# :TsHlInspect 同样要等 revision 对齐；条目本身就是"已请求"标记，并记住发起时的
+# 位置与 bang，避免用响应到达时"碰巧"的光标位置作答。
+# buf -> {lnum, col, verbose}
+var s_pending_inspect: dict<dict<any>> = {}
+# daemon 在 hello 里通告的能力集合。加法式请求（inspect）用它做门控，这样一个
+# 未重建的旧 daemon 得到的是一句可执行的提示，而不是 "unknown variant"。
+var s_daemon_capabilities: dict<bool> = {}
 # 上次应用的可见范围缓存 {bufnr: [start_lnum, end_lnum]}
 var s_last_ranges: dict<list<number>> = {}
 # 上次实际写入的高亮类型 {bufnr: [type, ...]}，用于增量清除（只清自己用过的类型）
@@ -641,6 +648,8 @@ def ResetProtocolState()
   s_pending_hl = {}
   s_pending_syms = {}
   s_pending_ast = {}
+  s_pending_inspect = {}
+  s_daemon_capabilities = {}
   s_pending_splice = {}
   s_inflight_folds = {}
   s_pending_folds = {}
@@ -775,6 +784,20 @@ def OnDaemonEvent(ev: dict<any>)
     endif
     var lines = get(ev, 'lines', [])
     ShowAst(buf, lines)
+  elseif ev.type ==# 'inspect'
+    var buf = get(ev, 'buf', 0)
+    if !EventRevisionIsCurrent(ev, buf)
+      # 报告会描述已经不存在的文本；保留 pending，同步完成后按原位置重问。
+      ScheduleSync(buf)
+      return
+    endif
+    var req = get(s_pending_inspect, buf, {})
+    if empty(req)
+      # 没有在等的请求，说明这是上一次会话或已取消请求的迟到回复。
+      return
+    endif
+    remove(s_pending_inspect, string(buf))
+    ShowInspect(InspectReportLines(ev, DetectLang(buf), get(req, 'verbose', false)))
   elseif ev.type ==# 'folds'
     var buf = get(ev, 'buf', 0)
     var retry = get(s_pending_folds, buf, false)
@@ -833,9 +856,18 @@ def OnDaemonEvent(ev: dict<any>)
         s_pending_ast[buf] = false
         RequestAstNow(buf)
       endif
+      if has_key(s_pending_inspect, buf)
+        RequestInspectNow(buf)
+      endif
     endif
   elseif ev.type ==# 'hello'
     s_protocol_version = get(ev, 'protocol_version', 0)
+    s_daemon_capabilities = {}
+    for cap in get(ev, 'capabilities', [])
+      if type(cap) == v:t_string
+        s_daemon_capabilities[cap] = true
+      endif
+    endfor
     if s_protocol_version < 2 && !s_protocol_notice_shown
       s_protocol_notice_shown = true
       echohl WarningMsg
@@ -901,6 +933,11 @@ def OnDaemonEvent(ev: dict<any>)
         s_inflight_hl[buf] = false
       elseif op ==# 'folds'
         s_inflight_folds[buf] = false
+      elseif op ==# 'inspect'
+        # 一次失败的 inspect 不能一直挂着：下一次 set_text 的 ok 会重发它。
+        if has_key(s_pending_inspect, buf)
+          remove(s_pending_inspect, string(buf))
+        endif
       elseif op ==# 'set_text' || op ==# 'edit_lines'
         s_inflight_sync[buf] = false
         if has_key(s_inflight_revision, buf)
@@ -2342,7 +2379,7 @@ export def OnBufClose(buf: number)
     endif
   endfor
   for state in [s_inflight_revision, s_sent_changedtick, s_skipped_changedtick,
-      s_req_timers, s_sync_timers, s_symbol_jump_pending]
+      s_req_timers, s_sync_timers, s_symbol_jump_pending, s_pending_inspect]
     if has_key(state, buf)
       remove(state, string(buf))
     endif
@@ -2755,6 +2792,188 @@ export def DumpAST()
     return
   endif
   RequestAstNow(buf)
+enddef
+
+# =============== :TsHlInspect（光标处的 capture 与高亮组） ===============
+# 'highlight link A B' 是一条链；只报告链首对想改配色的用户没有用，他必须知道
+# 最终落到哪个组。8 跳远超任何真实配色方案，这个上限只是防止有人写出成环的 link
+# 时把报告卡死。
+def ResolveHighlightChain(group: string): string
+  var chain = [group]
+  if !exists('*hlget')
+    return group
+  endif
+  var name = group
+  for _ in range(8)
+    var info: list<dict<any>> = []
+    try
+      info = hlget(name)
+    catch
+      break
+    endtry
+    if empty(info)
+      break
+    endif
+    var linked = get(info[0], 'linksto', '')
+    if type(linked) != v:t_string || linked ==# '' || index(chain, linked) >= 0
+      break
+    endif
+    chain->add(linked)
+    name = linked
+  endfor
+  return join(chain, ' -> ')
+enddef
+
+# 纯函数：daemon 事件 -> 报告文本。渲染方式（popup/scratch）与它无关，因此格式
+# 本身可以被直接断言。
+def InspectReportLines(ev: dict<any>, lang: string, verbose: bool): list<string>
+  var lines = [printf('ts-hl inspect  %s  [%d:%d]',
+    lang ==# '' ? '?' : lang, get(ev, 'lnum', 0), get(ev, 'col', 0))]
+  var captures = get(ev, 'captures', [])
+  lines->add('')
+  if empty(captures)
+    lines->add('Captures: none — no pattern in the ' .. lang .. ' query matches here')
+  else
+    lines->add('Captures (highest priority first; * is the one drawn)')
+    for cap in captures
+      var group = get(cap, 'group', '')
+      var injected = get(cap, 'injected_lang', '')
+      lines->add(printf('%s @%-22s %-18s priority %-3d [%d:%d-%d:%d]%s',
+        get(cap, 'applied', false) ? '*' : ' ',
+        get(cap, 'capture', '?'),
+        group ==# '' ? '(no group)' : group,
+        get(cap, 'priority', 0),
+        get(cap, 'lnum', 0), get(cap, 'col', 0),
+        get(cap, 'end_lnum', 0), get(cap, 'end_col', 0),
+        injected ==# '' ? '' : '  via ' .. injected))
+    endfor
+  endif
+  # 默认只解析真正画出来的那个组；:TsHlInspect! 解析全部。
+  var groups: list<string> = []
+  for cap in captures
+    var group = get(cap, 'group', '')
+    if group ==# '' || index(groups, group) >= 0
+      continue
+    endif
+    if verbose || get(cap, 'applied', false)
+      groups->add(group)
+    endif
+  endfor
+  if !empty(groups)
+    lines->add('')
+    lines->add('Highlight (link the leftmost group to restyle it)')
+    for group in groups
+      lines->add('  ' .. ResolveHighlightChain(group))
+    endfor
+  endif
+  var chain = get(ev, 'node_chain', [])
+  if !empty(chain)
+    lines->add('')
+    lines->add('Nodes (innermost first)')
+    for node in chain
+      var field = get(node, 'field', '')
+      lines->add(printf('  %-28s [%d:%d-%d:%d]%s',
+        get(node, 'kind', '?') .. (get(node, 'named', true) ? '' : ' (anonymous)'),
+        get(node, 'lnum', 0), get(node, 'col', 0),
+        get(node, 'end_lnum', 0), get(node, 'end_col', 0),
+        field ==# '' ? '' : '  field: ' .. field))
+    endfor
+  endif
+  return lines
+enddef
+
+def ShowInspect(lines: list<string>)
+  if get(g:, 'simpletreesitter_inspect_popup', 1) && exists('*popup_atcursor')
+    try
+      popup_atcursor(lines, {
+        padding: [0, 1, 0, 1],
+        border: [],
+        moved: 'any',
+        maxwidth: 100,
+        title: ' ts-hl inspect ',
+      })
+      return
+    catch
+    endtry
+  endif
+  var curwin = win_getid()
+  try
+    # 上一次的报告窗口可能还开着，而 buffer 名必须唯一。
+    var stale = bufnr('^ts-hl-inspect$')
+    if stale > 0
+      execute 'bwipeout! ' .. stale
+    endif
+    execute 'keepalt botright split'
+    execute 'enew'
+    execute 'file ts-hl-inspect'
+    setlocal buftype=nofile bufhidden=wipe nobuflisted noswapfile
+    setlocal nowrap nonumber norelativenumber signcolumn=no
+    call setline(1, lines)
+    execute 'resize ' .. min([max([len(lines), 3]), 20])
+    setlocal nomodifiable
+    nnoremap <silent><buffer> q :close<CR>
+  catch
+  finally
+    if curwin != 0
+      call win_gotoid(curwin)
+    endif
+  endtry
+enddef
+
+def RequestInspectNow(buf: number)
+  if !s_enabled || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
+    return
+  endif
+  var req = get(s_pending_inspect, buf, {})
+  if empty(req)
+    return
+  endif
+  if !EnsureDaemon()
+    return
+  endif
+  var lang = DetectLang(buf)
+  if lang ==# ''
+    return
+  endif
+  var ct = GetChangedTick(buf)
+  if get(s_skipped_changedtick, buf, -1) == ct
+    echo '[ts-hl] buffer exceeds g:simpletreesitter_max_buffer_bytes'
+    remove(s_pending_inspect, string(buf))
+    return
+  endif
+  if ct != get(s_sent_changedtick, buf, -1) || get(s_inflight_sync, buf, false)
+    # 保持 pending：set_text/edit_lines 的 ok 会用原始位置重发。
+    ScheduleSync(buf)
+    return
+  endif
+  Send({type: 'inspect', buf: buf, lang: lang, lnum: req.lnum, col: req.col})
+enddef
+
+# 报告光标处匹配到的 capture、它们映射到的高亮组，以及所在的节点链。
+# 加 ! 时连同未被采用的 capture 一起解析 highlight link 链。
+export def Inspect(verbose: bool = false)
+  var buf = bufnr()
+  if !bufexists(buf)
+    return
+  endif
+  if DetectLang(buf) ==# ''
+    echo '[ts-hl] inspect unsupported for this &filetype'
+    return
+  endif
+  if !s_enabled
+    Enable()
+  endif
+  if !s_enabled
+    return
+  endif
+  # 握手完成之后才有能力集可查；握手前不拦，让请求自己去撞 daemon 的错误。
+  if s_protocol_version > 0 && !get(s_daemon_capabilities, 'inspect', false)
+    echo '[ts-hl] this daemon predates :TsHlInspect; run ./install.sh, then :TsHlRestart'
+    return
+  endif
+  # 位置在按键时刻确定：响应可能要等一次同步往返，届时光标早已不在这里。
+  s_pending_inspect[buf] = {lnum: line('.'), col: col('.'), verbose: verbose}
+  RequestInspectNow(buf)
 enddef
 
 # =============== 渲染符号侧边栏（树形 + 高亮） ===============

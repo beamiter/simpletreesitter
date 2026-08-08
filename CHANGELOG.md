@@ -2,6 +2,24 @@
 
 ## Unreleased - 2026-08-08
 
+### 新增 `:TsHlInspect`：光标处的 capture 与高亮组
+
+- 对一个语法高亮插件来说，"这个 token 为什么是这个颜色、我该覆盖哪个组"是第一
+  问题，而在此之前唯一的答案是去读编译进二进制里的 .scm。`:TsHlInspect` 直接给出
+  答案：光标处匹配到的每个 capture、它映射到的高亮组、优先级、范围，以及哪一个
+  真正被画出来（`*` 标记）；该组的 `highlight link` 链（要改配色就改链首）；还有
+  从最内层节点到根的节点链，附带每个节点在父节点里占的 field。没有映射到任何组的
+  capture 也会以 `(no group)` 列出——token 完全没被着色时，那就是答案。
+- `:TsHlInspect!` 连同未被采用的 capture 一起解析 link 链。
+- daemon 侧新增 `inspect` 请求与 `inspect` 能力位，复用 `map_capture_to_group`
+  与 `capture_priority`，"被画出来的那一个"用 `run_highlight_cached` 同一条优先级
+  规则标记，因此报告不会和渲染结果脱节。列号会夹进本行并回退到 UTF-8 边界，
+  否则一个落在多字节字符中间的偏移会描述到旁边的 token 上。
+- 位置在按键时刻捕获，回复按 revision 校验：报告不会描述已经改掉的文本。默认渲染
+  为光标处 popup，`g:simpletreesitter_inspect_popup = 0` 改用可搜索可复制的
+  `ts-hl-inspect` scratch split。旧 daemon 没有该能力位时给出的是一句可执行的
+  提示，而不是 `unknown variant`。
+
 ### Outline 变成每标签页一份
 
 - 此前 Outline 是一份全局单例，而它的窗口 id 用 `win_id2win()` 探测——那是标签页

@@ -72,6 +72,10 @@ g:simpletreesitter_rainbow_brackets = get(g:, 'simpletreesitter_rainbow_brackets
 # =============== Tree-sitter 折叠 ===============
 g:simpletreesitter_folds = get(g:, 'simpletreesitter_folds', 0)
 
+# =============== :TsHlInspect ===============
+# 1: 光标处弹出 popup；0: 用底部的 ts-hl-inspect scratch split（可复制/搜索）。
+g:simpletreesitter_inspect_popup = get(g:, 'simpletreesitter_inspect_popup', 1)
+
 # =============== 面包屑导航 ===============
 g:simpletreesitter_breadcrumb = get(g:, 'simpletreesitter_breadcrumb', 0)
 g:simpletreesitter_breadcrumb_separator = get(g:, 'simpletreesitter_breadcrumb_separator', ' > ')
@@ -97,6 +101,7 @@ command! TsHlOutlineToggle  call simpletreesitter#OutlineToggle()
 command! TsHlOutlineRefresh call simpletreesitter#OutlineRefresh()
 command! -nargs=* TsHlOutlineFilter call simpletreesitter#OutlineFilter(<q-args>)
 command! TsHlDumpAST        call simpletreesitter#DumpAST()
+command! -bang TsHlInspect  call simpletreesitter#Inspect(<bang>0)
 command! TsHlStatus         call simpletreesitter#Status()
 command! TsHlSymbols        call simpletreesitter#SymbolsToLoclist()
 command! -count=1 TsHlNextSymbol call simpletreesitter#NextSymbol(<count>)

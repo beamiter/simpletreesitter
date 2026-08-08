@@ -504,6 +504,73 @@ call assert_false(s:CallPrivate('BufferTextExceedsLimit', [bufnr(), 6]))
 call assert_true(s:CallPrivate('BufferTextExceedsLimit', [bufnr(), 5]))
 call delete(s:size_file)
 
+" :TsHlInspect answers "why is this token this colour, and which group do I
+" override" from the daemon's own capture/group tables.
+call assert_equal(2, exists(':TsHlInspect'))
+let g:simpletreesitter_inspect_popup = 0
+enew
+call setline(1, ['pub fn inspected() -> i32 { 42 }'])
+setfiletype rust
+let s:insp = bufnr()
+call simpletreesitter#Enable()
+sleep 300m
+call cursor(1, 5)
+call simpletreesitter#Inspect()
+sleep 300m
+let s:insp_buf = bufnr('ts-hl-inspect')
+call assert_true(s:insp_buf > 0, ':TsHlInspect produced no report')
+let s:insp_lines = getbufline(s:insp_buf, 1, '$')
+let s:insp_text = join(s:insp_lines, "\n")
+call assert_match('ts-hl inspect  rust  \[1:5\]', s:insp_lines[0])
+call assert_match('\* @keyword\s\+TSKeyword\s\+priority 3\s\+\[1:5-1:7\]', s:insp_text)
+call assert_match('Nodes (innermost first)', s:insp_text)
+call assert_match('function_item', s:insp_text)
+call assert_false(has_key(s:State().s_pending_inspect, string(s:insp)),
+      \ 'inspect reply left its pending request behind')
+execute 'bwipeout! ' . s:insp_buf
+
+" The default renderer is a popup at the cursor; both paths carry one text.
+if exists('*popup_atcursor') && exists('*popup_list')
+  let g:simpletreesitter_inspect_popup = 1
+  call popup_clear()
+  call cursor(1, 5)
+  call simpletreesitter#Inspect()
+  sleep 300m
+  let s:insp_popups = popup_list()
+  call assert_equal(1, len(s:insp_popups), ':TsHlInspect did not open a popup')
+  call assert_match('@keyword\s\+TSKeyword',
+        \ join(getbufline(winbufnr(s:insp_popups[0]), 1, '$'), "\n"))
+  call popup_clear()
+  let g:simpletreesitter_inspect_popup = 0
+endif
+
+" The report is built from the reply, not from wherever the cursor ended up,
+" and an unmapped capture is reported rather than silently dropped -- that is
+" exactly the case a query author needs to see.
+let s:insp_report = s:CallPrivate('InspectReportLines', [{
+      \ 'lnum': 7, 'col': 3,
+      \ 'captures': [
+      \   {'capture': 'keyword', 'group': 'TSKeyword', 'priority': 3,
+      \    'lnum': 7, 'col': 3, 'end_lnum': 7, 'end_col': 6, 'applied': v:true},
+      \   {'capture': 'spell', 'group': '', 'priority': 4,
+      \    'lnum': 7, 'col': 1, 'end_lnum': 7, 'end_col': 40, 'applied': v:false},
+      \ ],
+      \ 'node_chain': [
+      \   {'kind': 'fn', 'named': v:false, 'lnum': 7, 'col': 3,
+      \    'end_lnum': 7, 'end_col': 6},
+      \   {'kind': 'identifier', 'named': v:true, 'lnum': 7, 'col': 6,
+      \    'end_lnum': 7, 'end_col': 9, 'field': 'name'},
+      \ ]}, 'rust', v:false])
+let s:insp_report_text = join(s:insp_report, "\n")
+call assert_match('ts-hl inspect  rust  \[7:3\]', s:insp_report[0])
+call assert_match('@spell\s\+(no group)', s:insp_report_text,
+      \ 'an unmapped capture was dropped from the report')
+call assert_match('fn (anonymous)', s:insp_report_text)
+call assert_match('field: name', s:insp_report_text)
+" Without a bang only the capture that is actually drawn gets a link chain.
+call assert_equal(1, len(filter(copy(s:insp_report), 'v:val =~# "^  TSKeyword"')))
+call simpletreesitter#Disable()
+
 " The Outline is one sidebar per tabpage. Opening one in a second tab must not
 " orphan the first, closing one must not close the other, and :TsHlOutlineToggle
 " must never cross a tabpage boundary to close a sidebar somewhere else.

@@ -3,6 +3,7 @@
 :TsHlEnable	simpletreesitter.txt	/*:TsHlEnable*
 :TsHlFoldsToggle	simpletreesitter.txt	/*:TsHlFoldsToggle*
 :TsHlHealth	simpletreesitter.txt	/*:TsHlHealth*
+:TsHlInspect	simpletreesitter.txt	/*:TsHlInspect*
 :TsHlLog	simpletreesitter.txt	/*:TsHlLog*
 :TsHlNextSymbol	simpletreesitter.txt	/*:TsHlNextSymbol*
 :TsHlOutlineClose	simpletreesitter.txt	/*:TsHlOutlineClose*
@@ -15,6 +16,7 @@
 :TsHlStatus	simpletreesitter.txt	/*:TsHlStatus*
 :TsHlSymbols	simpletreesitter.txt	/*:TsHlSymbols*
 :TsHlToggle	simpletreesitter.txt	/*:TsHlToggle*
+g:simpletreesitter_inspect_popup	simpletreesitter.txt	/*g:simpletreesitter_inspect_popup*
 simpletreesitter	simpletreesitter.txt	/*simpletreesitter*
 simpletreesitter-commands	simpletreesitter.txt	/*simpletreesitter-commands*
 simpletreesitter-daemon	simpletreesitter.txt	/*simpletreesitter-daemon*

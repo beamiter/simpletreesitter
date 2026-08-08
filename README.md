@@ -85,6 +85,7 @@ install -m 0755 target/release/ts-hl-daemon lib/ts-hl-daemon
 | `:TsHlOutlineRefresh` | 刷新当前大纲 |
 | `:TsHlOutlineFilter [query]` | 即时过滤大纲；省略 query 清除过滤 |
 | `:TsHlDumpAST` | 打开当前 revision 的 AST 视图 |
+| `:TsHlInspect[!]` | 报告光标处匹配到的 capture、映射到的高亮组与 link 链、以及节点链；`!` 连同未被采用的 capture 一起解析 |
 | `:TsHlStatus` | 显示 daemon 协议、cache 和解析统计；不会启动 daemon |
 | `:TsHlSymbols` | 当前 buffer 符号送入 location list 并打开 |
 | `:[count]TsHlNextSymbol` / `:[count]TsHlPrevSymbol` | 在结构符号间前后跳转，到头循环 |
@@ -166,6 +167,9 @@ g:simpletreesitter_symbol_jump_kinds = [
   'function', 'method', 'class', 'struct', 'enum',
   'namespace', 'type', 'module', 'macro'
 ]  " [] 表示全部；Markdown/结构化数据自动导航全部层级
+
+" :TsHlInspect 渲染方式：1 = 光标处 popup，0 = ts-hl-inspect scratch split
+g:simpletreesitter_inspect_popup = 1
 
 " 缩进参考线
 g:simpletreesitter_indent_guides = 0

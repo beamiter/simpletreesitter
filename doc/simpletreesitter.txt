@@ -77,6 +77,28 @@ Build or update the daemon from the plugin directory: >
                                                 *:TsHlDumpAST*
 :TsHlDumpAST            Show the AST for the current buffer revision.
 
+                                                *:TsHlInspect*
+:TsHlInspect[!]         Report what the highlighter sees under the cursor:
+                        every capture matching that point, the highlight group
+                        each maps to, its priority, its span, and which one is
+                        actually drawn (marked with '*'); the 'highlight link'
+                        chain for that group, so you know the name to override;
+                        and the node chain from the innermost node up to the
+                        root with each node's field name in its parent.
+                        Captures that map to no group are listed as
+                        "(no group)" -- that is the answer when a token is not
+                        coloured at all.
+                        With !, resolve the link chain for every capture, not
+                        just the one drawn.
+                        The report is rendered in a popup at the cursor, or in
+                        a ts-hl-inspect scratch split when
+                        |g:simpletreesitter_inspect_popup| is zero.  Position
+                        is captured when you run the command, and the reply is
+                        validated against the buffer revision, so a report
+                        never describes text that has since changed.
+                        Requires a daemon advertising the "inspect" capability;
+                        rebuild with ./install.sh and :TsHlRestart otherwise.
+
                                                 *:TsHlStatus*
 :TsHlStatus             Show protocol, cache and parse statistics.  This
                         command does not start a stopped daemon.
@@ -171,6 +193,12 @@ daemon omits this additive field and keeps using the existing revision, request
 class, and kind guards. Markdown and structured-data filetypes intentionally
 navigate all extracted levels. Rebuild the daemon after updating the plugin.
 
+                                        *g:simpletreesitter_inspect_popup*
+g:simpletreesitter_inspect_popup             1
+
+Render |:TsHlInspect| in a popup at the cursor.  Set to zero for a
+ts-hl-inspect scratch split you can search, yank and keep on screen.
+
 g:simpletreesitter_indent_guides             0
 g:simpletreesitter_indent_guide_char         '│'
 g:simpletreesitter_breadcrumb                0
@@ -195,6 +223,7 @@ Disable one buffer with: >
 
 "daemon not found"          Run ./install.sh or set the daemon path.
 "protocol is outdated"      Rebuild the daemon after updating the plugin.
+Wrong colour on a token     Run |:TsHlInspect| on it.
 Large buffer is skipped      Raise max_buffer_bytes or set it to zero.
 Icons look incorrect         Disable outline_fancy or enable outline_ascii.
 

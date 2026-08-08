@@ -113,6 +113,17 @@ enum Request {
     },
     #[serde(rename = "dump_ast")]
     DumpAst { buf: i64, lang: String },
+    /// Report what the highlighter sees at one point: which captures matched
+    /// there, which group each maps to, and the enclosing node chain. Read-only
+    /// and cheap — one point query, no state.
+    #[serde(rename = "inspect")]
+    Inspect {
+        buf: i64,
+        lang: String,
+        /// 1-based line and byte column, matching Vim's line()/col().
+        lnum: u32,
+        col: u32,
+    },
     #[serde(rename = "close_buffer")]
     CloseBuffer { buf: i64 },
     #[serde(rename = "status")]
@@ -151,6 +162,15 @@ enum Event {
         buf: i64,
         revision: u64,
         folds: Vec<Fold>,
+    },
+    #[serde(rename = "inspect")]
+    Inspect {
+        buf: i64,
+        revision: u64,
+        lnum: u32,
+        col: u32,
+        captures: Vec<InspectCapture>,
+        node_chain: Vec<InspectNode>,
     },
     #[serde(rename = "ok")]
     Ok {
@@ -204,6 +224,43 @@ struct Span {
     group: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     depth: Option<u32>,
+}
+
+/// One highlight capture covering the inspected point.
+#[derive(Debug, Serialize, Clone)]
+struct InspectCapture {
+    /// Capture name as written in the .scm query, without the leading '@'.
+    capture: String,
+    /// Result of `map_capture_to_group`; empty when the capture is not mapped
+    /// to any group, which is itself the answer to "why is this not coloured".
+    group: &'static str,
+    priority: u8,
+    lnum: u32,
+    col: u32,
+    end_lnum: u32,
+    end_col: u32,
+    /// True when this capture is the one the renderer would keep for its exact
+    /// span. Computed with the same priority rule `run_highlight_cached` uses,
+    /// so the report cannot claim a colour the highlighter does not draw.
+    applied: bool,
+    /// Set when the capture came from an injected grammar's query rather than
+    /// the host language's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    injected_lang: Option<&'static str>,
+}
+
+/// One node on the path from the innermost node at the point up to the root.
+#[derive(Debug, Serialize, Clone)]
+struct InspectNode {
+    kind: String,
+    named: bool,
+    lnum: u32,
+    col: u32,
+    end_lnum: u32,
+    end_col: u32,
+    /// The field name this node occupies in its parent, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -971,6 +1028,33 @@ fn serve() -> Result<()> {
                     },
                 )?,
             },
+            Request::Inspect {
+                buf,
+                lang,
+                lnum,
+                col,
+            } => match inspect_cached(&mut server, buf, &lang, lnum, col) {
+                Ok((revision, captures, node_chain)) => send(
+                    &mut out,
+                    &Event::Inspect {
+                        buf,
+                        revision,
+                        lnum,
+                        col,
+                        captures,
+                        node_chain,
+                    },
+                )?,
+                Err(e) => send(
+                    &mut out,
+                    &Event::Error {
+                        message: e.to_string(),
+                        buf: Some(buf),
+                        op: Some("inspect"),
+                        request_id: None,
+                    },
+                )?,
+            },
             Request::CloseBuffer { buf } => {
                 server.cache.remove(&buf);
                 send(
@@ -1013,6 +1097,7 @@ fn serve() -> Result<()> {
                             "symbol_kind_filter",
                             "error_op",
                             "symbol_request_id",
+                            "inspect",
                         ],
                     },
                 )?;
@@ -2162,6 +2247,158 @@ fn starts_with_vim_keyword(line: &str, keyword: &str) -> bool {
     rest.is_empty() || rest.starts_with(char::is_whitespace)
 }
 
+/// Byte offset of a 1-based (line, byte column) pair, clamped into the line and
+/// snapped back to a UTF-8 boundary. Vim's col() counts bytes, so a cursor
+/// sitting on a continuation byte of a multi-byte character is impossible from
+/// Vim itself but trivially reachable from a script; a mid-character offset
+/// would make `descendant_for_byte_range` describe a neighbouring token.
+fn point_byte_offset(cache: &BufCache, lnum: u32, col: u32) -> usize {
+    let start = cache.line_index.line_start_byte(&cache.text, lnum.max(1));
+    let mut end = cache
+        .line_index
+        .line_start_byte(&cache.text, lnum.max(1).saturating_add(1))
+        .min(cache.text.len());
+    if end > start && cache.text.as_bytes()[end - 1] == b'\n' {
+        end -= 1;
+    }
+    let mut offset = start
+        .saturating_add(col.max(1).saturating_sub(1) as usize)
+        .min(end.max(start));
+    while offset > start && !cache.text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn inspect_node(node: tree_sitter::Node) -> InspectNode {
+    let sp = node.start_position();
+    let ep = node.end_position();
+    InspectNode {
+        kind: node.kind().to_string(),
+        named: node.is_named(),
+        lnum: sp.row as u32 + 1,
+        col: sp.column as u32 + 1,
+        end_lnum: ep.row as u32 + 1,
+        end_col: ep.column as u32 + 1,
+        field: None,
+    }
+}
+
+fn inspect_cached(
+    server: &mut Server,
+    buf: i64,
+    lang: &str,
+    lnum: u32,
+    col: u32,
+) -> Result<(u64, Vec<InspectCapture>, Vec<InspectNode>)> {
+    server.ensure_queries(lang)?;
+    let cache = server.get_cache(buf, lang)?;
+    let bytes = cache.text.as_bytes();
+    let root = cache.tree.root_node();
+    let offset = point_byte_offset(cache, lnum, col);
+    let lang_queries = server.queries.get(&cache.lang).unwrap();
+
+    // Node chain, innermost first. `field` is read from the parent because a
+    // node does not know which slot it fills.
+    let mut node_chain = Vec::new();
+    if let Some(innermost) = root.descendant_for_byte_range(offset, offset) {
+        let mut current = Some(innermost);
+        while let Some(node) = current {
+            let mut entry = inspect_node(node);
+            if let Some(parent) = node.parent() {
+                let mut cursor = parent.walk();
+                if cursor.goto_first_child() {
+                    loop {
+                        if cursor.node() == node {
+                            entry.field = cursor.field_name().map(str::to_string);
+                            break;
+                        }
+                        if !cursor.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+            }
+            node_chain.push(entry);
+            if node_chain.len() >= MAX_AST_DEPTH {
+                break;
+            }
+            current = node.parent();
+        }
+    }
+
+    // Same passes as run_highlight_cached, so an injected grammar's captures
+    // show up here exactly when they show up on screen.
+    let mut passes: Vec<(&tree_sitter::Query, tree_sitter::Node, Option<&'static str>)> =
+        vec![(&lang_queries.hl_query, root, None)];
+    if let (Some(inline_query), Some(inline_tree)) =
+        (&lang_queries.inline_hl_query, &cache.inline_tree)
+    {
+        passes.push((
+            inline_query,
+            inline_tree.root_node(),
+            Some("markdown_inline"),
+        ));
+    }
+
+    let mut captures: Vec<InspectCapture> = Vec::new();
+    for (query, pass_root, injected_lang) in passes {
+        let mut cursor = tree_sitter::QueryCursor::new();
+        cursor.set_byte_range(offset..offset.saturating_add(1));
+        let mut it = cursor.captures(query, pass_root, bytes);
+        while let Some((m, cap_ix)) = it.next() {
+            let node = m.captures[*cap_ix].node;
+            // set_byte_range only bounds which patterns are considered; a match
+            // may still report a capture that does not cover the point.
+            if node.start_byte() > offset || node.end_byte() <= offset {
+                continue;
+            }
+            let sp = node.start_position();
+            let ep = node.end_position();
+            let name = query.capture_names()[m.captures[*cap_ix].index as usize];
+            captures.push(InspectCapture {
+                capture: name.to_string(),
+                group: map_capture_to_group(name),
+                priority: capture_priority(name),
+                lnum: sp.row as u32 + 1,
+                col: sp.column as u32 + 1,
+                end_lnum: ep.row as u32 + 1,
+                end_col: ep.column as u32 + 1,
+                applied: false,
+                injected_lang,
+            });
+        }
+    }
+
+    // Mark the winner per exact span with the rule run_highlight_cached applies:
+    // strictly greater priority replaces, so the first of a tie survives.
+    let mut winners = HashMap::<(u32, u32, u32, u32), usize>::new();
+    for index in 0..captures.len() {
+        if captures[index].group.is_empty() {
+            continue;
+        }
+        let key = (
+            captures[index].lnum,
+            captures[index].col,
+            captures[index].end_lnum,
+            captures[index].end_col,
+        );
+        match winners.get(&key) {
+            Some(&best) if captures[index].priority <= captures[best].priority => {}
+            _ => {
+                winners.insert(key, index);
+            }
+        }
+    }
+    for index in winners.into_values() {
+        captures[index].applied = true;
+    }
+    // Most specific first: the report's first line should be the answer.
+    captures.sort_by_key(|capture| std::cmp::Reverse(capture.priority));
+
+    Ok((cache.revision, captures, node_chain))
+}
+
 fn dump_ast_cached(server: &mut Server, buf: i64, lang: &str) -> Result<(u64, Vec<String>)> {
     let cache = server.get_cache(buf, lang)?;
     let root = cache.tree.root_node();
@@ -2996,6 +3233,87 @@ mod tests {
             .count();
         assert!(keyword_count >= 4, "keyword spans: {spans:?}");
         assert!(spans.iter().all(|span| span.depth.is_none()));
+    }
+
+    /// `:TsHlInspect` must answer "why is this token this colour, and which
+    /// group do I override" with the same facts the renderer used.
+    #[test]
+    fn inspect_reports_captures_groups_and_the_node_chain() {
+        let mut server = Server::new();
+        let source = "pub fn answer() -> i32 { 42 }\n";
+        server.set_text(1, "rust", source.to_string(), 7).unwrap();
+        // Column 5 is the 'f' of `fn`.
+        let (revision, captures, chain) = inspect_cached(&mut server, 1, "rust", 1, 5).unwrap();
+        assert_eq!(revision, 7);
+
+        let keyword = captures
+            .iter()
+            .find(|capture| capture.capture == "keyword")
+            .unwrap_or_else(|| panic!("no @keyword capture: {captures:?}"));
+        assert_eq!(keyword.group, "TSKeyword");
+        assert_eq!(keyword.priority, capture_priority("keyword"));
+        assert_eq!((keyword.lnum, keyword.col), (1, 5));
+        assert_eq!((keyword.end_lnum, keyword.end_col), (1, 7));
+        assert!(keyword.applied, "the winning capture was not marked");
+        // Highest priority first, so the first line of the report is the answer.
+        assert_eq!(captures.first().map(|c| c.priority), Some(keyword.priority));
+
+        // Innermost first, up to the root, with parent field names attached.
+        assert_eq!(chain.first().map(|node| node.kind.as_str()), Some("fn"));
+        assert_eq!(
+            chain.last().map(|node| node.kind.as_str()),
+            Some("source_file")
+        );
+        let function = chain
+            .iter()
+            .find(|node| node.kind == "function_item")
+            .unwrap_or_else(|| panic!("no enclosing function_item: {chain:?}"));
+        assert_eq!((function.lnum, function.end_lnum), (1, 1));
+
+        // Column 8 is the function's name; a node that fills a named slot in
+        // its parent reports which slot, which is what makes the chain usable
+        // for writing a query.
+        let (_, name_captures, name_chain) = inspect_cached(&mut server, 1, "rust", 1, 8).unwrap();
+        assert_eq!(
+            name_chain.first().map(|node| node.field.as_deref()),
+            Some(Some("name")),
+            "innermost node did not report its parent field: {name_chain:?}"
+        );
+        assert!(
+            name_captures
+                .iter()
+                .any(|capture| capture.group == "TSFunction"),
+            "function name is not captured as a function: {name_captures:?}"
+        );
+    }
+
+    /// A byte column landing inside a multi-byte character must not describe a
+    /// neighbouring token, and a column past the end of the line must clamp.
+    #[test]
+    fn inspect_clamps_columns_to_the_line_and_to_utf8_boundaries() {
+        let mut server = Server::new();
+        let source = "let s = \"héllo\";\nlet t = 1;\n";
+        server.set_text(1, "rust", source.to_string(), 1).unwrap();
+        // 'é' starts at byte column 11 and occupies columns 11-12.
+        let (_, mid_char, _) = inspect_cached(&mut server, 1, "rust", 1, 12).unwrap();
+        let (_, boundary, _) = inspect_cached(&mut server, 1, "rust", 1, 11).unwrap();
+        assert_eq!(
+            mid_char
+                .iter()
+                .map(|c| (c.capture.as_str(), c.col))
+                .collect::<Vec<_>>(),
+            boundary
+                .iter()
+                .map(|c| (c.capture.as_str(), c.col))
+                .collect::<Vec<_>>(),
+        );
+
+        // Well past the end of line 1: still line 1, never line 2's content.
+        let (_, _, chain) = inspect_cached(&mut server, 1, "rust", 1, 9_000).unwrap();
+        assert!(
+            chain.iter().all(|node| node.lnum <= 1),
+            "clamped column escaped its line: {chain:?}"
+        );
     }
 
     #[test]
