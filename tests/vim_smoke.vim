@@ -942,6 +942,106 @@ call assert_equal(2, exists(':TsHlSelect'))
 call assert_equal(['function.inner', 'function.outer'],
       \ sort(simpletreesitter#SelectComplete('function', '', 0)))
 
+" ---------------------------------------------------------------------------
+" protocol v7: compact spans and suppressed unchanged payloads
+" ---------------------------------------------------------------------------
+call assert_true(get(s:State().s_daemon_capabilities, 'compact_spans', v:false),
+      \ 'daemon did not advertise compact_spans')
+call assert_true(get(s:State().s_daemon_capabilities, 'payload_digest', v:false),
+      \ 'daemon did not advertise payload_digest')
+
+" The compact encoding is a second decoder for the same data, so what matters is
+" that it decodes to exactly what the object form produced -- rainbow bracket
+" depth, the one per-span rewrite rule, included.  Applied to a buffer the
+" plugin does not manage, so no daemon reply can repaint it between the calls.
+enew
+call setline(1, ['fn zeta() { let v = (1, (2, 3)); }'])
+let s:cmp = bufnr()
+let s:objects = {'buf': s:cmp, 'revision': 0, 'spans': [
+      \ {'lnum': 1, 'col': 1, 'end_lnum': 1, 'end_col': 3, 'group': 'TSKeyword'},
+      \ {'lnum': 1, 'col': 21, 'end_lnum': 1, 'end_col': 22, 'group': 'TSPunctBracket', 'depth': 1},
+      \ {'lnum': 1, 'col': 25, 'end_lnum': 1, 'end_col': 26, 'group': 'TSPunctBracket', 'depth': 2},
+      \ {'lnum': 1, 'col': 13, 'end_lnum': 1, 'end_col': 16, 'group': 'TSKeyword'}]}
+let s:compact = {'buf': s:cmp, 'revision': 0,
+      \ 'groups': ['TSKeyword', 'TSPunctBracket'],
+      \ 'cspans': [[1, 1, 1, 3, 0, 0], [1, 21, 1, 22, 1, 1],
+      \            [1, 25, 1, 26, 1, 2], [1, 13, 1, 16, 0, 0]]}
+call s:CallPrivate('ApplyHighlights', [s:cmp, s:objects])
+let s:from_objects = map(prop_list(1, {'bufnr': s:cmp}), '[v:val.col, v:val.length, v:val.type]')
+call s:CallPrivate('ApplyHighlights', [s:cmp, s:compact])
+let s:from_compact = map(prop_list(1, {'bufnr': s:cmp}), '[v:val.col, v:val.length, v:val.type]')
+call assert_equal(4, len(s:from_objects), 'the object form did not apply every span')
+call assert_equal(s:from_objects, s:from_compact,
+      \ 'the compact span encoding decoded differently from the object form')
+call assert_true(!empty(filter(copy(s:from_objects), 'v:val[2] =~# "Rainbow"')),
+      \ 'rainbow bracket depth was lost')
+
+" An unchanged payload is applied by doing nothing, so every consumer has to
+" already hold it.  Edit a literal without moving a byte of any symbol and the
+" daemon must answer `unchanged` -- and the outline must still be there
+" afterwards, which is exactly what a wrong suppression breaks.
+enew
+call setline(1, ['pub fn alpha() {', '    let n = 1;', '}', '',
+      \ 'pub fn beta() {', '    let m = 2;', '}'])
+setfiletype rust
+let s:v7 = bufnr()
+let g:simpletreesitter_breadcrumb = 1
+let g:simpletreesitter_folds = 1
+call simpletreesitter#OutlineOpen()
+sleep 400m
+let s:v7_outline = bufnr('ts-hl-outline')
+call assert_match('alpha', join(getbufline(s:v7_outline, 1, '$'), "\n"),
+      \ 'the outline never rendered the source symbols')
+let s:v7_digest = get(s:State().s_symbols_digest, s:v7, '')
+call assert_notequal('', s:v7_digest, 'no symbols digest was recorded')
+call assert_notequal('', get(s:State().s_folds_digest, s:v7, ''),
+      \ 'no folds digest was recorded')
+call assert_equal(s:v7_digest, s:CallPrivate('SymbolsDigestToSend', [s:v7]),
+      \ 'the digest was withheld although every consumer holds that payload')
+
+let g:simpletreesitter_log_file = '/tmp/simpletreesitter-v7.log'
+call delete(g:simpletreesitter_log_file)
+let g:simpletreesitter_debug = 1
+call win_gotoid(win_findbuf(s:v7)[0])
+call setline(2, '    let n = 2;')
+call simpletreesitter#OnBufEvent(s:v7)
+sleep 500m
+let g:simpletreesitter_debug = 0
+let s:v7_log = filereadable(g:simpletreesitter_log_file)
+      \ ? readfile(g:simpletreesitter_log_file) : []
+call assert_true(!empty(filter(copy(s:v7_log), 'v:val =~# "Symbols unchanged"')),
+      \ 'an identical symbol payload was sent again instead of being suppressed')
+call assert_true(!empty(filter(copy(s:v7_log), 'v:val =~# "Folds unchanged"')),
+      \ 'an identical fold payload was sent again instead of being suppressed')
+call assert_equal(s:v7_digest, get(s:State().s_symbols_digest, s:v7, ''),
+      \ 'the digest moved although the payload did not')
+call assert_match('alpha', join(getbufline(s:v7_outline, 1, '$'), "\n"),
+      \ 'a suppressed payload emptied the outline')
+call assert_equal('simpletreesitter#FoldExpr(v:lnum)', &l:foldexpr,
+      \ 'the fold expression was lost')
+
+" A consumer that no longer holds the payload must not be offered the digest:
+" the breadcrumb and the outline both follow the cursor to another buffer, and
+" answering `unchanged` there would leave them describing this one forever.
+enew
+call setline(1, ['pub fn gamma() {', '}'])
+setfiletype rust
+let s:v7b = bufnr()
+call simpletreesitter#OnBufEvent(s:v7b)
+sleep 400m
+call assert_notequal(s:v7, s:State().s_bc_items_buf,
+      \ 'the breadcrumb never followed the cursor to the second buffer')
+call assert_equal('', s:CallPrivate('SymbolsDigestToSend', [s:v7]),
+      \ 'the digest was offered while its consumers held another buffer')
+" Fold levels are sized by the buffer, so a buffer with no fold data of the
+" right length can never be answered with `unchanged`.
+call assert_equal('', s:CallPrivate('FoldsDigestToSend', [s:v7 + 100000]),
+      \ 'a buffer with no fold data was offered a digest')
+
+let g:simpletreesitter_breadcrumb = 0
+let g:simpletreesitter_folds = 0
+call delete(g:simpletreesitter_log_file)
+
 call simpletreesitter#Disable()
 
 if !empty(v:errors)

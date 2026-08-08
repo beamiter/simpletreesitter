@@ -26,7 +26,7 @@ const SUPPORTED_LANGUAGES: &[&str] = &[
     "css",
     "markdown",
 ];
-const PROTOCOL_VERSION: u32 = 6;
+const PROTOCOL_VERSION: u32 = 7;
 
 const MAX_AST_NODES: usize = 50_000;
 const MAX_AST_DEPTH: usize = 512;
@@ -49,6 +49,104 @@ const MAX_INJECTED_RANGES: usize = 8_192;
 
 fn default_true() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// FNV-1a over the fields of a reply, used to answer "is this the same payload
+/// I already sent you?" without sending it.
+///
+/// Written out rather than taken from `DefaultHasher` because the value goes on
+/// the wire and comes back from the client: `SipHasher`'s per-process random
+/// keys would make every digest a client saved across a daemon restart compare
+/// unequal, and its exact output is explicitly not a stable API.
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    fn new() -> Self {
+        Fnv1a(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    /// Length-prefixed, so that ("ab", "c") and ("a", "bc") cannot collide —
+    /// adjacent symbol names and kinds are exactly the fields most likely to
+    /// shift a character across a boundary as the user types.
+    fn str(&mut self, value: &str) {
+        self.u32(value.len() as u32);
+        self.bytes(value.as_bytes());
+    }
+
+    /// Decimal, and therefore never the empty string, which is the wire's
+    /// "I hold no payload for this buffer".
+    fn finish(self) -> String {
+        self.0.to_string()
+    }
+}
+
+fn digest_symbols(symbols: &[Symbol]) -> String {
+    let mut hash = Fnv1a::new();
+    hash.u32(symbols.len() as u32);
+    for symbol in symbols {
+        hash.str(&symbol.name);
+        hash.str(symbol.kind);
+        hash.u32(symbol.lnum);
+        hash.u32(symbol.col);
+        hash.u32(symbol.end_lnum);
+        hash.u32(symbol.end_col);
+        hash.str(symbol.container_kind.unwrap_or(""));
+        hash.str(symbol.container_name.as_deref().unwrap_or(""));
+        hash.u32(symbol.container_lnum.unwrap_or(0));
+        hash.u32(symbol.container_col.unwrap_or(0));
+    }
+    hash.finish()
+}
+
+fn digest_folds(folds: &[Fold]) -> String {
+    let mut hash = Fnv1a::new();
+    hash.u32(folds.len() as u32);
+    for fold in folds {
+        hash.u32(fold.lnum);
+        hash.u32(fold.end_lnum);
+        hash.u32(fold.level);
+    }
+    hash.finish()
+}
+
+/// Split spans into a group-name dictionary and fixed-width rows.
+///
+/// Group names come from one static table, so the dictionary is at most the
+/// size of that table however many spans there are.
+fn compact_spans(spans: &[Span]) -> (Vec<&'static str>, Vec<[u32; 6]>) {
+    let mut groups: Vec<&'static str> = Vec::new();
+    let mut index: HashMap<&'static str, u32> = HashMap::new();
+    let mut rows: Vec<[u32; 6]> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let group = *index.entry(span.group).or_insert_with(|| {
+            groups.push(span.group);
+            (groups.len() - 1) as u32
+        });
+        rows.push([
+            span.lnum,
+            span.col,
+            span.end_lnum,
+            span.end_col,
+            group,
+            span.depth.unwrap_or(0),
+        ]);
+    }
+    (groups, rows)
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +189,12 @@ enum Request {
         rainbow: bool,
         #[serde(default)]
         max_spans: Option<usize>,
+        /// Ask for the protocol-v7 compact span encoding. Opt-in per request
+        /// rather than negotiated in `hello`, so a client that downgrades mid
+        /// session (or a second client on the same daemon) cannot be handed an
+        /// encoding it does not parse.
+        #[serde(default)]
+        compact: bool,
     },
     #[serde(rename = "symbols")]
     Symbols {
@@ -111,6 +215,11 @@ enum Request {
         /// structural symbol.
         #[serde(default)]
         kinds: Vec<String>,
+        /// Digest of the payload the client still holds for this buffer, from
+        /// an earlier reply's `digest`. When it matches what this request would
+        /// produce, the reply carries `unchanged` and no `symbols` array.
+        #[serde(default)]
+        have_digest: String,
     },
     #[serde(rename = "folds")]
     Folds {
@@ -118,6 +227,9 @@ enum Request {
         lang: String,
         #[serde(default)]
         max_items: Option<usize>,
+        /// See `Symbols::have_digest`.
+        #[serde(default)]
+        have_digest: String,
     },
     #[serde(rename = "dump_ast")]
     DumpAst { buf: i64, lang: String },
@@ -163,14 +275,37 @@ enum Event {
     Highlights {
         buf: i64,
         revision: u64,
-        spans: Vec<Span>,
+        /// Protocol v6 object form, one JSON object per span. Omitted when the
+        /// request asked for the compact encoding below.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spans: Option<Vec<Span>>,
+        /// Compact encoding (v7): the group-name dictionary, plus one fixed
+        /// list per span holding [lnum, col, end_lnum, end_col, group_index,
+        /// depth]. A highlight reply repeats the same thirty-odd group names
+        /// and the same six key names thousands of times; hoisting both out
+        /// costs about two thirds of the bytes and turns six dictionary
+        /// lookups per span into list indexing on the Vim side.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        groups: Option<Vec<&'static str>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cspans: Option<Vec<[u32; 6]>>,
     },
     #[serde(rename = "symbols")]
     Symbols {
         buf: i64,
         revision: u64,
         request_id: u64,
-        symbols: Vec<Symbol>,
+        /// Absent exactly when `unchanged` is set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        symbols: Option<Vec<Symbol>>,
+        /// Digest of the payload this reply describes, for the client to send
+        /// back as `have_digest` next time. A decimal string, not a number:
+        /// Vim's json_decode() rounds integers above 2^53 through a float.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        digest: String,
+        /// The client already holds this exact payload; `symbols` is omitted.
+        #[serde(skip_serializing_if = "is_false")]
+        unchanged: bool,
     },
     #[serde(rename = "ast")]
     Ast {
@@ -182,7 +317,13 @@ enum Event {
     Folds {
         buf: i64,
         revision: u64,
-        folds: Vec<Fold>,
+        /// Absent exactly when `unchanged` is set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        folds: Option<Vec<Fold>>,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        digest: String,
+        #[serde(skip_serializing_if = "is_false")]
+        unchanged: bool,
     },
     #[serde(rename = "inspect")]
     Inspect {
@@ -1061,17 +1202,28 @@ fn serve() -> Result<()> {
                 lend,
                 rainbow,
                 max_spans,
+                compact,
             } => {
                 let lrange = lstart.zip(lend);
                 match run_highlight_cached(&mut server, buf, &lang, lrange, rainbow, max_spans) {
-                    Ok((revision, spans)) => send(
-                        &mut out,
-                        &Event::Highlights {
-                            buf,
-                            revision,
-                            spans,
-                        },
-                    )?,
+                    Ok((revision, spans)) => {
+                        let (groups, cspans) = if compact {
+                            let (groups, rows) = compact_spans(&spans);
+                            (Some(groups), Some(rows))
+                        } else {
+                            (None, None)
+                        };
+                        send(
+                            &mut out,
+                            &Event::Highlights {
+                                buf,
+                                revision,
+                                spans: if compact { None } else { Some(spans) },
+                                groups,
+                                cspans,
+                            },
+                        )?
+                    }
                     Err(e) => send(
                         &mut out,
                         &Event::Error {
@@ -1091,6 +1243,7 @@ fn serve() -> Result<()> {
                 lend,
                 max_items,
                 kinds,
+                have_digest,
             } => {
                 let lrange = lstart.zip(lend);
                 match run_symbols_cached_filtered(
@@ -1101,15 +1254,21 @@ fn serve() -> Result<()> {
                     max_items,
                     &kinds,
                 ) {
-                    Ok((revision, symbols)) => send(
-                        &mut out,
-                        &Event::Symbols {
-                            buf,
-                            revision,
-                            request_id,
-                            symbols,
-                        },
-                    )?,
+                    Ok((revision, symbols)) => {
+                        let digest = digest_symbols(&symbols);
+                        let unchanged = !have_digest.is_empty() && have_digest == digest;
+                        send(
+                            &mut out,
+                            &Event::Symbols {
+                                buf,
+                                revision,
+                                request_id,
+                                symbols: if unchanged { None } else { Some(symbols) },
+                                digest,
+                                unchanged,
+                            },
+                        )?
+                    }
                     Err(e) => send(
                         &mut out,
                         &Event::Error {
@@ -1125,15 +1284,22 @@ fn serve() -> Result<()> {
                 buf,
                 lang,
                 max_items,
+                have_digest,
             } => match run_folds_cached(&server, buf, &lang, max_items) {
-                Ok((revision, folds)) => send(
-                    &mut out,
-                    &Event::Folds {
-                        buf,
-                        revision,
-                        folds,
-                    },
-                )?,
+                Ok((revision, folds)) => {
+                    let digest = digest_folds(&folds);
+                    let unchanged = !have_digest.is_empty() && have_digest == digest;
+                    send(
+                        &mut out,
+                        &Event::Folds {
+                            buf,
+                            revision,
+                            folds: if unchanged { None } else { Some(folds) },
+                            digest,
+                            unchanged,
+                        },
+                    )?
+                }
                 Err(e) => send(
                     &mut out,
                     &Event::Error {
@@ -1265,6 +1431,8 @@ fn serve() -> Result<()> {
                             "inspect",
                             "scope",
                             "injections",
+                            "payload_digest",
+                            "compact_spans",
                         ],
                     },
                 )?;
@@ -3599,7 +3767,9 @@ mod tests {
             buf: 3,
             revision: 9,
             request_id: 77,
-            symbols: Vec::new(),
+            symbols: Some(Vec::new()),
+            digest: digest_symbols(&[]),
+            unchanged: false,
         })
         .unwrap();
         assert_eq!(success["request_id"], 77);
@@ -4696,6 +4866,163 @@ mod tests {
         // 单行函数不产生折叠
         assert!(!folds.iter().any(|fold| fold.lnum == 6));
         assert_eq!(folds.len(), 2);
+    }
+
+    #[test]
+    fn payload_digests_track_content_and_not_revision() {
+        let mut server = Server::new();
+        let source = "fn outer() {\n    let x = 1;\n}\n";
+        server.set_text(1, "rust", source.to_string(), 1).unwrap();
+        let (_, symbols) =
+            run_symbols_cached_filtered(&mut server, 1, "rust", None, None, &[]).expect("symbols");
+        let (_, folds) = run_folds_cached(&server, 1, "rust", None).expect("folds");
+        let sym_digest = digest_symbols(&symbols);
+        let fold_digest = digest_folds(&folds);
+
+        // Editing inside a body is the common keystroke: same symbols, same
+        // folds, new revision. The digest must not move, or the suppression
+        // never fires where it matters most.
+        server
+            .set_text(
+                1,
+                "rust",
+                "fn outer() {\n    let x = 12;\n}\n".to_string(),
+                2,
+            )
+            .unwrap();
+        let (revision, symbols) =
+            run_symbols_cached_filtered(&mut server, 1, "rust", None, None, &[]).expect("symbols");
+        assert_eq!(revision, 2);
+        assert_eq!(digest_symbols(&symbols), sym_digest);
+        let (_, folds) = run_folds_cached(&server, 1, "rust", None).expect("folds");
+        assert_eq!(digest_folds(&folds), fold_digest);
+
+        // A rename of the same length moves no position and changes no count:
+        // only the length-prefixed name bytes distinguish it.
+        server
+            .set_text(
+                1,
+                "rust",
+                "fn outre() {\n    let x = 12;\n}\n".to_string(),
+                3,
+            )
+            .unwrap();
+        let (_, symbols) =
+            run_symbols_cached_filtered(&mut server, 1, "rust", None, None, &[]).expect("symbols");
+        assert_ne!(digest_symbols(&symbols), sym_digest);
+
+        // Growing the body moves the fold's end line.
+        server
+            .set_text(
+                1,
+                "rust",
+                "fn outre() {\n    let x = 12;\n    let y = 2;\n}\n".to_string(),
+                4,
+            )
+            .unwrap();
+        let (_, folds) = run_folds_cached(&server, 1, "rust", None).expect("folds");
+        assert_ne!(digest_folds(&folds), fold_digest);
+    }
+
+    #[test]
+    fn a_matching_have_digest_suppresses_the_payload() {
+        // The reply's own fields, exactly as the dispatcher assembles them.
+        let mut server = Server::new();
+        server
+            .set_text(1, "rust", "fn a() {\n    let x = 1;\n}\n".to_string(), 1)
+            .unwrap();
+        let (revision, symbols) =
+            run_symbols_cached_filtered(&mut server, 1, "rust", None, None, &[]).expect("symbols");
+        assert!(!symbols.is_empty());
+        let digest = digest_symbols(&symbols);
+
+        let fresh = serde_json::to_value(Event::Symbols {
+            buf: 1,
+            revision,
+            request_id: 1,
+            symbols: Some(symbols.clone()),
+            digest: digest.clone(),
+            unchanged: false,
+        })
+        .unwrap();
+        assert!(fresh["symbols"].is_array());
+        assert_eq!(fresh["digest"], serde_json::Value::String(digest.clone()));
+        // `unchanged` is skipped when false so a v6 client sees the v6 shape.
+        assert!(fresh.get("unchanged").is_none());
+
+        let suppressed = serde_json::to_value(Event::Symbols {
+            buf: 1,
+            revision,
+            request_id: 2,
+            symbols: None,
+            digest: digest.clone(),
+            unchanged: true,
+        })
+        .unwrap();
+        assert!(suppressed.get("symbols").is_none());
+        assert_eq!(suppressed["unchanged"], true);
+
+        // A client that sends no digest is never suppressed, whatever the
+        // payload — that is what makes the optimisation opt-in.
+        let request: Request = serde_json::from_str(r#"{"type":"symbols","buf":1,"lang":"rust"}"#)
+            .expect("legacy symbols request");
+        match request {
+            Request::Symbols { have_digest, .. } => assert_eq!(have_digest, ""),
+            _ => panic!("wrong request variant"),
+        }
+        let request: Request =
+            serde_json::from_str(r#"{"type":"folds","buf":1,"lang":"rust","have_digest":"42"}"#)
+                .expect("folds request");
+        match request {
+            Request::Folds { have_digest, .. } => assert_eq!(have_digest, "42"),
+            _ => panic!("wrong request variant"),
+        }
+    }
+
+    #[test]
+    fn the_compact_span_encoding_reproduces_the_object_form() {
+        let mut server = Server::new();
+        let source = "fn main() {\n    let v = vec![(1, 2)];\n}\n";
+        server.set_text(1, "rust", source.to_string(), 1).unwrap();
+        let (_, spans) = run_highlight_cached(&mut server, 1, "rust", None, true, None).unwrap();
+        assert!(spans.len() > 5);
+        let (groups, rows) = compact_spans(&spans);
+        assert_eq!(rows.len(), spans.len());
+        // The dictionary is deduplicated: `fn`/`let` share one group entry.
+        assert!(groups.len() < spans.len());
+        for (span, row) in spans.iter().zip(rows.iter()) {
+            assert_eq!(
+                [span.lnum, span.col, span.end_lnum, span.end_col],
+                [row[0], row[1], row[2], row[3]]
+            );
+            assert_eq!(groups[row[4] as usize], span.group);
+            assert_eq!(span.depth.unwrap_or(0), row[5]);
+        }
+        // Rainbow depth survives: the brackets in this source are nested.
+        assert!(rows.iter().any(|row| row[5] > 1));
+
+        // Only the asked-for encoding goes on the wire; a v6 client that never
+        // sends `compact` must keep seeing `spans`.
+        let compact = serde_json::to_value(Event::Highlights {
+            buf: 1,
+            revision: 1,
+            spans: None,
+            groups: Some(groups),
+            cspans: Some(rows),
+        })
+        .unwrap();
+        assert!(compact.get("spans").is_none());
+        assert_eq!(compact["cspans"][0].as_array().unwrap().len(), 6);
+        let legacy = serde_json::to_value(Event::Highlights {
+            buf: 1,
+            revision: 1,
+            spans: Some(spans),
+            groups: None,
+            cspans: None,
+        })
+        .unwrap();
+        assert!(legacy.get("cspans").is_none());
+        assert!(legacy["spans"].is_array());
     }
 
     #[test]

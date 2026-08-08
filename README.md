@@ -20,6 +20,10 @@
   `<script>`/`<style>` 分别用对应语法解析并高亮，坐标仍在宿主文档里；注入区间内
   宿主自己的 capture 会被丢弃，围栏不再被一整片 `@text.literal` 盖住。未知或无标记
   的围栏保持原样。注入深度为 1，每种语言每次同步只解析一遍。
+- 协议 v7 省流编辑回路：symbols/folds 内容没变时 daemon 只回一个 `unchanged`，
+  不重发载荷、不重建 Outline、也不重设 `'foldexpr'`（重设会让 Vim 把整个 buffer
+  的折叠层级重算一遍）；高亮改用「组名表 + 定长列表」的紧凑编码，约省三分之二
+  字节。两者都按请求协商，旧 daemon 仍按 v6 形态工作。
 - 协议 v6 作用域链：一次应答同时喂饱文本对象与增量选择，且对整个 token 有效，
   故算子等待里无需往返即可同步作答；旧 daemon 缺 `scope` 能力时给出可执行提示。
 - 协议 v5 请求关联：每次 symbols 请求携带单调 token；迟到的 full/partial 成功或
@@ -248,7 +252,8 @@ let b:simpletreesitter_max_buffer_bytes = 0  " 仅当前 buffer 取消 Vim 端�
 
 ```text
 Vim9 plugin/autoload
-  │ newline-delimited JSON，protocol v5 + revision/request class/request_id
+  │ newline-delimited JSON，protocol v7 + revision/request class/request_id
+  │ symbols/folds 带载荷摘要，内容未变只回 unchanged；highlights 走紧凑编码
   │ 首次 set_text 全量；此后 listener 合并变更行，只发 edit_lines 行区间
   ▼
 ts-hl-daemon

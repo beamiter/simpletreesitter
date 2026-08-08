@@ -78,6 +78,7 @@ var s_inflight_folds: dict<bool> = {}
 var s_pending_folds: dict<bool> = {}
 # buf -> 每行 foldexpr 取值（'>1'、'2'、'0' 等）
 var s_fold_exprs: dict<list<string>> = {}
+const s_foldexpr = 'simpletreesitter#FoldExpr(v:lnum)'
 # winid -> {method: string, expr: string} 应用折叠前的窗口设置
 var s_fold_windows: dict<dict<string>> = {}
 # =============== 符号 location list 请求 ===============
@@ -97,6 +98,13 @@ var s_full_symbol_cache: dict<dict<any>> = {}
 # buf -> {steps, winid, lnum, col, changedtick}。导航响应必须回到发起窗口，
 # 不能以响应到达时的当前窗口/光标为准。
 var s_symbol_jump_pending: dict<dict<any>> = {}
+# =============== 载荷摘要（protocol v7） ===============
+# buf -> daemon 上一次接受的 symbols/folds 载荷摘要。回请求时带上它，内容没变的话
+# daemon 只回一个 unchanged 标记，不再重发整份 JSON —— 一次防抖击键就要重跑一遍
+# 整个符号查询并序列化上千个对象，而其中绝大多数结果与上一次逐字节相同。
+# 摘要是十进制字符串：Vim 的 json_decode() 会把超过 2^53 的整数走成浮点。
+var s_symbols_digest: dict<string> = {}
+var s_folds_digest: dict<string> = {}
 
 # 待用的 TS 高亮组 -> Vim 高亮组 默认链接
 const s_groups = [
@@ -149,6 +157,13 @@ const s_language_by_filetype = {
 # =============== 面包屑状态 ===============
 var s_bc_items: list<dict<any>> = []
 var s_bc_buf: number = 0
+# Buffer whose symbols s_bc_items actually holds. Not the same thing as
+# s_bc_buf: SetBreadcrumbItems() drops a payload that arrives for a buffer the
+# cursor has already left, so after switching buffers s_bc_buf names the new one
+# while the items are still the old one's. Payload suppression has to know the
+# difference — skipping an "unchanged" reply is only safe when this consumer
+# already holds that very payload.
+var s_bc_items_buf: number = 0
 var s_bc_timer: number = 0
 # winid (as a string key) -> the breadcrumb that window's own cursor produced.
 # Every window's 'winbar' holds the same fixed %{simpletreesitter#Breadcrumb()}
@@ -595,7 +610,7 @@ def VisibleRangeForBufSymbols(buf: number): list<number>
   return VisibleRangeForBufWithMargin(buf, margin)
 enddef
 
-def ApplyHighlights(buf: number, spans: list<dict<any>>)
+def ApplyHighlights(buf: number, ev: dict<any>)
   if !bufexists(buf)
     return
   endif
@@ -610,38 +625,82 @@ def ApplyHighlights(buf: number, spans: list<dict<any>>)
 
   var applied = 0
   var max_props = get(g:, 'simpletreesitter_max_props', 20000)
+  var rainbow = get(g:, 'simpletreesitter_rainbow_brackets', 1) ? true : false
 
   # 按类型分桶，最后用 prop_add_list 一次性提交，省去逐 span 调用 prop_add 的开销。
   var by_type: dict<list<list<number>>> = {}
-  for s in spans
-    var l1 = get(s, 'lnum', 1)
-    var l2 = get(s, 'end_lnum', l1)
-    if l2 < vstart || l1 > vend
-      continue
+  var groups: list<string> = get(ev, 'groups', [])
+  if !empty(groups)
+    # protocol v7 的紧凑编码：组名表 + 每个 span 一条定长列表
+    # [lnum, col, end_lnum, end_col, group_idx, depth]。一次全量高亮有上万个
+    # span，而组名只有三十几个：把组名与键名都提到外面之后，解码从每个 span 六次
+    # 字典查找变成列表下标，prop 类型名也只按组算一次而不是按 span 算一次。
+    var types: list<string> = []
+    for group in groups
+      types->add(HlProp(group))
+    endfor
+    var fallback = HlProp('TSVariable')
+    # 彩虹括号是唯一按 span 改写组名的规则；先把它的组下标找出来，循环里就只剩
+    # 一次整数比较。组名表里没有它时 bracket 为 -1，永不命中。
+    var bracket = index(groups, 'TSPunctBracket')
+    var rainbow_types: list<string> = []
+    if rainbow && bracket >= 0
+      for i in range(1, 6)
+        rainbow_types->add(HlProp('TSRainbow' .. string(i)))
+      endfor
     endif
-    if l1 <= 0 || l2 <= 0
-      continue
-    endif
-    var c1 = max([1, get(s, 'col', 1)])
-    var c2 = max([1, get(s, 'end_col', c1)])
-    var tp = get(s, 'group', 'TSVariable')
-    # Rainbow brackets: 用深度对应的彩虹颜色替换 TSPunctBracket
-    if tp ==# 'TSPunctBracket' && get(g:, 'simpletreesitter_rainbow_brackets', 1)
-      var depth = get(s, 'depth', 0)
-      if depth > 0
-        tp = 'TSRainbow' .. string(((depth - 1) % 6) + 1)
+    for s in get(ev, 'cspans', [])
+      var l1 = s[0]
+      var l2 = s[2]
+      if l2 < vstart || l1 > vend || l1 <= 0 || l2 <= 0
+        continue
       endif
-    endif
-    var prop_type = HlProp(tp)
-    if !has_key(by_type, prop_type)
-      by_type[prop_type] = []
-    endif
-    by_type[prop_type]->add([l1, c1, l2, c2])
-    applied += 1
-    if applied >= max_props
-      break
-    endif
-  endfor
+      var gi = s[4]
+      var prop_type = gi >= 0 && gi < len(types) ? types[gi] : fallback
+      if gi == bracket && !empty(rainbow_types) && s[5] > 0
+        prop_type = rainbow_types[(s[5] - 1) % 6]
+      endif
+      if !has_key(by_type, prop_type)
+        by_type[prop_type] = []
+      endif
+      by_type[prop_type]->add([l1, max([1, s[1]]), l2, max([1, s[3]])])
+      applied += 1
+      if applied >= max_props
+        break
+      endif
+    endfor
+  else
+    # protocol v6 及更早的对象形式。安装后没重建二进制的用户走这里。
+    for s in get(ev, 'spans', [])
+      var l1 = get(s, 'lnum', 1)
+      var l2 = get(s, 'end_lnum', l1)
+      if l2 < vstart || l1 > vend
+        continue
+      endif
+      if l1 <= 0 || l2 <= 0
+        continue
+      endif
+      var c1 = max([1, get(s, 'col', 1)])
+      var c2 = max([1, get(s, 'end_col', c1)])
+      var tp = get(s, 'group', 'TSVariable')
+      # Rainbow brackets: 用深度对应的彩虹颜色替换 TSPunctBracket
+      if tp ==# 'TSPunctBracket' && rainbow
+        var depth = get(s, 'depth', 0)
+        if depth > 0
+          tp = 'TSRainbow' .. string(((depth - 1) % 6) + 1)
+        endif
+      endif
+      var prop_type = HlProp(tp)
+      if !has_key(by_type, prop_type)
+        by_type[prop_type] = []
+      endif
+      by_type[prop_type]->add([l1, c1, l2, c2])
+      applied += 1
+      if applied >= max_props
+        break
+      endif
+    endfor
+  endif
 
   for [tp, positions] in items(by_type)
     try
@@ -685,6 +744,10 @@ def ResetProtocolState()
   s_symbol_request_ids = {}
   s_full_symbol_cache = {}
   s_symbol_jump_pending = {}
+  # 摘要描述的是“上一次会话告诉过我们的那份载荷”。新 daemon 从零开始重算，留着
+  # 只会让一次抑制把陈旧的 Outline 永远留在屏幕上。
+  s_symbols_digest = {}
+  s_folds_digest = {}
   # 作用域链描述的是上一次会话的解析树；留着会让文本对象作用在陈旧的区间上。
   s_inflight_scope = {}
   s_scope_cache = {}
@@ -757,8 +820,7 @@ def OnDaemonEvent(ev: dict<any>)
       ScheduleSync(buf)
       return
     endif
-    var spans = get(ev, 'spans', [])
-    ApplyHighlights(buf, spans)
+    ApplyHighlights(buf, ev)
     if retry
       ScheduleRequest(buf, 'scroll')
     endif
@@ -784,6 +846,25 @@ def OnDaemonEvent(ev: dict<any>)
       Log('Discarded stale symbols for buffer ' .. buf)
       ScheduleSync(buf)
       return
+    endif
+    if get(ev, 'unchanged', false)
+      # daemon 确认这份载荷与我们提供的摘要逐字节相同；消费者已经持有它，
+      # 什么都不用做。整个符号查询的序列化、传输与重建都被省掉了。
+      Log('Symbols unchanged for buffer ' .. buf)
+      if get(s_loclist_pending, buf, false) || has_key(s_symbol_jump_pending, buf)
+        RequestFullSymbols(buf)
+      elseif retry
+        ScheduleSymbols(buf)
+      endif
+      return
+    endif
+    # 全量回包喂的消费者与视口回包不同（ConsumeFullSymbols 而不是 Outline），
+    # 之后再拿视口摘要去抑制就无从判断谁持有什么；直接丢掉，下一次视口请求
+    # 老老实实要一份完整载荷。
+    if was_full
+      ClearSymbolsDigest(buf)
+    else
+      s_symbols_digest[buf] = get(ev, 'digest', '')
     endif
     var syms = get(ev, 'symbols', [])
     # 面包屑：保存符号数据
@@ -852,7 +933,20 @@ def OnDaemonEvent(ev: dict<any>)
       ScheduleSync(buf)
       return
     endif
-    ApplyFolds(buf, get(ev, 'folds', []))
+    if get(ev, 'unchanged', false)
+      # 折叠层级数组没变，就绝不能再赋一次 'foldexpr'：那会让 Vim 把整个 buffer
+      # 的每一行都重新求值一遍折叠层级，而这正是打开折叠后打字变卡的原因。
+      # 新开的窗口仍要拿到设置，所以还是走一遍（现在是幂等的）。
+      Log('Folds unchanged for buffer ' .. buf)
+      if FoldsEnabled()
+        for wid in win_findbuf(buf)
+          EnsureFoldSettingsForWin(wid)
+        endfor
+      endif
+    else
+      s_folds_digest[buf] = get(ev, 'digest', '')
+      ApplyFolds(buf, get(ev, 'folds', []))
+    endif
     if retry
       ScheduleFolds(buf)
     endif
@@ -939,6 +1033,11 @@ def OnDaemonEvent(ev: dict<any>)
       echohl WarningMsg
       echom '[ts-hl] daemon protocol is v5; run install.sh for tree-sitter text objects'
       echohl None
+    elseif s_protocol_version == 6 && !s_protocol_notice_shown
+      s_protocol_notice_shown = true
+      echohl WarningMsg
+      echom '[ts-hl] daemon protocol is v6; run install.sh for a cheaper edit loop'
+      echohl None
     endif
   elseif ev.type ==# 'status'
     echom printf('[ts-hl] daemon v%s protocol=%d | cache=%d/%d bytes evicted=%d | parse full=%d incremental=%d unchanged=%d | %s',
@@ -980,6 +1079,8 @@ def OnDaemonEvent(ev: dict<any>)
         s_inflight_syms[buf] = false
         s_pending_syms[buf] = false
         ClearSymbolRequestId(buf)
+        # 这次请求没有结果，消费者与 daemon 之间的对应关系无从确认。
+        ClearSymbolsDigest(buf)
         if has_key(s_symbol_request_purpose, buf)
           remove(s_symbol_request_purpose, string(buf))
         endif
@@ -1558,7 +1659,7 @@ def RequestFoldsNow(buf: number)
   endif
   s_inflight_folds[buf] = true
   s_pending_folds[buf] = false
-  if !Send({type: 'folds', buf: buf, lang: lang})
+  if !Send({type: 'folds', buf: buf, lang: lang, have_digest: FoldsDigestToSend(buf)})
     s_inflight_folds[buf] = false
   endif
 enddef
@@ -1607,9 +1708,23 @@ def ApplyFoldSettingsToWin(wid: number)
       expr: getwinvar(wid, '&foldexpr'),
     }
   endif
-  # 重新赋值 foldexpr 会触发该窗口的折叠重算
+  # 重新赋值 foldexpr 会触发该窗口的折叠重算 —— s_fold_exprs 刚变过，这正是我们
+  # 要的。
   setwinvar(wid, '&foldmethod', 'expr')
-  setwinvar(wid, '&foldexpr', 'simpletreesitter#FoldExpr(v:lnum)')
+  setwinvar(wid, '&foldexpr', s_foldexpr)
+enddef
+
+# 折叠数据没变时用这个：只在窗口还没装上我们的 foldexpr 时才写。
+# 无条件重写会让 Vim 把整个 buffer 的每一行都重新求一次折叠层级，而 daemon 每
+# 接受一次同步就回一次 folds —— 那就是打开折叠之后打字变卡的原因。
+def EnsureFoldSettingsForWin(wid: number)
+  if empty(getwininfo(wid))
+    return
+  endif
+  if getwinvar(wid, '&foldmethod') ==# 'expr' && getwinvar(wid, '&foldexpr') ==# s_foldexpr
+    return
+  endif
+  ApplyFoldSettingsToWin(wid)
 enddef
 
 def RestoreFoldSettings()
@@ -2073,6 +2188,7 @@ def SetBreadcrumbItems(buf: number, syms: list<dict<any>>)
     return
   endif
   s_bc_items = syms
+  s_bc_items_buf = buf
   ScheduleBreadcrumbUpdate()
 enddef
 
@@ -2500,8 +2616,11 @@ export def OnBufClose(buf: number)
       remove(state, string(buf))
     endif
   endfor
+  # 摘要必须跟着 buffer 号一起消失：Vim 会复用 bufnr，留着就等于让新文件继承旧
+  # 文件的“内容没变”结论。
   for state in [s_inflight_revision, s_sent_changedtick, s_skipped_changedtick,
-      s_req_timers, s_sync_timers, s_symbol_jump_pending, s_pending_inspect]
+      s_req_timers, s_sync_timers, s_symbol_jump_pending, s_pending_inspect,
+      s_symbols_digest, s_folds_digest]
     if has_key(state, buf)
       remove(state, string(buf))
     endif
@@ -2775,6 +2894,50 @@ def FancyIcon(kind: string): string
 enddef
 
 # =============== 符号请求 ===============
+# Digest to offer the daemon for a viewport symbols request, or '' to ask for
+# the payload unconditionally.
+#
+# An `unchanged` reply is applied by doing nothing at all, so it is only correct
+# when every consumer of a symbols payload still holds the exact payload this
+# digest describes. Both consumers can drift out from under it — the breadcrumb
+# follows the cursor to another buffer, the Outline is retargeted or reopened
+# empty — and each drift is a case where doing nothing would leave a stale or
+# blank panel with no event left to fix it.
+def SymbolsDigestToSend(buf: number): string
+  var digest = get(s_symbols_digest, buf, '')
+  if digest ==# '' || !get(s_daemon_capabilities, 'payload_digest', false)
+    return ''
+  endif
+  if get(g:, 'simpletreesitter_breadcrumb', 0) && s_bc_items_buf != buf
+    return ''
+  endif
+  if s_outline_win != 0 && s_outline_src_buf == buf
+      && (!s_outline_raw_valid || s_outline_state_buf != buf)
+    return ''
+  endif
+  return digest
+enddef
+
+def ClearSymbolsDigest(buf: number)
+  if has_key(s_symbols_digest, buf)
+    remove(s_symbols_digest, string(buf))
+  endif
+enddef
+
+# The fold expression array is a pure function of (folds, buffer line count), so
+# an unchanged payload may still need a rebuild when the buffer grew or shrank
+# outside every fold.
+def FoldsDigestToSend(buf: number): string
+  var digest = get(s_folds_digest, buf, '')
+  if digest ==# '' || !get(s_daemon_capabilities, 'payload_digest', false)
+    return ''
+  endif
+  if len(get(s_fold_exprs, buf, [])) != BufLineCount(buf)
+    return ''
+  endif
+  return digest
+enddef
+
 def RequestSymbolsNow(buf: number)
   if !s_enabled || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
     return
@@ -2809,7 +2972,8 @@ def RequestSymbolsNow(buf: number)
   var render_limit = get(g:, 'simpletreesitter_outline_max_items', 1000)
   var scan_limit = max([render_limit, get(g:, 'simpletreesitter_outline_scan_max_items', 5000)])
   if !Send({type: 'symbols', buf: buf, lang: lang, lstart: vstart, lend: vend,
-      max_items: scan_limit, request_id: request_id})
+      max_items: scan_limit, request_id: request_id,
+      have_digest: SymbolsDigestToSend(buf)})
     s_inflight_syms[buf] = false
     ClearSymbolRequestId(buf)
     remove(s_symbol_request_purpose, string(buf))
@@ -4068,6 +4232,7 @@ def RequestNow(buf: number)
     lend: hend,
     rainbow: get(g:, 'simpletreesitter_rainbow_brackets', 1) ? true : false,
     max_spans: get(g:, 'simpletreesitter_max_props', 20000),
+    compact: get(s_daemon_capabilities, 'compact_spans', false),
   })
     # 未发出的请求不会有响应来清 inflight 标记，此后本 buffer 再也不会重绘。
     s_inflight_hl[buf] = false

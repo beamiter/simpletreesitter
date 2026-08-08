@@ -2,6 +2,29 @@
 
 ## Unreleased - 2026-08-08
 
+### 性能：protocol v7 —— 内容没变就不发载荷，高亮走紧凑编码
+
+- 每一次被接受的同步都会重新请求 symbols 和 folds，而绝大多数击键两者都没变：
+  在函数体里打字既不移动任何符号，也不改变任何折叠。daemon 现在接受请求里的
+  `have_digest`（客户端手上那份载荷的摘要），命中就只回一个 `unchanged`，整个
+  符号查询结果既不序列化、也不重新解析、更不重新渲染。
+- 折叠那一半更值钱：此前每次 folds 回包都会重新赋值 `'foldexpr'`，而重新赋值会
+  让 Vim 把整个 buffer 每一行的折叠层级重算一遍 —— 这正是 `g:simpletreesitter_folds`
+  不得不默认关掉的原因。`unchanged` 时不再碰窗口设置；新窗口仍会被装上（改用
+  幂等的 `EnsureFoldSettingsForWin`）。折叠层级数组是 (folds, 行数) 的函数，所以
+  行数变了就照常重建，摘要不会被交出去。
+- `unchanged` 的应用方式是"什么都不做"，所以只有当这份载荷的每一个消费者都还
+  原封不动地持有它时，插件才会把摘要交出去：Outline 刚被重定向、面包屑跟着光标
+  去了别的 buffer、上一次回的是 full 载荷（喂的是另一批消费者），都退回完整载荷。
+  摘要随 `close_buffer` 一起丢弃 —— Vim 会复用 bufnr。
+- 高亮回包新增紧凑编码：一张组名表加上每个 span 一条
+  `[lnum, col, end_lnum, end_col, group_idx, depth]`。一次全量高亮里三十几个组名
+  和六个键名要重复上万遍，去掉之后约省三分之二字节，Vim 端解码也从每个 span 六次
+  字典查找变成列表下标，prop 类型名按组算一次而不是按 span 算一次。
+- 两者都按请求协商（`have_digest` / `compact`）而不是握手时一次性打开：客户端中途
+  降级、或同一个 daemon 上挂着两个版本的客户端，都不会收到自己不认识的编码。摘要
+  是十进制字符串，因为 Vim 的 `json_decode()` 会把超过 2^53 的整数走成浮点。
+
 ### 新增：通用语言注入，markdown 围栏与 HTML `<script>`/`<style>` 都按本语言高亮
 
 - 原先只有一条写死的 markdown-inline 分支：`BufCache.inline_tree` 一棵树、

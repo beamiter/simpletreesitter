@@ -349,6 +349,27 @@ so a document with forty rust fences costs one rust parse.
 
 Injections need a daemon advertising the "injections" capability.
 
+                                                *simpletreesitter-wire*
+THE EDIT LOOP
+
+Every accepted sync re-asks for symbols and folds, and most keystrokes change
+neither: typing inside a function body moves no symbol and no fold.  A daemon
+advertising the "payload_digest" capability (protocol v7) answers such a
+request with `unchanged` and no payload at all, so the symbol query result is
+neither serialised nor re-parsed nor re-rendered, and 'foldexpr' is not
+reassigned -- reassigning it makes Vim recompute the fold level of every line
+in the buffer, which is why folds used to be expensive to leave on.
+
+A digest is only offered while every consumer of that payload still holds it,
+so an Outline that has just been retargeted, or a breadcrumb that has followed
+the cursor into another buffer, always gets a full payload.
+
+The same daemon advertises "compact_spans": a highlight reply then carries one
+group-name table plus one fixed-width list per span instead of an object with
+six keys, which is roughly a third of the bytes and a cheaper decode.  Both are
+negotiated per request, so an older daemon keeps receiving and answering the
+protocol-v6 shape.
+
 ===============================================================================
 7. TROUBLESHOOTING                          *simpletreesitter-troubleshooting*
 
