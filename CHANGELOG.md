@@ -2,6 +2,24 @@
 
 ## Unreleased - 2026-08-08
 
+### Outline 变成每标签页一份
+
+- 此前 Outline 是一份全局单例，而它的窗口 id 用 `win_id2win()` 探测——那是标签页
+  局部的。在第二个标签页 `:TsHlOutlineOpen` 会看不到第一个标签页的侧边栏，把状态
+  清零后新建一个（实际上会撞上 E95：buffer 名重复），第一个标签页的侧边栏就此
+  变成孤儿：它的 `<CR>`/`q` 映射还在，读到的却是另一个标签页的 linemap。而在
+  第二个标签页 `:TsHlOutlineToggle` 会看到非零的 `s_outline_win` 转去
+  `OutlineClose()`，`win_gotoid()` 是跨标签页的——用户被直接甩到第一个标签页，
+  那边的 Outline 被关掉。
+- 现在每个标签页各有一份完整的 Outline 状态（窗口、buffer、source、过滤、折叠、
+  linemap、光标跟随）。标签页身份与状态快照都存在 `t:` 变量里——这是 Vim 唯一
+  随标签页存亡的稳定标识，`tabpagenr()` 会在 `:tabclose` 后重排。进入标签页时
+  整体换入换出，因此渲染/过滤/跳转/折叠路径依旧写得像不存在标签页一样。
+- 关窗改用 `win_execute()`：它能操作别的标签页的窗口而不移动用户。
+  `:TsHlDisable` 与自动停机会关掉所有标签页的侧边栏；只要还有任何一个标签页开着
+  Outline，daemon 就不会自动停。第一个 Outline buffer 仍叫 `ts-hl-outline`，
+  之后的加标签页后缀。
+
 ### 修复：breadcrumb 不再把符号名当作 'statusline' 格式串
 
 - `'winbar'` 与 `'statusline'` 用同一套格式解析：裸 `%` 开启一个 item，`%{expr}`

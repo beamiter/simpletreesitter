@@ -90,6 +90,11 @@ install -m 0755 target/release/ts-hl-daemon lib/ts-hl-daemon
 | `:[count]TsHlNextSymbol` / `:[count]TsHlPrevSymbol` | 在结构符号间前后跳转，到头循环 |
 | `:TsHlFoldsToggle` | 切换 Tree-sitter 折叠（`foldexpr` 驱动，可恢复原设置） |
 
+大纲是**每个标签页一份**：窗口、buffer、source buffer、过滤、折叠与跳转表都属于
+所在标签页。在第二个标签页打开不会影响第一个，任何 `:TsHlOutline*` 只作用于当前
+标签页、绝不切走；`:TsHlDisable` 关闭全部。第一个大纲 buffer 名为 `ts-hl-outline`，
+之后的带后缀（Vim buffer 名必须唯一）。
+
 默认普通模式映射：
 
 | 按键 | 功能 |

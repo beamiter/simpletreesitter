@@ -130,4 +130,7 @@ augroup TsHlOutlineAutoClose
   autocmd!
   # WinClosed 的 <amatch> 是被关闭窗口的 winid（字符串）
   autocmd WinClosed * call simpletreesitter#OnWinClosed(expand('<amatch>'))
+  # The Outline is per tabpage: swap in this tab's sidebar state before any
+  # mapping, timer or daemon reply can read the previous tab's line map.
+  autocmd TabEnter * call simpletreesitter#OnTabEnter()
 augroup END

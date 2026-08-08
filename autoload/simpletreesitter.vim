@@ -143,6 +143,135 @@ var s_outline_state_buf: number = 0
 # winid -> {list: bool, listchars: string}
 var s_indent_guide_windows: dict<dict<any>> = {}
 
+# =============== Outline 的每标签页上下文 ===============
+# The Outline is one sidebar per tabpage.  All the s_outline_* variables above
+# describe exactly one of them — the tabpage whose id is s_outline_ctx — and
+# entering another tabpage swaps the whole set.  Indexing every read by tabpage
+# instead would touch the render, filter, cursor-follow, jump and fold paths;
+# swapping one working set leaves them all written as if tabs did not exist.
+#
+# Vim gives a tabpage no stable numeric identity (tabpagenr() renumbers on every
+# :tabclose, which is why win_id2win() on a stored window id silently reads 0
+# for a sidebar living in another tab).  Tab-local variables do travel with the
+# tabpage and are freed with it, so both the identity and the stashed state live
+# in t:.
+var s_outline_ctx: number = 0
+var s_next_outline_ctx: number = 0
+const s_outline_ctx_var = 'simpletreesitter_outline_ctx'
+const s_outline_state_var = 'simpletreesitter_outline_state'
+
+def OutlineCtxId(): number
+  var ctx = gettabvar(tabpagenr(), s_outline_ctx_var, 0)
+  if type(ctx) != v:t_number || ctx <= 0
+    s_next_outline_ctx += 1
+    ctx = s_next_outline_ctx
+    settabvar(tabpagenr(), s_outline_ctx_var, ctx)
+  endif
+  return ctx
+enddef
+
+def CaptureOutlineState(): dict<any>
+  return {
+    win: s_outline_win,
+    buf: s_outline_buf,
+    src_buf: s_outline_src_buf,
+    src_win: s_outline_src_win,
+    raw_items: s_outline_raw_items,
+    raw_valid: s_outline_raw_valid,
+    filter: s_outline_filter,
+    items: s_outline_items,
+    linemap: s_outline_linemap,
+    idx_to_lnum: s_outline_idx_to_lnum,
+    sig: s_last_outline_sig,
+    collapsed: s_outline_collapsed,
+    state_buf: s_outline_state_buf,
+    cursor_line: s_outline_cursor_line,
+  }
+enddef
+
+def ResetOutlineState()
+  s_outline_win = 0
+  s_outline_buf = 0
+  s_outline_src_buf = 0
+  s_outline_src_win = 0
+  s_outline_raw_items = []
+  s_outline_raw_valid = false
+  s_outline_filter = ''
+  s_outline_items = []
+  s_outline_linemap = []
+  s_outline_idx_to_lnum = {}
+  s_last_outline_sig = ''
+  s_outline_collapsed = {}
+  s_outline_state_buf = 0
+  s_outline_cursor_line = 0
+enddef
+
+def LoadOutlineState(state: dict<any>)
+  s_outline_win = get(state, 'win', 0)
+  s_outline_buf = get(state, 'buf', 0)
+  s_outline_src_buf = get(state, 'src_buf', 0)
+  s_outline_src_win = get(state, 'src_win', 0)
+  s_outline_raw_items = get(state, 'raw_items', [])
+  s_outline_raw_valid = get(state, 'raw_valid', false)
+  s_outline_filter = get(state, 'filter', '')
+  s_outline_items = get(state, 'items', [])
+  s_outline_linemap = get(state, 'linemap', [])
+  s_outline_idx_to_lnum = get(state, 'idx_to_lnum', {})
+  s_last_outline_sig = get(state, 'sig', '')
+  s_outline_collapsed = get(state, 'collapsed', {})
+  s_outline_state_buf = get(state, 'state_buf', 0)
+  s_outline_cursor_line = get(state, 'cursor_line', 0)
+enddef
+
+# Every Outline entry point calls this first.  TabEnter is the usual trigger,
+# but win_gotoid() across tabpages, :tabdo and a <CR> in a sidebar mapping can
+# all reach the Outline without one, and running a mapping against another
+# tabpage's line map is precisely the bug this replaces.
+def SyncOutlineContext()
+  var ctx = OutlineCtxId()
+  if ctx == s_outline_ctx
+    return
+  endif
+  if s_outline_ctx != 0
+    # The tabpage being left may already be gone (:tabclose), in which case its
+    # t: dictionary went with it and there is nothing left to write back.
+    for nr in range(1, tabpagenr('$'))
+      if gettabvar(nr, s_outline_ctx_var, 0) == s_outline_ctx
+        settabvar(nr, s_outline_state_var, CaptureOutlineState())
+        break
+      endif
+    endfor
+  endif
+  s_outline_ctx = ctx
+  var saved = gettabvar(tabpagenr(), s_outline_state_var, {})
+  if type(saved) == v:t_dict && !empty(saved)
+    LoadOutlineState(saved)
+  else
+    ResetOutlineState()
+  endif
+enddef
+
+# Window ids of every tabpage's sidebar, current tabpage included.  Used where
+# the question really is global — "may the daemon stop?", "close everything".
+def AllOutlineWins(): list<number>
+  var wins: list<number> = []
+  for nr in range(1, tabpagenr('$'))
+    var wid = 0
+    if gettabvar(nr, s_outline_ctx_var, 0) == s_outline_ctx
+      wid = s_outline_win
+    else
+      var saved = gettabvar(nr, s_outline_state_var, {})
+      if type(saved) == v:t_dict
+        wid = get(saved, 'win', 0)
+      endif
+    endif
+    if wid != 0 && !empty(getwininfo(wid))
+      wins->add(wid)
+    endif
+  endfor
+  return wins
+enddef
+
 # =============== 工具 ===============
 
 def HlProp(group: string): string
@@ -1179,7 +1308,10 @@ def AutoEnableForBuffer(buf: number)
 enddef
 
 def CheckAndStopDaemon()
-  if s_outline_win != 0 && win_id2win(s_outline_win) != 0
+  # An Outline in *any* tabpage keeps the daemon alive; win_id2win() would only
+  # ever see this one, and stopping the daemon under another tab's sidebar
+  # leaves it frozen with no way back except :TsHlOutlineRefresh.
+  if !empty(AllOutlineWins())
     return
   endif
   var has_active = false
@@ -2029,9 +2161,7 @@ export def Disable()
   augroup TsHl
     autocmd!
   augroup END
-  if s_outline_win != 0
-    OutlineClose()
-  endif
+  CloseAllOutlines()
   for [k, tid] in items(s_req_timers)
     if tid != 0 && exists('*timer_stop')
       try | call timer_stop(tid) | catch | endtry
@@ -2115,6 +2245,7 @@ def ShowOutlineMessage(message: string)
 enddef
 
 export def OnBufEvent(buf: number)
+  SyncOutlineContext()
   if bufexists(buf) && bufloaded(buf) && has_key(s_closed_bufs, buf)
     remove(s_closed_bufs, string(buf))
   endif
@@ -2181,6 +2312,7 @@ export def OnScroll(buf: number)
   if !bufexists(buf)
     return
   endif
+  SyncOutlineContext()
   # AutoEnableForBuffer(buf)
   ScheduleRequest(buf, 'scroll')
   # 面包屑导航更新
@@ -2960,7 +3092,19 @@ def ApplySymbols(buf: number, syms: list<dict<any>>)
 enddef
 
 # =============== 侧边栏窗口管理 ===============
+# Buffer names must be unique, and one sidebar per tabpage means more than one
+# can exist at a time.  The first keeps the historical name so :buffer
+# ts-hl-outline and any user autocmd matching it keep working.
+def OutlineBufName(ctx: number): string
+  var name = 'ts-hl-outline'
+  if bufnr('^' .. name .. '$') != -1
+    name ..= '-' .. ctx
+  endif
+  return name
+enddef
+
 export def OutlineOpen()
+  SyncOutlineContext()
   var src = bufnr()
   if src == s_outline_buf && s_outline_src_buf != 0
     src = s_outline_src_buf
@@ -3005,7 +3149,7 @@ export def OutlineOpen()
     else
       execute 'enew'
       s_outline_buf = bufnr('%')
-      execute 'file ts-hl-outline'
+      execute 'file ' .. fnameescape(OutlineBufName(s_outline_ctx))
       setlocal buftype=nofile bufhidden=wipe nobuflisted noswapfile
       setlocal nowrap nonumber norelativenumber signcolumn=no
       setlocal foldcolumn=0
@@ -3043,28 +3187,8 @@ export def OutlineOpen()
   endtry
 enddef
 
-export def OutlineClose()
-  if s_outline_win != 0
-    try
-      if win_gotoid(s_outline_win)
-        execute 'close'
-      endif
-    catch
-    endtry
-  endif
-  s_outline_win = 0
-  s_outline_buf = 0
-  s_outline_filter = ''
-  s_outline_raw_items = []
-  s_outline_raw_valid = false
-  s_outline_items = []
-  s_outline_linemap = []
-  s_outline_idx_to_lnum = {}
-  s_last_outline_sig = ''
-  s_outline_src_buf = 0
-  s_outline_src_win = 0
-  s_outline_state_buf = 0
-  s_outline_collapsed = {}
+def OutlineTeardown()
+  ResetOutlineState()
   Log('[ts-hl] outline closed')
 
   # 全局暂停 -> 恢复：关闭后主动刷新所有活跃缓冲
@@ -3073,7 +3197,42 @@ export def OutlineClose()
   endif
 enddef
 
+export def OutlineClose()
+  SyncOutlineContext()
+  if s_outline_win != 0 && !empty(getwininfo(s_outline_win))
+    # win_execute() closes the window without ever moving the user; win_gotoid()
+    # follows a window id into another tabpage, which is how :TsHlOutlineToggle
+    # used to teleport people out of the tab they were working in.
+    try
+      call win_execute(s_outline_win, 'close')
+    catch
+    endtry
+  endif
+  OutlineTeardown()
+enddef
+
+# :TsHlDisable and the auto-stop path own every sidebar, not just this tab's.
+def CloseAllOutlines()
+  var here = OutlineCtxId()
+  for nr in range(1, tabpagenr('$'))
+    if gettabvar(nr, s_outline_ctx_var, 0) == here
+      continue
+    endif
+    var saved = gettabvar(nr, s_outline_state_var, {})
+    if type(saved) != v:t_dict
+      continue
+    endif
+    var wid = get(saved, 'win', 0)
+    if wid != 0 && !empty(getwininfo(wid))
+      try | call win_execute(wid, 'close') | catch | endtry
+    endif
+    settabvar(nr, s_outline_state_var, {})
+  endfor
+  OutlineClose()
+enddef
+
 export def OutlineToggle()
+  SyncOutlineContext()
   if s_outline_win != 0
     OutlineClose()
   else
@@ -3082,6 +3241,7 @@ export def OutlineToggle()
 enddef
 
 export def OutlineRefresh()
+  SyncOutlineContext()
   if s_outline_src_buf == 0 || !bufexists(s_outline_src_buf)
     return
   endif
@@ -3089,6 +3249,7 @@ export def OutlineRefresh()
 enddef
 
 export def OutlineFilter(query: string = '')
+  SyncOutlineContext()
   if s_outline_win == 0 || s_outline_src_buf == 0 || !bufexists(s_outline_buf)
     echo '[ts-hl] open the Outline before filtering'
     return
@@ -3120,6 +3281,7 @@ export def OutlinePromptFilter()
 enddef
 
 export def OutlineJump()
+  SyncOutlineContext()
   if s_outline_win == 0 || s_outline_src_buf == 0
     return
   endif
@@ -3162,6 +3324,7 @@ export def OutlineJump()
 enddef
 
 export def OutlineToggleFold()
+  SyncOutlineContext()
   if s_outline_win == 0 || s_outline_buf == 0
     return
   endif
@@ -3182,6 +3345,19 @@ export def OutlineToggleFold()
   ApplySymbols(s_outline_src_buf, s_outline_raw_items)
 enddef
 
+# TabEnter 事件回调（导出）：换入本标签页自己的 Outline 状态。
+export def OnTabEnter()
+  SyncOutlineContext()
+  if s_outline_win == 0
+    return
+  endif
+  # Responses that landed while another tabpage was current were dropped by
+  # ApplySymbols' source-buffer guard, so ask again instead of leaving this
+  # sidebar showing whatever it last managed to render.
+  s_last_outline_sig = ''
+  OutlineRefresh()
+enddef
+
 # 新增：WinClosed 事件回调（导出），用于判断关闭的是否为 outline 窗口
 export def OnWinClosed(wid_str: string)
   var wid = 0
@@ -3190,11 +3366,26 @@ export def OnWinClosed(wid_str: string)
   catch
     wid = 0
   endtry
-  if wid != 0 && wid == s_outline_win
-    # 如果关闭的是 outline 窗口，则走统一的清理逻辑
-    # 注意：此时窗口已被关闭，OutlineClose 内部 win_gotoid(s_outline_win) 会失败，但不影响清理状态
-    OutlineClose()
+  if wid == 0
+    return
   endif
+  SyncOutlineContext()
+  if wid == s_outline_win
+    # 窗口正在关闭中，只剩状态清理；不要再去关一次。
+    OutlineTeardown()
+    return
+  endif
+  # A sidebar can also disappear from another tabpage — :tabclose, or the
+  # CloseAllOutlines sweep — and that tabpage's stash must not be left pointing
+  # at a dead window id that a later win_execute() could resolve to something
+  # else entirely.
+  for nr in range(1, tabpagenr('$'))
+    var saved = gettabvar(nr, s_outline_state_var, {})
+    if type(saved) == v:t_dict && get(saved, 'win', 0) == wid
+      settabvar(nr, s_outline_state_var, {})
+      break
+    endif
+  endfor
 enddef
 
 # =============== 请求调度 ===============

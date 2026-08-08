@@ -504,6 +504,60 @@ call assert_false(s:CallPrivate('BufferTextExceedsLimit', [bufnr(), 6]))
 call assert_true(s:CallPrivate('BufferTextExceedsLimit', [bufnr(), 5]))
 call delete(s:size_file)
 
+" The Outline is one sidebar per tabpage. Opening one in a second tab must not
+" orphan the first, closing one must not close the other, and :TsHlOutlineToggle
+" must never cross a tabpage boundary to close a sidebar somewhere else.
+tabonly!
+enew
+call setline(1, ['fn tab_one() {}'])
+setfiletype rust
+let s:tab1_src = bufnr()
+call simpletreesitter#Enable()
+sleep 200m
+call simpletreesitter#OutlineOpen()
+sleep 300m
+let s:tab1_win = s:State().s_outline_win
+let s:tab1_outline = s:State().s_outline_buf
+call assert_true(s:tab1_win > 0, 'first tab did not get an Outline')
+call assert_match('tab_one', join(getbufline(s:tab1_outline, 1, '$'), "\n"))
+
+tabnew
+call setline(1, ['fn tab_two() {}'])
+setfiletype rust
+let s:tab2_src = bufnr()
+sleep 200m
+" Toggling in a tab without a sidebar must open one here, not reach across to
+" the sidebar tab 1 owns.
+let s:tab2_nr = tabpagenr()
+call simpletreesitter#OutlineToggle()
+sleep 300m
+call assert_equal(s:tab2_nr, tabpagenr(), 'OutlineToggle teleported to another tabpage to open')
+let s:tab2_win = s:State().s_outline_win
+let s:tab2_outline = s:State().s_outline_buf
+call assert_true(s:tab2_win > 0, 'second tab did not get an Outline')
+call assert_notequal(s:tab1_win, s:tab2_win, 'second tab reused the first tab Outline window')
+call assert_notequal(s:tab1_outline, s:tab2_outline, 'both tabs share a single Outline buffer')
+call assert_false(empty(getwininfo(s:tab1_win)), 'opening an Outline in tab 2 orphaned tab 1')
+call assert_equal(s:tab2_src, s:State().s_outline_src_buf)
+call assert_match('tab_two', join(getbufline(s:tab2_outline, 1, '$'), "\n"))
+
+call simpletreesitter#OutlineToggle()
+call assert_equal(s:tab2_nr, tabpagenr(), 'OutlineToggle teleported to another tabpage to close')
+call assert_equal(0, s:State().s_outline_win, 'OutlineToggle did not close this tab Outline')
+call assert_false(empty(getwininfo(s:tab1_win)), 'closing the tab 2 Outline closed the tab 1 Outline')
+
+" Returning to tab 1 restores that tab's own window, buffer, source and jump map.
+tabprevious
+sleep 300m
+call assert_equal(s:tab1_win, s:State().s_outline_win, 'tab 1 did not get its own Outline back')
+call assert_equal(s:tab1_outline, s:State().s_outline_buf)
+call assert_equal(s:tab1_src, s:State().s_outline_src_buf,
+      \ 'tab 1 Outline is pointed at another tab source buffer')
+call assert_match('tab_one', join(getbufline(s:tab1_outline, 1, '$'), "\n"))
+call simpletreesitter#OutlineClose()
+tabonly!
+call simpletreesitter#Disable()
+
 " Breadcrumb text is data, never a statusline format string. Vim parses 'winbar'
 " like 'statusline', so a container symbol whose name contains %{...} used to be
 " evaluated on the next redraw -- code execution from moving the cursor in an

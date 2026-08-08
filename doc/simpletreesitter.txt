@@ -117,6 +117,13 @@ are never replaced.  For custom mappings use: >
 Inside the Outline, <CR> jumps, o and za toggle a node, / prompts for a local
 filter (empty clears it), and q closes it.
 
+The Outline is per tabpage.  Each tabpage gets its own sidebar window, buffer,
+source buffer, filter, collapse state and jump map; opening one in a second
+tabpage leaves the first alone, and every :TsHlOutline* command acts on the
+tabpage you are in and never switches tabpages.  :TsHlDisable closes all of
+them.  The first sidebar is named ts-hl-outline and later ones are suffixed,
+because Vim buffer names must be unique.
+
 ===============================================================================
 5. OPTIONS                                   *simpletreesitter-options*
 
