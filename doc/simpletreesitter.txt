@@ -227,8 +227,12 @@ Wrong colour on a token     Run |:TsHlInspect| on it.
 Large buffer is skipped      Raise max_buffer_bytes or set it to zero.
 Icons look incorrect         Disable outline_fancy or enable outline_ascii.
 
-Enable g:simpletreesitter_debug and inspect g:simpletreesitter_log_file for
-daemon stderr and scheduling diagnostics.
+Daemon errors the plugin recovers from by itself -- "buffer not cached" after
+the daemon evicts a buffer from its own cache, and the two incremental-sync
+divergence checks -- are logged rather than echoed, because the resync has
+already been scheduled by the time you would read the message.  Enable
+g:simpletreesitter_debug and inspect g:simpletreesitter_log_file for those,
+for daemon stderr and for scheduling diagnostics.
 
 
 ==============================================================================

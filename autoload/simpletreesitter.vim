@@ -637,6 +637,15 @@ def ApplyHighlights(buf: number, spans: list<dict<any>>)
   s_applied_types[buf] = keys(by_type)
 enddef
 
+# Daemon errors the plugin recovers from on its own by forcing a full resync:
+# 'buffer not cached' after the daemon evicts from its 128-entry cache, and the
+# two incremental-sync divergence checks.  One predicate so the message that
+# suppresses the echo can never drift from the message that triggers the
+# recovery — this used to be the same regexp written out three times.
+def RecoverableDaemonError(message: string): bool
+  return message =~# 'buffer not cached\|lang mismatch\|edit_lines mismatch'
+enddef
+
 def ResetProtocolState()
   s_inflight_sync = {}
   s_inflight_revision = {}
@@ -912,7 +921,16 @@ def OnDaemonEvent(ev: dict<any>)
     if buf > 0 && op ==# 'symbols' && !SymbolEventMatchesCurrent(ev, buf)
       return
     endif
-    echom '[ts-hl] error: ' .. message
+    # 'buffer not cached' is what the daemon says after evicting a buffer from
+    # its own 128-entry cache; 'lang mismatch' and 'edit_lines mismatch' are the
+    # incremental-sync divergence checks.  All three are recovered a few lines
+    # below by forcing a full resync, so echoing them only produced a hit-enter
+    # prompt in the middle of typing for something the plugin had already fixed.
+    if RecoverableDaemonError(message)
+      Log('Recovering from daemon error: ' .. message)
+    else
+      echom '[ts-hl] error: ' .. message
+    endif
     # protocol v4 的 error 带 op，只清理真正失败的请求类别。否则
     # highlight/fold 错误可能破坏同 buffer 的 full-symbol 用途归类。
     if buf > 0
@@ -926,7 +944,7 @@ def OnDaemonEvent(ev: dict<any>)
         if has_key(s_symbol_request_kinds, buf)
           remove(s_symbol_request_kinds, string(buf))
         endif
-        if message !~# 'buffer not cached\|lang mismatch\|edit_lines mismatch'
+        if !RecoverableDaemonError(message)
           CancelSymbolConsumers(buf)
         endif
       elseif op ==# 'highlight'
@@ -961,7 +979,7 @@ def OnDaemonEvent(ev: dict<any>)
           remove(s_inflight_revision, string(buf))
         endif
       endif
-      if message =~# 'buffer not cached\|lang mismatch\|edit_lines mismatch'
+      if RecoverableDaemonError(message)
         s_sent_changedtick[buf] = -1
         if has_key(s_pending_splice, buf)
           remove(s_pending_splice, string(buf))
@@ -1127,6 +1145,21 @@ def RemoveAllListeners()
   s_pending_splice = {}
 enddef
 
+# core#Send() returns false when ch_sendraw throws while the job is still
+# alive — a full pipe, a daemon wedged mid-write.  The inflight flags were set
+# before the send, and nothing ever cleared them on that path: ScheduleSync()
+# then bailed at its inflight guard and every other request class bailed on the
+# changedtick check, so one failed write silently froze that buffer's pipeline
+# for the rest of the session.  Unwinding restores the state the send tried to
+# leave, and the next ScheduleSync() retries normally.
+def UnwindInflightSync(buf: number)
+  s_inflight_sync[buf] = false
+  if has_key(s_inflight_revision, buf)
+    remove(s_inflight_revision, string(buf))
+  endif
+  Log('Send failed; released the sync interlock for buffer ' .. buf)
+enddef
+
 def SyncBufferNow(buf: number)
   if !s_enabled || get(s_closed_bufs, buf, false) || !IsSupportedLang(buf)
     return
@@ -1216,6 +1249,7 @@ def SyncBufferNow(buf: number)
         line_count: BufLineCount(buf),
         eol: eol,
       })
+        UnwindInflightSync(buf)
         return
       endif
       Log('Sent edit_lines for buffer ' .. buf .. ' (changedtick=' .. ct
@@ -1236,6 +1270,7 @@ def SyncBufferNow(buf: number)
   s_inflight_sync[buf] = true
   s_inflight_revision[buf] = ct
   if !Send({type: 'set_text', buf: buf, lang: lang, text: text, revision: ct})
+    UnwindInflightSync(buf)
     return
   endif
   Log('Sent set_text for buffer ' .. buf .. ' (changedtick=' .. ct .. ')')
@@ -1478,7 +1513,9 @@ def RequestFoldsNow(buf: number)
   endif
   s_inflight_folds[buf] = true
   s_pending_folds[buf] = false
-  Send({type: 'folds', buf: buf, lang: lang})
+  if !Send({type: 'folds', buf: buf, lang: lang})
+    s_inflight_folds[buf] = false
+  endif
 enddef
 
 def ApplyFolds(buf: number, folds: list<dict<any>>)
@@ -3636,7 +3673,7 @@ def RequestNow(buf: number)
   s_pending_hl[buf] = false
 
   var [hstart, hend] = VisibleRangeForBuf(buf)
-  Send({
+  if !Send({
     type: 'highlight',
     buf: buf,
     lang: lang,
@@ -3645,5 +3682,9 @@ def RequestNow(buf: number)
     rainbow: get(g:, 'simpletreesitter_rainbow_brackets', 1) ? true : false,
     max_spans: get(g:, 'simpletreesitter_max_props', 20000),
   })
+    # 未发出的请求不会有响应来清 inflight 标记，此后本 buffer 再也不会重绘。
+    s_inflight_hl[buf] = false
+    return
+  endif
   Log('Requested highlight (range-only) for buffer ' .. buf .. ' ...')
 enddef

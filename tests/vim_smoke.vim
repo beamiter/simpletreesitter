@@ -504,6 +504,47 @@ call assert_false(s:CallPrivate('BufferTextExceedsLimit', [bufnr(), 6]))
 call assert_true(s:CallPrivate('BufferTextExceedsLimit', [bufnr(), 5]))
 call delete(s:size_file)
 
+" A send that fails while the job is alive leaves nothing to clear the sync
+" interlock: ScheduleSync then bails at its inflight guard and every other
+" request class bails on the changedtick check, so the buffer silently stops
+" updating for the rest of the session. Unwinding is what makes a retry possible.
+enew
+call setline(1, ['fn unwind_me() {}'])
+setfiletype rust
+let s:unwind = bufnr()
+call simpletreesitter#Enable()
+sleep 300m
+call setline(1, ['fn unwind_me_again() {}'])
+call listener_flush(s:unwind)
+call s:CallPrivate('SyncBufferNow', [s:unwind])
+call assert_true(get(s:State().s_inflight_sync, string(s:unwind), v:false),
+      \ 'sync did not take the interlock')
+call assert_true(has_key(s:State().s_inflight_revision, string(s:unwind)))
+call s:CallPrivate('UnwindInflightSync', [s:unwind])
+call assert_false(get(s:State().s_inflight_sync, string(s:unwind), v:false),
+      \ 'a failed send would latch the sync interlock forever')
+call assert_false(has_key(s:State().s_inflight_revision, string(s:unwind)),
+      \ 'a failed send would leave an inflight revision behind')
+
+" 'buffer not cached' is the daemon evicting from its own cache; the handler
+" already recovers by forcing a full resync, so echoing it only produced a
+" hit-enter prompt mid-edit. Genuine failures must still be reported.
+call assert_true(s:CallPrivate('RecoverableDaemonError', ['buffer not cached: 12']))
+call assert_true(s:CallPrivate('RecoverableDaemonError', ['edit_lines mismatch']))
+call assert_false(s:CallPrivate('RecoverableDaemonError', ['query compile failed']))
+messages clear
+call s:CallPrivate('OnDaemonEvent', [{'type': 'error', 'buf': s:unwind,
+      \ 'op': 'highlight', 'message': 'buffer not cached: 12'}])
+call assert_notmatch('buffer not cached', execute('messages'),
+      \ 'a self-healing daemon error was echoed to the user')
+call assert_equal(-1, get(s:State().s_sent_changedtick, string(s:unwind), 0),
+      \ 'suppressing the echo also suppressed the resync')
+call s:CallPrivate('OnDaemonEvent', [{'type': 'error', 'buf': s:unwind,
+      \ 'op': 'highlight', 'message': 'synthetic unrecoverable failure'}])
+call assert_match('synthetic unrecoverable failure', execute('messages'),
+      \ 'a real daemon error was swallowed')
+call simpletreesitter#Disable()
+
 " :TsHlInspect answers "why is this token this colour, and which group do I
 " override" from the daemon's own capture/group tables.
 call assert_equal(2, exists(':TsHlInspect'))

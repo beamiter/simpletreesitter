@@ -2,6 +2,21 @@
 
 ## Unreleased - 2026-08-08
 
+### 修复：发送失败不再永久冻结一个 buffer；可自愈的错误不再打断输入
+
+- `core#Send()` 在 job 仍存活但 `ch_sendraw` 抛出时返回 false（管道满、daemon
+  卡在写入中）。`SyncBufferNow` 先置 `s_inflight_sync`/`s_inflight_revision`
+  再发送，失败分支只是 `return`，没有任何东西会再来清掉这两个标记：此后
+  `ScheduleSync()` 卡在 inflight 守卫上，highlight/symbols/folds 全部卡在
+  changedtick 检查上——该 buffer 在本次会话里彻底停止更新，且没有任何提示。
+  现在三类请求（sync、highlight、folds）在发送失败时都会把自己刚占用的状态还
+  回去，下一次调度正常重试。
+- daemon 自身缓存淘汰后返回的 `buffer not cached`（超过 128 个 buffer 就会发生）
+  以及两个增量同步分歧检查，都是插件在几行之后主动整体重同步就能自愈的；此前它们
+  仍被 `echom`，在打字过程中弹出 hit-enter 提示，报告一件已经修好的事。现在这三类
+  写日志、不打扰用户，真正的错误照旧上报。三处重复的正则合并成一个
+  `RecoverableDaemonError()`，抑制条件与恢复条件从此不可能各自漂移。
+
 ### 新增 `:TsHlInspect`：光标处的 capture 与高亮组
 
 - 对一个语法高亮插件来说，"这个 token 为什么是这个颜色、我该覆盖哪个组"是第一
