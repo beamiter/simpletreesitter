@@ -706,7 +706,50 @@ if exists('+winbar')
   call assert_equal('%{simpletreesitter#Breadcrumb()}', &l:winbar,
         \ 'winbar does not hold the fixed breadcrumb expression')
 endif
-redraw
+
+" `vim -es` never paints a screen, so nothing here evaluates a statusline format
+" string: I measured a %{} item staying unevaluated through redraw, redraw!,
+" redrawstatus, redrawstatus! and redrawtabline, and this build has no 'winbar'
+" at all (exists('+winbar') == 0), so SetWinbar() returns before it assigns.
+" `redraw | call assert_false(exists('g:pwned'))` is therefore green by
+" construction: it would stay green if SetWinbar went back to interpolating the
+" symbol name, which is the one regression it claims to guard.  Stand in for the
+" renderer instead -- evaluate the option's %{} items the way Vim's screen code
+" would -- and prove the stand-in can fire before trusting that it did not.
+function! s:EvalStatuslineItems(value) abort
+  let l:i = 0
+  while 1
+    let l:open = stridx(a:value, '%{', l:i)
+    if l:open < 0
+      break
+    endif
+    let l:close = stridx(a:value, '}', l:open + 2)
+    if l:close < 0
+      break
+    endif
+    " Vim renders the *result* of a plain %{} literally and never re-parses it,
+    " so this deliberately does not recurse into the returned text.
+    call eval(strpart(a:value, l:open + 2, l:close - l:open - 2))
+    let l:i = l:close + 1
+  endwhile
+endfunction
+
+call s:EvalStatuslineItems('left %{execute("let g:sl_probe = 1")} right')
+call assert_equal(1, get(g:, 'sl_probe', -1),
+      \ 'the stand-in statusline evaluator never ran, so the payload assertion below cannot fail')
+unlet! g:sl_probe
+
+" The hostile name reaches Breadcrumb() intact (asserted above) and must still
+" leave the option a fixed constant, whatever bytes it carries.
+for s:payload in [s:hostile, '%{execute("let g:pwned = 1")}', '%%{execute("let g:pwned = 1")}', '50%']
+  call assert_equal('%{simpletreesitter#Breadcrumb()}',
+        \ s:CallPrivate('WinbarValue', [s:payload]),
+        \ 'symbol text leaked into the winbar format string: ' . s:payload)
+endfor
+call s:EvalStatuslineItems(s:CallPrivate('WinbarValue', [simpletreesitter#Breadcrumb()]))
+if exists('+winbar')
+  call s:EvalStatuslineItems(&l:winbar)
+endif
 call assert_false(exists('g:pwned'),
       \ 'breadcrumb evaluated a %{} payload taken from a symbol name')
 
