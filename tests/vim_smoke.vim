@@ -829,10 +829,19 @@ for s:spec in simpletreesitter#TEXTOBJECT_SPECS
         \ 'no operator-pending <Plug> mapping for ' . s:spec)
   call assert_match('TextObject', maparg(s:plug, 'x'),
         \ 'no visual <Plug> mapping for ' . s:spec)
+  " :<C-u> has already dropped the selection by the time the function runs, so
+  " the Visual-mode mapping must ask for it back; only that argument keeps a
+  " declining object from stranding the user in Normal mode.
+  call assert_match(', v:true)', maparg(s:plug, 'x'),
+        \ 'the Visual-mode mapping for ' . s:spec . ' does not restore the selection')
+  call assert_notmatch(', v:true)', maparg(s:plug, 'o'),
+        \ 'the operator-pending mapping for ' . s:spec . ' asks for a selection to restore')
 endfor
 for s:lhs in ['af', 'if', 'ac', 'ic', 'aa', 'ia']
   call assert_match('simpletreesitter-textobj', maparg(s:lhs, 'o'),
         \ s:lhs . ' is not installed as an operator-pending text object')
+  call assert_match('simpletreesitter-textobj', maparg(s:lhs, 'x'),
+        \ s:lhs . ' is not installed as a Visual-mode text object')
 endfor
 " Incremental selection must not take <CR>/<BS> without being asked to.
 call assert_equal('', maparg('<CR>', 'x'), 'selection maps were installed by default')
@@ -897,11 +906,45 @@ call assert_equal(s:before, getline(1, '$'), 'a cold scope cache still edited th
 call assert_equal(s:cold_tick, getbufinfo(s:to)[0].changedtick,
       \ 'a cold scope cache changed the buffer')
 
+" Same cold cache, entered from Visual mode.  Stock Vim beeps and keeps the
+" selection; so must this.  Dropping out of Visual is not a harmless no-op --
+" the help then tells the user to repeat the key, and in Normal mode `af` is
+" "append an f", which silently edits the buffer the object promised not to
+" touch.  Press it twice here, exactly as documented.
+call cursor(2, 9)
+call feedkeys("v", 'x')
+call feedkeys("af", 'x')
+call assert_equal('v', mode(),
+      \ 'a cold Visual text object dropped the user out of Visual mode')
+call feedkeys("af", 'x')
+call assert_equal('v', mode(),
+      \ 'repeating a cold Visual text object dropped the user out of Visual mode')
+execute "normal! \<Esc>"
+call assert_equal(s:before, getline(1, '$'),
+      \ 'a cold Visual text object edited the buffer')
+call assert_equal(s:cold_tick, getbufinfo(s:to)[0].changedtick,
+      \ 'a cold Visual text object changed the buffer')
+
 call simpletreesitter#Enable()
 sleep 300m
 call cursor(2, 9)
 call simpletreesitter#OnScroll(s:to)
 sleep 300m
+
+" A warm chain that holds no node of the wanted class falls through the loop
+" instead of returning early, and that path has to give the selection back too.
+let s:kinds = map(copy(s:State().s_scope_cache[s:to].chain), 'get(v:val, "kind", "")')
+call assert_equal(-1, index(s:kinds, 'class'),
+      \ 'this buffer has a class after all -- pick another object for this check')
+let s:warm_tick = getbufinfo(s:to)[0].changedtick
+call feedkeys("v", 'x')
+call feedkeys("ac", 'x')
+call assert_equal('v', mode(),
+      \ 'a Visual text object with no node of that class dropped the user out of Visual mode')
+execute "normal! \<Esc>"
+call assert_equal(s:warm_tick, getbufinfo(s:to)[0].changedtick,
+      \ 'a declining Visual text object changed the buffer')
+call cursor(2, 9)
 
 " One reply serves a whole token: moving inside the anchor must not invalidate
 " the cache, and leaving it must.
@@ -1020,6 +1063,29 @@ call assert_match('alpha', join(getbufline(s:v7_outline, 1, '$'), "\n"),
 call assert_equal('simpletreesitter#FoldExpr(v:lnum)', &l:foldexpr,
       \ 'the fold expression was lost')
 
+" Fold levels are a function of (folds, line count), so holding the digest is
+" not enough to be answered `unchanged` -- the recorded fold array has to still
+" span the buffer.  :TsHlFoldsToggle off drops s_fold_exprs and keeps the
+" digest, so without that second condition the refold on the way back in is
+" suppressed, ApplyFolds() never runs, FoldExpr() answers '=' for every line
+" and folding stays dead until the next edit.  No edit here: toggle and back.
+call assert_equal(line('$'), len(get(s:State().s_fold_exprs, s:v7, [])),
+      \ 'the fold expressions do not span the buffer')
+call simpletreesitter#FoldsToggle()
+call assert_equal([], get(s:State().s_fold_exprs, s:v7, []),
+      \ 'toggling folds off left the fold expressions behind')
+call assert_notequal('', get(s:State().s_folds_digest, s:v7, ''),
+      \ 'toggling folds off dropped the digest, so nothing here could regress')
+call assert_equal('', s:CallPrivate('FoldsDigestToSend', [s:v7]),
+      \ 'a fold array that no longer spans the buffer was still offered its digest')
+call simpletreesitter#FoldsToggle()
+sleep 400m
+call assert_equal(line('$'), len(get(s:State().s_fold_exprs, s:v7, [])),
+      \ 'folds never came back after being toggled off and on again')
+call assert_equal('>1', simpletreesitter#FoldExpr(1),
+      \ 'FoldExpr fell back to = after a fold toggle')
+call assert_true(foldlevel(2) > 0, 'line 2 is not inside a fold after a fold toggle')
+
 " A consumer that no longer holds the payload must not be offered the digest:
 " the breadcrumb and the outline both follow the cursor to another buffer, and
 " answering `unchanged` there would leave them describing this one forever.
@@ -1033,8 +1099,9 @@ call assert_notequal(s:v7, s:State().s_bc_items_buf,
       \ 'the breadcrumb never followed the cursor to the second buffer')
 call assert_equal('', s:CallPrivate('SymbolsDigestToSend', [s:v7]),
       \ 'the digest was offered while its consumers held another buffer')
-" Fold levels are sized by the buffer, so a buffer with no fold data of the
-" right length can never be answered with `unchanged`.
+" A buffer that never recorded a digest at all cannot be offered one either.
+" (This one stops at the first condition; the toggle above is what covers the
+" line-count condition.)
 call assert_equal('', s:CallPrivate('FoldsDigestToSend', [s:v7 + 100000]),
       \ 'a buffer with no fold data was offered a digest')
 

@@ -159,10 +159,13 @@ enddef
 
 # 每个类别都给 <Plug>，不用默认键的人也能自己接。
 # 用 :<C-u>call 而不是 <Cmd>：函数要把用户带进可视模式，<Cmd> 映射不许换模式。
+# 可视模式那份多传一个真值：:<C-u> 已经把用户带出了可视模式，对象答不出来时
+# 要靠它 gv 把选区还回去，否则后续按键会掉进普通模式改文件。
 for spec in TEXTOBJECT_SPECS
-  var rhs = printf(':<C-u>call simpletreesitter#TextObject(%s)<CR>', string(spec))
-  execute 'xnoremap <silent> ' .. TextObjectPlug(spec) .. ' ' .. rhs
-  execute 'onoremap <silent> ' .. TextObjectPlug(spec) .. ' ' .. rhs
+  execute printf('xnoremap <silent> %s :<C-u>call simpletreesitter#TextObject(%s, v:true)<CR>',
+    TextObjectPlug(spec), string(spec))
+  execute printf('onoremap <silent> %s :<C-u>call simpletreesitter#TextObject(%s)<CR>',
+    TextObjectPlug(spec), string(spec))
 endfor
 
 nnoremap <silent> <Plug>(simpletreesitter-select-init) :<C-u>call simpletreesitter#SelectInit()<CR>

@@ -223,9 +223,15 @@ cached scope chain and never blocks Vim.  The chain is prefetched when the
 cursor comes to rest, and one reply covers the whole token the cursor is in.
 
 If no chain is cached for the buffer's current text -- immediately after an
-edit, or before the first prefetch has landed -- the object selects nothing and
-the operator is abandoned with the buffer untouched.  It never half-applies an
-edit.  Repeat the key and it will work.
+edit, or before the first prefetch has landed -- the object selects nothing.
+So does an object whose class is nowhere in the chain, such as ac in a file
+with no type in it.
+
+In Operator-pending mode the operator is then abandoned with the buffer
+untouched; it never half-applies an edit.  In Visual mode the selection you
+already had is handed straight back, unchanged, exactly as Vim does when one
+of its own text objects has nothing to select.  Repeat the key in either mode
+and it will work.
 
                                 *g:simpletreesitter_scope_prefetch*
                                 *g:simpletreesitter_scope_debounce*

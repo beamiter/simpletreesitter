@@ -3419,11 +3419,11 @@ def SameOuterRange(left: dict<any>, right: dict<any>): bool
   return true
 enddef
 
-# spec 形如 'function.outer'：类别 + outer/inner。
-export def TextObject(spec: string)
+# spec 形如 'function.outer'：类别 + outer/inner。答不出来时返回 false。
+def TextObjectSelect(spec: string): bool
   var parts = split(spec, '\.')
   if len(parts) != 2
-    return
+    return false
   endif
   var want = parts[0]
   var half = parts[1]
@@ -3433,15 +3433,28 @@ export def TextObject(spec: string)
   if !ScopeCacheValid(buf, lnum, col)
     # 冷缓存：把这次位置取回来给下一次按键用，本次什么都不选。
     RequestScopeNow(buf, lnum, col)
-    return
+    return false
   endif
   for node in s_scope_cache[buf].chain
     # inner 可能是空区间（例如 `{}` 的函数体）；那就继续往外找同类节点，
     # 而不是选中一个由空区间猜出来的位置。
     if get(node, 'kind', '') ==# want && SelectScopeNode(node, half)
-      return
+      return true
     endif
   endfor
+  return false
+enddef
+
+# visual 为真表示这次是可视模式的映射调用。可视模式的映射必须用 :<C-u> 而不是
+# <Cmd>（<Cmd> 映射不许换模式），代价是进函数时用户已经被带出可视模式了。答得
+# 出来时 SelectScopeNode() 会重新划一个选区；答不出来就得把原来的选区还回去，
+# 否则接下来的按键会落进普通模式——`af` 在那里是「append 一个 f」，帮助里那句
+# 「再按一次就好了」就变成了一次静默的改文件。SelectExpand()/SelectShrink()
+# 早就是这么做的。
+export def TextObject(spec: string, visual: bool = false)
+  if !TextObjectSelect(spec) && visual
+    normal! gv
+  endif
 enddef
 
 # 增量选择：从光标处最内层的具名节点开始，沿链往外扩。
