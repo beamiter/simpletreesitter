@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test daemon vim-test vim-core defcompile core-verify
+.PHONY: check fmt clippy test daemon vim-test vim-indent vim-core defcompile core-verify
 
-check: core-verify fmt clippy test defcompile vim-core vim-test
+check: core-verify fmt clippy test defcompile vim-core vim-indent vim-test
 
 fmt:
 	cargo fmt --all -- --check
@@ -24,6 +24,9 @@ daemon:
 
 vim-test: daemon
 	vim -Nu NONE -n -i NONE -es -S tests/vim_smoke.vim
+
+vim-indent:
+	vim -Nu NONE -n -i NONE -es -S tests/haskell_indent.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

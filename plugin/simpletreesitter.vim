@@ -25,7 +25,8 @@ g:simpletreesitter_auto_enable_filetypes = get(g:, 'simpletreesitter_auto_enable
   ['rust', 'c', 'cpp', 'cc', 'javascript', 'javascriptreact', 'jsx',
    'typescript', 'typescriptreact',
    'python', 'go', 'sh', 'bash', 'zsh', 'vim', 'vimrc',
-   'json', 'jsonc', 'yaml', 'toml', 'lua', 'html', 'css', 'markdown'])
+   'json', 'jsonc', 'yaml', 'toml', 'lua', 'html', 'css', 'markdown',
+   'julia', 'haskell'])
 g:simpletreesitter_auto_stop = get(g:, 'simpletreesitter_auto_stop', 1)
 g:simpletreesitter_max_buffer_bytes = get(g:, 'simpletreesitter_max_buffer_bytes', 5 * 1024 * 1024)
 g:simpletreesitter_clear_props_on_disable = get(g:, 'simpletreesitter_clear_props_on_disable', 1)
@@ -34,6 +35,14 @@ g:simpletreesitter_incremental_sync = get(g:, 'simpletreesitter_incremental_sync
 
 g:simpletreesitter_debug = get(g:, 'simpletreesitter_debug', 0)
 g:simpletreesitter_log_file = get(g:, 'simpletreesitter_log_file', '/tmp/ts-hl.log')
+g:simpletreesitter_match_words = get(g:, 'simpletreesitter_match_words', 1)
+
+# Vim 自带的 matchit 已经覆盖 %, g%, [%, ]% 与 a% 文本对象，并会读取各
+# filetype 的 b:match_words。SimpleTreeSitter 负责语义高亮/括号层级，matchit
+# 负责块关键字跳转；两者组合替代 vim-matchup，同时不再引入第三方插件。
+if g:simpletreesitter_match_words
+  silent! packadd matchit
+endif
 
 g:simpletreesitter_outline_width = get(g:, 'simpletreesitter_outline_width', 40)
 

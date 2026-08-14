@@ -152,6 +152,8 @@ const s_language_by_filetype = {
   html: 'html',
   css: 'css',
   markdown: 'markdown',
+  julia: 'julia',
+  haskell: 'haskell',
 }
 
 # =============== 面包屑状态 ===============
@@ -2395,6 +2397,10 @@ export def Health()
   echo printf('  [%s] text properties: %s',
     has('textprop') ? 'OK' : 'ERROR',
     has('textprop') ? 'available' : 'missing +textprop — highlighting disabled')
+  echo printf('  [%s] match words: %s',
+    !get(g:, 'simpletreesitter_match_words', 1) || exists('g:loaded_matchit') ? 'OK' : 'WARN',
+    !get(g:, 'simpletreesitter_match_words', 1) ? 'disabled' :
+      (exists('g:loaded_matchit') ? 'Vim matchit active' : 'matchit unavailable'))
   echo printf('  [INFO] enabled: %s, active buffers: %d',
     s_enabled ? 'yes' : 'no', len(s_active_bufs))
 enddef

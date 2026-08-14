@@ -25,6 +25,8 @@ const SUPPORTED_LANGUAGES: &[&str] = &[
     "html",
     "css",
     "markdown",
+    "julia",
+    "haskell",
 ];
 const PROTOCOL_VERSION: u32 = 7;
 
@@ -680,6 +682,16 @@ impl Server {
                 tree_sitter_md::LANGUAGE.into(),
                 queries::MD_QUERY,
                 queries::MD_SYM_QUERY,
+            ),
+            "julia" => (
+                tree_sitter_julia::LANGUAGE.into(),
+                queries::JULIA_QUERY,
+                queries::JULIA_SYM_QUERY,
+            ),
+            "haskell" => (
+                tree_sitter_haskell::LANGUAGE.into(),
+                queries::HASKELL_QUERY,
+                queries::HASKELL_SYM_QUERY,
             ),
             _ => return Err(anyhow!("unsupported language: {lang}")),
         };
@@ -2438,6 +2450,27 @@ fn foldable_kinds(lang: &str) -> &'static [&'static str] {
         "json" => &["object", "array"],
         "yaml" => &["block_mapping", "block_sequence"],
         "toml" => &["table", "table_array_element"],
+        "julia" => &[
+            "function_definition",
+            "macro_definition",
+            "struct_definition",
+            "module_definition",
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "try_statement",
+            "let_statement",
+            "compound_statement",
+        ],
+        "haskell" => &[
+            "function",
+            "class",
+            "instance",
+            "data_type",
+            "newtype",
+            "do",
+            "case",
+        ],
         _ => &[],
     }
 }
@@ -2895,6 +2928,29 @@ fn scope_table(lang: &str) -> &'static [(&'static str, &'static str)] {
             ("for_statement", "loop"),
             ("while_statement", "loop"),
         ],
+        "julia" => &[
+            ("function_definition", "function"),
+            ("macro_definition", "function"),
+            ("struct_definition", "class"),
+            ("module_definition", "class"),
+            ("compound_statement", "block"),
+            ("call_expression", "call"),
+            ("if_statement", "conditional"),
+            ("try_statement", "conditional"),
+            ("for_statement", "loop"),
+            ("while_statement", "loop"),
+        ],
+        "haskell" => &[
+            ("function", "function"),
+            ("lambda", "function"),
+            ("class", "class"),
+            ("data_type", "class"),
+            ("newtype", "class"),
+            ("apply", "call"),
+            ("conditional", "conditional"),
+            ("case", "conditional"),
+            ("do", "block"),
+        ],
         "css" => &[("rule_set", "class"), ("block", "block")],
         _ => &[],
     }
@@ -3274,10 +3330,12 @@ fn capture_priority(name: &str) -> u8 {
 fn map_capture_to_group(name: &str) -> &'static str {
     match name {
         "comment" => "TSComment",
+        "spell" => "TSComment",
         "string" => "TSString",
         "string.regex" => "TStringRegex",
         "string.escape" => "TStringEscape",
         "string.special" => "TStringSpecial",
+        "string.documentation" => "TSString",
         "number" => "TSNumber",
         "boolean" => "TSBoolean",
         "null" => "TSConstant",
@@ -3287,10 +3345,12 @@ fn map_capture_to_group(name: &str) -> &'static str {
         "operator" => "TSOperator",
         "punctuation.delimiter" => "TSPunctDelimiter",
         "punctuation.bracket" => "TSPunctBracket",
+        "punctuation.special" => "TSPunctDelimiter",
 
         "variable" => "TSVariable",
         "variable.parameter" => "TSVariableParameter",
         "variable.builtin" => "TSVariableBuiltin",
+        "variable.member" => "TSProperty",
         "constant" => "TSConstant",
         "constant.builtin" => "TSConstBuiltin",
 
@@ -3300,12 +3360,18 @@ fn map_capture_to_group(name: &str) -> &'static str {
         "function" => "TSFunction",
         "method" => "TSMethod",
         "function.builtin" => "TSFunctionBuiltin",
+        "function.macro" => "TSMacro",
 
         "type" => "TSType",
         "type.builtin" => "TSTypeBuiltin",
         "namespace" => "TSNamespace",
         "macro" => "TSMacro",
         "attribute" => "TSAttribute",
+
+        "character" => "TSString",
+        "number.float" => "TSNumber",
+        "module" => "TSNamespace",
+        "constructor" => "TSType",
 
         "text.title" => "TSTitle",
         "text.literal" => "TSLiteral",
@@ -3315,6 +3381,11 @@ fn map_capture_to_group(name: &str) -> &'static str {
         "text.uri" => "TSURI",
         "text.reference" => "TSLink",
 
+        name if name.starts_with("comment.") => "TSComment",
+        name if name.starts_with("string.special") => "TStringSpecial",
+        name if name.starts_with("function.") => "TSFunction",
+        name if name.starts_with("keyword.") => "TSKeyword",
+        name if name.starts_with("type.") => "TSType",
         _ => "",
     }
 }
@@ -3443,6 +3514,8 @@ fn injection_language_for_tag(tag: &str) -> Option<&'static str> {
         "yml" => "yaml",
         "vim9" | "viml" => "vim",
         "md" => "markdown",
+        "jl" => "julia",
+        "hs" => "haskell",
         other => other,
     };
     SUPPORTED_LANGUAGES
@@ -3927,7 +4000,7 @@ mod tests {
             let queries = server.queries.get(*lang).unwrap();
             for capture in queries.hl_query.capture_names() {
                 assert!(
-                    !map_capture_to_group(capture).is_empty(),
+                    capture.starts_with('_') || !map_capture_to_group(capture).is_empty(),
                     "{lang} has unmapped highlight capture @{capture}"
                 );
             }
@@ -4735,6 +4808,12 @@ mod tests {
             ("json", "{\"top_key\": {\"nested\": 1}}\n", "top_key"),
             ("yaml", "top_key:\n  nested: 1\n", "top_key"),
             ("toml", "[section]\nkey = \"value\"\n", "section"),
+            (
+                "julia",
+                "module Demo\nstruct Point\n  x::Float64\nend\nfunction area(p::Point)\n  p.x\nend\nend\n",
+                "area",
+            ),
+            ("haskell", "module Demo where\narea x = x * x\n", "area"),
         ];
         let mut server = Server::new();
         for (index, (lang, source, expected_symbol)) in cases.into_iter().enumerate() {

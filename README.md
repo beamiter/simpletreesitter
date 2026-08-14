@@ -56,6 +56,12 @@
 | HTML | `html` | ✅（`<script>`/`<style>` 注入） | ✅ |
 | CSS | `css` | ✅ | ✅ |
 | Markdown (GFM) | `markdown` | ✅（行内 + 围栏注入） | ✅（标题大纲） |
+| Julia | `julia` | ✅ | ✅ |
+| Haskell | `haskell` | ✅ | ✅ |
+
+SimpleTreeSitter also enables Vim's bundled `matchit` for `%`/`g%`/`[%`/`]%`
+block matching and ships a lightweight Haskell layout indent script, so these
+features do not require `vim-matchup` or `haskell-vim`.
 
 ## 环境要求
 

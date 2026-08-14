@@ -39,3 +39,7 @@ pub const CSS_SYM_QUERY: &str = include_str!("css_symbols.scm");
 pub const MD_QUERY: &str = include_str!("markdown.scm");
 pub const MD_SYM_QUERY: &str = include_str!("markdown_symbols.scm");
 pub const MD_INLINE_QUERY: &str = include_str!("markdown_inline.scm");
+pub const JULIA_QUERY: &str = include_str!("julia.scm");
+pub const JULIA_SYM_QUERY: &str = include_str!("julia_symbols.scm");
+pub const HASKELL_QUERY: &str = include_str!("haskell.scm");
+pub const HASKELL_SYM_QUERY: &str = include_str!("haskell_symbols.scm");

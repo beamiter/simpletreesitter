@@ -23,7 +23,12 @@ large buffers stay cheap to keep in sync.
 
 Supported filetypes: rust, c, cpp, cc, javascript, javascriptreact, jsx,
 typescript, typescriptreact, python, go, sh, bash, zsh, vim, vimrc, json,
-jsonc, yaml, toml, lua, html, css and markdown.
+jsonc, yaml, toml, lua, html, css, markdown, julia and haskell.
+
+When |g:simpletreesitter_match_words| is enabled (the default), Vim's bundled
+|matchit| supplies %, g%, [%, ]% and a% block matching.  The plugin also ships
+its own Haskell layout indentation so neither vim-matchup nor haskell-vim is
+required.
 
 Markdown uses two grammars: the block grammar drives structure (headings,
 fences, lists, tables) and a second inline tree — parsed only inside the

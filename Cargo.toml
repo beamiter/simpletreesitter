@@ -35,6 +35,8 @@ tree-sitter-lua = "0.5"
 tree-sitter-html = "0.23"
 tree-sitter-css = "0.25"
 tree-sitter-md = "0.5"
+tree-sitter-julia = "0.23.1"
+tree-sitter-haskell = "0.23.1"
 [dependencies.tree-sitter-vim9]
 git = "https://github.com/beamiter/tree-sitter-vim9"
 rev = "fc891a2a5d6a0fde65a256d508c9e5406aba4464"
