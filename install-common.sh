@@ -84,25 +84,31 @@ fi
 # Check the daemon before replacing a working one with it.  A binary that
 # cannot answer --version is one the plugin will fail to start much later,
 # somewhere far less obvious than here.
+# Written as two tests rather than a case with `;&` fall-through: that
+# terminator needs bash 4, and macOS still ships bash 3.2, where the whole
+# file is a syntax error before a single line of it runs.
 case "$SIMPLECORE_VERIFY" in
-self-test)
-	if ! "$source_binary" --self-test >/dev/null; then
-		echo "error: the freshly built $SIMPLECORE_BINARY failed its self-test; nothing was installed." >&2
-		exit 1
-	fi
-	;&
-version)
-	if ! reported_version="$("$source_binary" --version)"; then
-		echo "error: the freshly built $SIMPLECORE_BINARY could not report its version; nothing was installed." >&2
-		exit 1
-	fi
-	;;
-none) reported_version="" ;;
+self-test | version | none) ;;
 *)
 	echo "install.sh: unknown SIMPLECORE_VERIFY '$SIMPLECORE_VERIFY'" >&2
 	exit 1
 	;;
 esac
+
+if [ "$SIMPLECORE_VERIFY" = self-test ]; then
+	if ! "$source_binary" --self-test >/dev/null; then
+		echo "error: the freshly built $SIMPLECORE_BINARY failed its self-test; nothing was installed." >&2
+		exit 1
+	fi
+fi
+
+reported_version=""
+if [ "$SIMPLECORE_VERIFY" != none ]; then
+	if ! reported_version="$("$source_binary" --version)"; then
+		echo "error: the freshly built $SIMPLECORE_BINARY could not report its version; nothing was installed." >&2
+		exit 1
+	fi
+fi
 
 # ── install ──────────────────────────────────────────────────────────────────
 
