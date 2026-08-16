@@ -42,6 +42,48 @@ var s_daemon_capabilities: dict<bool> = {}
 var s_last_ranges: dict<list<number>> = {}
 # 上次实际写入的高亮类型 {bufnr: [type, ...]}，用于增量清除（只清自己用过的类型）
 var s_applied_types: dict<list<string>> = {}
+# =============== 光标上下文 ===============
+# The window the user's cursor is really in.
+#
+# win_getid() and bufnr('%') cannot answer that question on their own:
+# win_execute() makes another window (and its buffer) current for the duration
+# of the command it runs, and that is exactly how SimpleRemote attaches a
+# filetype to a remote:// buffer whose asynchronous read finished in a
+# background window -- DetectRemoteFiletype() runs
+# `win_execute(winid, 'filetype detect')`.  The FileType autocmd then reaches
+# OnBufEvent() with the background buffer current, so every "is this the buffer
+# under the cursor?" test spelled `bufnr('%')` answers yes for a buffer the
+# user never touched: the Outline retargets, the breadcrumb adopts it, and the
+# user's own 'winbar' is blanked by the next UpdateBreadcrumb() and stays blank
+# until an edit or a BufEnter.
+#
+# win_execute() switches windows with 'noautocmd', so BufEnter, WinEnter and
+# CursorMoved never fire inside it: a window id fed only by those three always
+# names the user's own window.  The buffer is read back out of that window
+# instead of being tracked separately, so :bufdo -- and anything else that
+# swaps the buffer of the cursor's window -- stays correct for free.
+var s_cursor_win: number = 0
+
+export def NoteCursorContext()
+  s_cursor_win = win_getid()
+enddef
+
+def CursorWin(): number
+  if s_cursor_win != 0 && !empty(getwininfo(s_cursor_win))
+    return s_cursor_win
+  endif
+  # Nothing tracked yet (the first FileType of a session can precede the first
+  # BufEnter), or the window is gone: fall back to what Vim says.
+  return win_getid()
+enddef
+
+# True when this event is about the buffer under the user's cursor, in the
+# user's own window -- the only case in which cursor-owned state (the Outline
+# source, the breadcrumb target, this window's indent guides) may move.
+def IsCursorBuf(buf: number): bool
+  return win_getid() == CursorWin() && bufnr('%') == buf
+enddef
+
 # =============== 侧边栏状态 ===============
 var s_outline_win: number = 0
 var s_outline_buf: number = 0
@@ -2543,16 +2585,24 @@ export def OnBufEvent(buf: number)
   if !s_enabled
     return
   endif
+  # Syncing, highlighting and folding are buffer-scoped and run for whichever
+  # buffer the event named.  Everything that names the cursor instead -- the
+  # Outline's source buffer and window, the breadcrumb, the indent guides of
+  # "this" window -- may only move when the event really is about the buffer
+  # under the cursor.  FileType arrives here from inside win_execute() for a
+  # background remote:// read, where the current buffer is not the user's; see
+  # s_cursor_win.
+  var cursor_owned = IsCursorBuf(buf)
   # 先保证文本同步
   if IsSupportedLang(buf)
     s_active_bufs[buf] = true
-    if win_getid() != s_outline_win
+    if cursor_owned && win_getid() != s_outline_win
       s_outline_src_win = win_getid()
     endif
   endif
   ScheduleSync(buf)
 
-  if s_outline_win != 0 && buf != s_outline_buf && getbufvar(buf, '&filetype') !=# 'simpletreesitter_outline'
+  if cursor_owned && s_outline_win != 0 && buf != s_outline_buf && getbufvar(buf, '&filetype') !=# 'simpletreesitter_outline'
     if IsSupportedLang(buf)
       if s_outline_state_buf != buf
         s_outline_collapsed = {}
@@ -2582,7 +2632,7 @@ export def OnBufEvent(buf: number)
   ScheduleRequest(buf, 'edit')
   ScheduleSymbols(buf)
   # 缩进参考线
-  if IsSupportedLang(buf)
+  if cursor_owned && IsSupportedLang(buf)
     ApplyIndentGuidesForBuf()
   endif
 enddef
@@ -2606,7 +2656,7 @@ export def OnRemoteBufferRead(buf: number)
   if !bufexists(buf) || !bufloaded(buf)
     return
   endif
-  if buf == bufnr('%')
+  if IsCursorBuf(buf)
     OnBufEvent(buf)
     return
   endif
@@ -2638,6 +2688,10 @@ export def OnScroll(buf: number)
   if !bufexists(buf)
     return
   endif
+  # CursorMoved cannot fire inside win_execute(), so this is a safe place to
+  # re-anchor the cursor's window even if some other plugin moved between
+  # windows with :noautocmd.
+  NoteCursorContext()
   SyncOutlineContext()
   # AutoEnableForBuffer(buf)
   ScheduleRequest(buf, 'scroll')
@@ -3048,7 +3102,10 @@ def ScheduleSymbols(buf: number)
   # its ACK came back -- must neither retarget it (UpdateBreadcrumb() would
   # blank this window's bar until the next edit) nor cancel a symbols request
   # the current buffer's Outline is waiting for through the shared timer.
-  var need_bc = get(g:, 'simpletreesitter_breadcrumb', 0) && buf == bufnr('%')
+  # IsCursorBuf(), not bufnr('%'): SimpleRemote detects the filetype of a
+  # background remote:// read with win_execute(), which makes that buffer
+  # current while the FileType autocmd runs.
+  var need_bc = get(g:, 'simpletreesitter_breadcrumb', 0) && IsCursorBuf(buf)
     && IsSupportedLang(buf)
   if !need_outline && !need_bc
     return

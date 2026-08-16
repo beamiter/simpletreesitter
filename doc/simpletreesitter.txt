@@ -358,7 +358,13 @@ optional and detected at runtime:
   paths and need nothing special.
 - Virtual workspaces open remote:///path buffers with 'buftype' acwrite.  The
   text arrives asynchronously; the FileType event that follows attaches the
-  buffer as usual.
+  buffer as usual.  When the read lands in a window the cursor is not in,
+  SimpleRemote detects the filetype with win_execute(), which makes that
+  window and buffer current while FileType runs.  The plugin tracks the
+  cursor's own window through BufEnter/WinEnter/CursorMoved -- none of which
+  can fire inside win_execute() -- so such a read attaches and highlights the
+  background buffer without moving the Outline, the breadcrumb or the indent
+  guides away from the buffer you are actually editing.
 - The plugin listens for `User SimpleRemoteBufferRead`, which SimpleRemote
   fires with the buffer number in g:simpleremote_event once a remote://
   buffer has been (re)filled.  For the current buffer this resyncs the fresh

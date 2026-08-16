@@ -272,7 +272,11 @@ terminal、prompt、popup 以及本插件自己的 Outline/Inspect 视图）一�
 
 - 投影模式（sshfs / docker-bind / local-map）打开的是普通本地路径，无需任何处理。
 - 虚拟模式打开 `remote:///path` buffer（`'buftype'` acwrite），文本异步到达；随后的
-  FileType 事件照常挂载。
+  FileType 事件照常挂载。若这次读取落在光标不在的窗口里，SimpleRemote 会用
+  `win_execute()` 跑 `filetype detect` —— 那一刻当前窗口/当前 buffer 都是后台那个。
+  插件用 BufEnter/WinEnter/CursorMoved（三者都无法在 `win_execute()` 内触发）记住
+  光标真正所在的窗口，所以后台 buffer 照常挂载、照常高亮，而 Outline、breadcrumb
+  与缩进参考线不会被拽离你正在编辑的 buffer。
 - 插件监听 `User SimpleRemoteBufferRead`（SimpleRemote 在 `remote://` buffer 填充/重读
   完成后触发，`g:simpleremote_event.bufnr` 指明 buffer）：当前 buffer 立即重新同步 ——
   重读不改 `'filetype'`，不会有 FileType，而 TextChanged 要等下一次按键；显示在其他

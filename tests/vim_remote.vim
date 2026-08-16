@@ -16,6 +16,9 @@ let g:simpletreesitter_debounce = 10
 let g:simpletreesitter_scroll_debounce = 10
 let g:simpletreesitter_outline_fancy = 0
 let g:simpletreesitter_outline_spacing = 0
+" A private log path: the default is /tmp/ts-hl.log, which belongs to whatever
+" Vim the developer running `make check` happens to have open.
+let g:simpletreesitter_log_file = '/tmp/simpletreesitter-vim-remote.log'
 
 function! s:AutoloadInfo() abort
   let l:matches = getscriptinfo({'name': 'autoload/simpletreesitter.vim'})
@@ -191,10 +194,126 @@ call assert_equal(s:local, s:State().s_bc_items_buf,
       \ 'the breadcrumb items were replaced by the background buffer')
 call assert_equal(s:sym_requests_before, s:State().s_next_symbol_request_id,
       \ 'a background read issued a symbols request nobody consumes')
+
+" ---------------------------------------------------------------------------
+" 4. The same background read, but reached the way simpleremote really reaches
+"    it.  A buffer that has not been read yet has no filetype, so
+"    ApplyRemoteRead() calls DetectRemoteFiletype(), which for a non-current
+"    buffer runs `win_execute(winid, 'filetype detect')`.  win_execute() makes
+"    the background window -- and its buffer -- current for the duration, so
+"    the FileType autocmd fires with bufnr('%') naming a buffer the cursor was
+"    never in.  Nothing cursor-owned may follow it there.
+" ---------------------------------------------------------------------------
+call assert_equal(s:local_win, win_getid())
+" :split remote://... in the background window, still empty and filetype-less:
+" the state simpleremote leaves behind while the read is in flight.
+call win_gotoid(s:remote_win)
+enew
+execute 'file remote:///work/src/delta.rs'
+let s:fresh = bufnr()
+let s:fresh_win = win_getid()
+call win_gotoid(s:local_win)
+call assert_equal(s:local, bufnr(), 'the cursor did not come back to the local buffer')
+call assert_equal('', getbufvar(s:fresh, '&filetype'), 'the unread buffer already has a filetype')
+" Entering an unsupported buffer legitimately blanks the Outline; wait until it
+" is back on the cursor's buffer before measuring what the read does to it.
+call s:WaitFor({-> s:State().s_outline_src_buf == s:local
+      \ && join(getbufline(s:outline, 1, '$'), "\n") =~# 'beta'},
+      \ 'the Outline did not return to the local buffer')
+call s:WaitFor({-> s:State().s_bc_buf == s:local}, 'the breadcrumb did not return to the local buffer')
+call simpletreesitter#OnScroll(s:local)
+call s:WaitFor({-> simpletreesitter#Breadcrumb() =~# 'beta'},
+      \ 'the local breadcrumb was never produced')
+
+" ApplyRemoteRead(): the text and 'buftype' land on the background buffer,
+" then `filetype detect` runs in its window, then the event is emitted.
+call setbufline(s:fresh, 1, ['pub fn delta() {', '    let d = 4;', '    let e = 5;', '}'])
+call setbufvar(s:fresh, '&buftype', 'acwrite')
+call setbufvar(s:fresh, '&swapfile', 0)
+call setbufvar(s:fresh, 'vimrc_remote',
+      \ {'path': '/work/src/delta.rs', 'uri': 'remote:///work/src/delta.rs', 'generation': 1})
+call setbufvar(s:fresh, '&modified', 0)
+call win_execute(s:fresh_win, 'filetype detect')
+call assert_equal('rust', getbufvar(s:fresh, '&filetype'),
+      \ '`filetype detect` did not reach the background window')
+let g:simpleremote_event = {
+      \ 'event': 'SimpleRemoteBufferRead', 'type': 'buffer-read',
+      \ 'bufnr': s:fresh, 'path': '/work/src/delta.rs', 'workspace': {},
+      \ 'status': 'ssh:devbox', 'time': localtime()}
+doautocmd <nomodeline> User SimpleRemoteBufferRead
+
+call assert_equal(s:local, bufnr(), 'the background detect switched buffers')
+call assert_equal(s:local_win, win_getid(), 'the background detect switched windows')
+call assert_equal(s:local, s:State().s_bc_buf,
+      \ 'a `filetype detect` in a background window stole the breadcrumb')
+call assert_equal(s:local, s:State().s_outline_src_buf,
+      \ 'a `filetype detect` in a background window retargeted the Outline')
+call assert_equal(s:local_win, s:State().s_outline_src_win,
+      \ 'a `filetype detect` in a background window retargeted the Outline source window')
+" The regression was only visible one CursorMoved later: UpdateBreadcrumb()
+" drops the cache and blanks 'winbar' for a window whose buffer is no longer
+" s_bc_buf, and nothing restores it until the next edit or BufEnter.
+call simpletreesitter#OnScroll(s:local)
+sleep 300m
+call assert_equal(s:local, s:State().s_bc_buf, 'the breadcrumb did not stay on the cursor buffer')
+call assert_match('beta', simpletreesitter#Breadcrumb(),
+      \ 'a background `filetype detect` blanked the breadcrumb of the cursor window')
+call assert_notmatch('delta', join(getbufline(s:outline, 1, '$'), "\n"),
+      \ 'the Outline shows the background buffer symbols')
+" The background buffer is still on screen, so it is synced and highlighted --
+" that half of the contract must keep working.
+call s:WaitFor({-> s:HasProps(s:fresh, 2) && s:HasProps(s:fresh, 3)},
+      \ 'the freshly read background remote buffer was not highlighted')
+call assert_true(get(s:State().s_active_bufs, s:fresh, v:false),
+      \ 'the freshly read background remote buffer is not an active buffer')
+
+" ---------------------------------------------------------------------------
+" 5. The user-visible half of the same bug, with no Outline open to paper over
+"    it.  Once s_bc_buf had followed the background detect, the very next
+"    CursorMoved in the user's own window made UpdateBreadcrumb() drop the
+"    cache and blank 'winbar' -- and with no Outline render to pull the state
+"    back, it stayed blank until the next edit or BufEnter.
+" ---------------------------------------------------------------------------
+call simpletreesitter#OutlineClose()
+call assert_equal(s:local_win, win_getid(), 'OutlineClose moved the cursor')
+call win_gotoid(s:fresh_win)
+enew
+execute 'file remote:///work/src/epsilon.rs'
+let s:fresh2 = bufnr()
+let s:fresh2_win = win_getid()
+call win_gotoid(s:local_win)
+call s:WaitFor({-> s:State().s_bc_buf == s:local}, 'the breadcrumb did not return to the local buffer')
+call simpletreesitter#OnScroll(s:local)
+call s:WaitFor({-> simpletreesitter#Breadcrumb() =~# 'beta'},
+      \ 'the local breadcrumb was never restored')
+call setbufline(s:fresh2, 1, ['pub fn epsilon() {', '    let e = 5;', '    let f = 6;', '}'])
+call setbufvar(s:fresh2, '&buftype', 'acwrite')
+call setbufvar(s:fresh2, '&swapfile', 0)
+call setbufvar(s:fresh2, '&modified', 0)
+call win_execute(s:fresh2_win, 'filetype detect')
+call assert_equal('rust', getbufvar(s:fresh2, '&filetype'))
+let g:simpleremote_event = {
+      \ 'event': 'SimpleRemoteBufferRead', 'type': 'buffer-read',
+      \ 'bufnr': s:fresh2, 'path': '/work/src/epsilon.rs', 'workspace': {},
+      \ 'status': 'ssh:devbox', 'time': localtime()}
+doautocmd <nomodeline> User SimpleRemoteBufferRead
+call assert_equal(s:local, s:State().s_bc_buf,
+      \ 'a background `filetype detect` stole the breadcrumb with no Outline open')
+" One cursor move in the user's own window is what used to blank the bar.
+call simpletreesitter#OnScroll(s:local)
+sleep 300m
+call assert_match('beta', simpletreesitter#Breadcrumb(),
+      \ 'a background `filetype detect` blanked the breadcrumb of the cursor window')
+" ('winbar' itself is unavailable in this Vim build, so the cache the option's
+" %{} expression reads is the observable: UpdateBreadcrumb() drops it and calls
+" SetWinbar('') together.)
+call s:WaitFor({-> s:HasProps(s:fresh2, 2)},
+      \ 'the second freshly read background remote buffer was not highlighted')
+
 let g:simpletreesitter_breadcrumb = 0
 
 " ---------------------------------------------------------------------------
-" 4. A hidden buffer is left to BufEnter, which resyncs by changedtick.  A
+" 6. A hidden buffer is left to BufEnter, which resyncs by changedtick.  A
 "    buffer nobody can see is not worth a highlight round trip.
 " ---------------------------------------------------------------------------
 call simpletreesitter#OutlineClose()
@@ -224,7 +343,7 @@ call s:WaitFor({-> s:HasProps(s:hidden, 3)},
       \ 'entering the hidden remote buffer did not resync it')
 
 " ---------------------------------------------------------------------------
-" 5. Robustness: the handler swallows garbage and never reaches into the
+" 7. Robustness: the handler swallows garbage and never reaches into the
 "    emitter -- an unknown buffer, a non-numeric bufnr, a nofile buffer, and
 "    a fire with no payload at all.
 " ---------------------------------------------------------------------------

@@ -233,6 +233,14 @@ enddef
 
 augroup TsHlAutoStart
   autocmd!
+  # Remember the user's own window before anything else looks at it, and before
+  # OnBufEvent() below runs for the same BufEnter.  win_execute() -- how
+  # SimpleRemote runs `filetype detect` for a remote:// buffer whose read
+  # finished in a background window -- switches windows with 'noautocmd', so
+  # neither of these two events can fire inside it and what is recorded here
+  # stays the window the cursor is really in.  Without it the FileType that
+  # win_execute() does fire looks exactly like the user entering that buffer.
+  autocmd BufEnter,WinEnter * call simpletreesitter#NoteCursorContext()
   autocmd BufEnter,FileType * call simpletreesitter#OnBufEvent(bufnr())
   # Registered unconditionally: without SimpleRemote nothing ever fires it.
   autocmd User SimpleRemoteBufferRead call OnRemoteBufferRead()

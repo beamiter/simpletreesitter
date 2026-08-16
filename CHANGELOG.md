@@ -2,6 +2,36 @@
 
 ## Unreleased - 2026-08-16
 
+### 修复：后台窗口里的一次 `filetype detect` 会把 breadcrumb 和 Outline 拽走
+
+- 上一条改动放开 `acwrite` 之后，SimpleRemote 真正的后台读取路径第一次能走到我们
+  这里，随之暴露一个更深的问题：`bufnr('%')` 根本不能用来判断「这是不是光标所在的
+  buffer」。SimpleRemote 的 `DetectRemoteFiletype()` 对非当前 buffer 跑的是
+  `win_execute(winid, 'filetype detect')`，`win_execute()` 会在命令执行期间把那个窗口
+  和它的 buffer 变成「当前」——于是 FileType 自动命令带着后台 buffer 进了
+  `OnBufEvent()`，`s_outline_src_buf`、`s_outline_src_win` 与 `s_bc_buf` 全部改指过去。
+  后果是：光标所在窗口的下一次 CursorMoved 走到 `UpdateBreadcrumb()`，发现
+  `buf != s_bc_buf`，把缓存丢掉并清空 winbar —— 面包屑就此空白，直到你敲一下键
+  （TextChanged）或切一次窗口/buffer（BufEnter）才回来；开着 Outline 的话侧边栏还会
+  翻到后台 buffer 的符号。会话恢复带 `remote://` 的分屏布局、`:split remote://path`
+  之后在读取途中切窗口、连接后 SimpleRemote 的 open_queue，都能触发。
+- `win_execute()` 是用 `noautocmd` 切窗口的，所以 BufEnter、WinEnter、CursorMoved
+  三者都不可能在它内部触发。新增 `simpletreesitter#NoteCursorContext()`，由
+  `TsHlAutoStart` 的 `BufEnter,WinEnter` 与 `OnScroll()`（CursorMoved）记录光标真正
+  所在的窗口 id；`IsCursorBuf()` 用它替代 `bufnr('%')`，作为 `OnBufEvent()` 里那些
+  只属于光标的动作（Outline 来源 buffer/窗口、breadcrumb 认领、当前窗口的缩进参考线）
+  以及 `ScheduleSymbols()` 里 `need_bc` 的判据。buffer 从窗口反查而不是单独记，
+  `:bufdo` 一类换 buffer 的操作因此自动正确。同步、高亮、折叠仍照常对事件点名的
+  buffer 执行 —— 后台远程 buffer 该挂载、该高亮的一样不少。
+- `tests/vim_remote.vim` 补上这半边契约：新的第 4、5 节先在后台窗口放一个还没读完、
+  没有 filetype 的 `remote://` buffer，再照 `ApplyRemoteRead()` 的真实顺序
+  `win_execute(win, 'filetype detect')` 然后发事件，断言 Outline 与 breadcrumb 不动、
+  且光标窗口的面包屑在随后的 CursorMoved 之后依然在（第 5 节关掉 Outline，正是用户
+  看得见的那个空白 winbar 场景）。两节在修复前都会失败。
+- `tests/vim_remote.vim` 不再删除 `g:simpletreesitter_log_file` 的默认值
+  `/tmp/ts-hl.log`（那是跑 `make check` 这台机器上别的 Vim 正在写的日志），改成先把
+  它指向 `/tmp/simpletreesitter-vim-remote.log`，与 `tests/vim_smoke.vim` 一致。
+
 ### 新增：SimpleRemote 虚拟远程文件（`'buftype'` acwrite）进入整条流水线
 
 - `IsSupportedLang()` 原先要求 `'buftype'` 为空，这是插件里唯一的一处 buftype
