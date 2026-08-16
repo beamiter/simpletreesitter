@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased - 2026-08-16
+
+### 新增：SimpleRemote 虚拟远程文件（`'buftype'` acwrite）进入整条流水线
+
+- `IsSupportedLang()` 原先要求 `'buftype'` 为空，这是插件里唯一的一处 buftype
+  判断，却把 SimpleRemote 虚拟模式的 `remote://` buffer 整个挡在门外：SimpleRemote
+  填完文本后把 buffer 设成 `acwrite` 再跑 `filetype detect`，FileType 事件照常把
+  我们带到 `OnBufEvent()`，可下游每一步 —— 同步、高亮、Outline、符号跳转、折叠、
+  文本对象、缩进参考线 —— 都在这道门上退出，远程文件于是什么都没有。投影模式
+  （sshfs / docker-bind / local-map）打开的是普通本地路径，本来就没事。
+- 门改成「空或 `acwrite`」。`acwrite` 是「由某个插件自己通过 BufReadCmd/BufWriteCmd
+  读写」的 buffer，netrw 的 `scp://` 也属此类，都是货真价实的源文件；而插件只吃
+  buffer 文本（daemon 拿到的是 `getbufline()`，从不读路径），来源无关紧要。nofile、
+  nowrite、terminal、prompt、popup 以及本插件自己的 Outline/Inspect/AST 视图仍被排除。
+  这是一处行为变化：其他带受支持 filetype 的 acwrite buffer 从此也会被高亮。
+- 新监听 `User SimpleRemoteBufferRead`（无条件注册，没有 SimpleRemote 就永远不触发），
+  处理函数 `simpletreesitter#OnRemoteBufferRead(bufnr)`：当前 buffer 走完整的
+  `OnBufEvent()` —— 重读不改 `'filetype'`，不会有 FileType，而 TextChanged 要等下一次
+  按键，此前刚读回来的新文本得等你敲一下才有颜色；显示在其他窗口里的 buffer 只做
+  重新同步（ACK 自会补请求高亮/符号/折叠），不走 `OnBufEvent()` 里那些只对光标所在
+  buffer 有意义的部分 —— 改 Outline 来源、改 breadcrumb、给当前窗口挂缩进参考线；
+  隐藏 buffer 留给 BufEnter，进入时按 changedtick 补同步，没人看得见的文本不值一次
+  高亮往返。
+- 顺手堵上 `ScheduleSymbols()` 里 breadcrumb 认领非当前 buffer 的口子：一次为别的
+  buffer 而来的同步 ACK（后台窗口重读、或者用户在 ACK 回来之前已经离开）会把
+  `s_bc_buf` 指到那个 buffer，`UpdateBreadcrumb()` 随即清空当前窗口的 winbar 直到
+  下一次编辑，还会通过共用的定时器取消当前 buffer Outline 正在等的 symbols 请求。
+  现在只有光标所在的 buffer 才能被 breadcrumb 认领。
+- 新增 `tests/vim_remote.vim`（`make vim-remote`，已并入 `make check`）：对真 daemon
+  验证 acwrite buffer 的门、高亮与 Outline；当前 buffer 重读、后台窗口 buffer 重读
+  （Outline / breadcrumb 不动、不多发 symbols 请求）、隐藏 buffer 留待 BufEnter；以及
+  事件载荷缺失/非法/指向 nofile buffer 时不出错。`tests/vim_smoke.vim` 也钉住了门本身。
+  文档新增 |simpletreesitter-simpleremote|。
+
 ## Unreleased - 2026-08-08
 
 ### 修复：可视模式下答不出来的文本对象会把你的选区弄丢，并顺手改掉 buffer

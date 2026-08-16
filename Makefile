@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test daemon vim-test vim-indent vim-core defcompile core-verify
+.PHONY: check fmt clippy test daemon vim-test vim-remote vim-indent vim-core defcompile core-verify
 
-check: core-verify fmt clippy test defcompile vim-core vim-indent vim-test
+check: core-verify fmt clippy test defcompile vim-core vim-indent vim-test vim-remote
 
 fmt:
 	cargo fmt --all -- --check
@@ -24,6 +24,12 @@ daemon:
 
 vim-test: daemon
 	vim -Nu NONE -n -i NONE -es -S tests/vim_smoke.vim
+
+# SimpleRemote integration: remote:// buffers ('buftype' acwrite) and the
+# User SimpleRemoteBufferRead event, against the same real daemon.  simpleremote
+# itself is not on the runtimepath; the test fires the event by hand.
+vim-remote: daemon
+	vim -Nu NONE -n -i NONE -es -S tests/vim_remote.vim
 
 vim-indent:
 	vim -Nu NONE -n -i NONE -es -S tests/haskell_indent.vim

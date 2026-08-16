@@ -33,6 +33,9 @@
 - 长会话稳定性：buffer 关闭即释放 daemon cache；daemon 重启后自动重新同步。
 - 大文件保护：Vim 端默认跳过超过 5 MiB 的 buffer；daemon 另有硬上限和有界结果。
 - 彩虹括号、缩进参考线、breadcrumb、AST 调试视图。
+- 远程工作区：`'buftype'` 为 `acwrite` 的 buffer（SimpleRemote 的 `remote://` 虚拟文件、
+  netrw 的 `scp://` 等）与本地文件同等对待；监听 `User SimpleRemoteBufferRead`，远程
+  文件读完/重读后立即重新同步高亮，详见下文「与 SimpleRemote 协作」。
 - 查询与语义回归测试：覆盖全部 13 种语言。
 
 ## 支持语言
@@ -256,6 +259,31 @@ let b:simpletreesitter_disable = 1
 let b:simpletreesitter_max_buffer_bytes = 0  " 仅当前 buffer 取消 Vim 端上限
 ```
 
+## 与 SimpleRemote 协作
+
+插件只消费 buffer 文本（daemon 拿到的是 `getbufline()`，从不读路径），所以文件从哪里
+来无关紧要，`'buftype'` 才是判据：空值与 `acwrite` 视为文件，其余（nofile、nowrite、
+terminal、prompt、popup 以及本插件自己的 Outline/Inspect 视图）一律不碰。`acwrite`
+就是「由某个插件自己通过 BufReadCmd/BufWriteCmd 读写」的 buffer —— SimpleRemote 的
+`remote://` 虚拟文件、netrw 的 `scp://` 都属此类，同样享有高亮、Outline、符号跳转、
+折叠与文本对象，也按 `g:simpletreesitter_auto_enable_filetypes` 自动启动。
+
+[SimpleRemote](https://github.com/beamiter/simpleremote) 可选，运行时探测：
+
+- 投影模式（sshfs / docker-bind / local-map）打开的是普通本地路径，无需任何处理。
+- 虚拟模式打开 `remote:///path` buffer（`'buftype'` acwrite），文本异步到达；随后的
+  FileType 事件照常挂载。
+- 插件监听 `User SimpleRemoteBufferRead`（SimpleRemote 在 `remote://` buffer 填充/重读
+  完成后触发，`g:simpleremote_event.bufnr` 指明 buffer）：当前 buffer 立即重新同步 ——
+  重读不改 `'filetype'`，不会有 FileType，而 TextChanged 要等下一次按键；显示在其他
+  窗口里的 buffer 同样重新同步，但不会把 Outline 或 breadcrumb 从光标所在 buffer 上
+  拽走；隐藏 buffer 留给 BufEnter，进入时按 changedtick 补同步。
+- 不向远端发送任何东西：高亮、符号与折叠都在本地 daemon 上对 buffer 文本完成；保存
+  走 SimpleRemote 自己的 BufWriteCmd，与本插件无关。
+
+自动命令无条件注册，没有 SimpleRemote 时它永远不会触发。回归测试见
+`tests/vim_remote.vim`（`make vim-remote`）。
+
 ## 架构与稳定性
 
 ```text
@@ -281,6 +309,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --release --locked
 vim -Nu NONE -i NONE -n -es -X -S tests/vim_smoke.vim
+vim -Nu NONE -i NONE -n -es -X -S tests/vim_remote.vim
 ```
 
 ## 排障

@@ -376,8 +376,19 @@ def DetectLang(buf: number): string
   return get(s_language_by_filetype, ft, '')
 enddef
 
+# 'buftype' acwrite is a file that some plugin reads and writes itself through
+# BufReadCmd/BufWriteCmd -- SimpleRemote's virtual remote:// buffers, netrw's
+# scp:// edits.  Their text is a source file like any other and is all this
+# plugin ever consumes (the daemon is fed getbufline(), never a path), so they
+# get highlighting, Outline, folds and text objects.  Every other non-empty
+# buftype -- nofile, nowrite, terminal, prompt, popup and this plugin's own
+# scratch views -- stays excluded.
+def IsFileLikeBuftype(bt: string): bool
+  return bt ==# '' || bt ==# 'acwrite'
+enddef
+
 def IsSupportedLang(buf: number): bool
-  if !bufexists(buf) || !bufloaded(buf) || getbufvar(buf, '&buftype') !=# ''
+  if !bufexists(buf) || !bufloaded(buf) || !IsFileLikeBuftype(getbufvar(buf, '&buftype'))
     return false
   endif
   if getbufvar(buf, 'simpletreesitter_disable', 0)
@@ -2576,6 +2587,43 @@ export def OnBufEvent(buf: number)
   endif
 enddef
 
+# SimpleRemote fills a virtual remote:// buffer asynchronously (BufReadCmd)
+# and fires User SimpleRemoteBufferRead once the text is in place and the
+# filetype detected.  When that buffer is the current one, the FileType event
+# has already brought us here for a first read; a re-read keeps the filetype,
+# fires nothing, and TextChanged waits for the next keystroke -- so run the
+# ordinary buffer-event path now and the fresh text is highlighted without one.
+#
+# A buffer whose read finished after the user moved on gets no autocmd at all
+# until it is re-entered.  If it is still on screen in another window it is
+# resynced here (the ACK re-requests highlight, symbols and folds by itself),
+# without the parts of OnBufEvent that only make sense for the buffer under the
+# cursor: retargeting the Outline and the breadcrumb, or decorating the
+# current window with indent guides.  A hidden buffer is left to BufEnter,
+# which compares changedticks and resyncs then; highlighting text nobody can
+# see would be wasted work.
+export def OnRemoteBufferRead(buf: number)
+  if !bufexists(buf) || !bufloaded(buf)
+    return
+  endif
+  if buf == bufnr('%')
+    OnBufEvent(buf)
+    return
+  endif
+  if empty(win_findbuf(buf))
+    return
+  endif
+  if has_key(s_closed_bufs, buf)
+    remove(s_closed_bufs, string(buf))
+  endif
+  AutoEnableForBuffer(buf)
+  if !s_enabled || !IsSupportedLang(buf)
+    return
+  endif
+  s_active_bufs[buf] = true
+  ScheduleSync(buf)
+enddef
+
 export def RefreshHighlightGroups()
   EnsureHlGroupsAndProps()
 enddef
@@ -2994,7 +3042,14 @@ def ScheduleSymbols(buf: number)
     return
   endif
   var need_outline = (s_outline_win != 0 && s_outline_src_buf == buf)
-  var need_bc = get(g:, 'simpletreesitter_breadcrumb', 0) && IsSupportedLang(buf)
+  # The breadcrumb describes the cursor, so it only ever adopts the buffer the
+  # cursor is in.  A sync ACK for another buffer -- one resynced in a
+  # background window after a SimpleRemote re-read, or one the user left before
+  # its ACK came back -- must neither retarget it (UpdateBreadcrumb() would
+  # blank this window's bar until the next edit) nor cancel a symbols request
+  # the current buffer's Outline is waiting for through the shared timer.
+  var need_bc = get(g:, 'simpletreesitter_breadcrumb', 0) && buf == bufnr('%')
+    && IsSupportedLang(buf)
   if !need_outline && !need_bc
     return
   endif

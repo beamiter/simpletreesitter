@@ -218,9 +218,24 @@ if maparg('<leader>to', 'n') ==# '' && !hasmapto('<Plug>(simpletreesitter-outlin
 endif
 
 # =============== 自动启动逻辑 ===============
+# SimpleRemote (virtual remote:// workspaces) fills a buffer asynchronously
+# and announces it with User SimpleRemoteBufferRead; the payload names the
+# buffer, which is not necessarily the current one.  The handler must never
+# let an error escape into the emitter's read completion, and a one-line
+# `try | call ... | catch | endtry` inside an :autocmd does not catch in Vim9,
+# so the guard is a function.
+def OnRemoteBufferRead()
+  try
+    simpletreesitter#OnRemoteBufferRead(get(get(g:, 'simpleremote_event', {}), 'bufnr', bufnr()))
+  catch
+  endtry
+enddef
+
 augroup TsHlAutoStart
   autocmd!
   autocmd BufEnter,FileType * call simpletreesitter#OnBufEvent(bufnr())
+  # Registered unconditionally: without SimpleRemote nothing ever fires it.
+  autocmd User SimpleRemoteBufferRead call OnRemoteBufferRead()
 augroup END
 
 # 新增：当任何窗口关闭时，若是 outline 窗口则自动 OutlineClose

@@ -10,6 +10,7 @@ CONTENTS                                                *simpletreesitter*
 5. Text objects.............................|simpletreesitter-textobjects|
    Language injections......................|simpletreesitter-injections|
 6. Options..................................|simpletreesitter-options|
+   Remote workspaces........................|simpletreesitter-simpleremote|
 7. Troubleshooting..........................|simpletreesitter-troubleshooting|
 
 ===============================================================================
@@ -255,6 +256,10 @@ Rebuild with ./install.sh and :TsHlRestart otherwise.
 Set global options before loading the plugin.  Defaults are shown below.
 
 g:simpletreesitter_auto_enable_filetypes     List of auto-start filetypes.
+                                             Matched against 'filetype' in
+                                             any buffer whose 'buftype' is
+                                             empty or "acwrite" -- see
+                                             |simpletreesitter-simpleremote|.
 g:simpletreesitter_auto_stop                 1
 g:simpletreesitter_daemon_path               ''
 g:simpletreesitter_debounce                  120
@@ -334,6 +339,41 @@ Disable one buffer with: >
   let b:simpletreesitter_disable = 1
   let b:simpletreesitter_max_buffer_bytes = 0
 <
+REMOTE WORKSPACES                          *simpletreesitter-simpleremote*
+
+The plugin only ever consumes buffer text -- the daemon is fed getbufline(),
+never a path -- so a buffer's origin does not matter.  What matters is
+'buftype': the empty value and "acwrite" are treated as files, everything
+else (nofile, nowrite, terminal, prompt, popup, and this plugin's own scratch
+views) is left alone.  "acwrite" is a buffer that some plugin reads and writes
+itself through BufReadCmd/BufWriteCmd: SimpleRemote's virtual remote://
+buffers, netrw's scp:// edits, and the like.  They get highlighting, the
+Outline, symbol navigation, folds and text objects like a local file, and
+auto-enable through g:simpletreesitter_auto_enable_filetypes.
+
+With SimpleRemote (https://github.com/beamiter/simpleremote), which is
+optional and detected at runtime:
+
+- Projected workspaces (sshfs, docker-bind, local-map) open ordinary local
+  paths and need nothing special.
+- Virtual workspaces open remote:///path buffers with 'buftype' acwrite.  The
+  text arrives asynchronously; the FileType event that follows attaches the
+  buffer as usual.
+- The plugin listens for `User SimpleRemoteBufferRead`, which SimpleRemote
+  fires with the buffer number in g:simpleremote_event once a remote://
+  buffer has been (re)filled.  For the current buffer this resyncs the fresh
+  text at once -- a re-read keeps its 'filetype', so no FileType fires, and
+  TextChanged would wait for the next keystroke.  A buffer shown in another
+  window is resynced too, without moving the Outline or the breadcrumb off
+  the buffer the cursor is in.  A hidden buffer waits for BufEnter, which
+  compares changedticks and resyncs then.
+- Nothing is sent to the remote host: highlighting, symbols and folds run in
+  the local daemon on the buffer text.  Saves go through SimpleRemote's
+  BufWriteCmd and are none of this plugin's business.
+
+The autocmd is registered unconditionally; without SimpleRemote it never
+fires.
+
 LANGUAGE INJECTIONS                          *simpletreesitter-injections*
 
 Some documents embed another language.  Those regions are parsed with the

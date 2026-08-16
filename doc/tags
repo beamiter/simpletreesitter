@@ -33,6 +33,7 @@ simpletreesitter-options	simpletreesitter.txt	/*simpletreesitter-options*
 simpletreesitter-requirements	simpletreesitter.txt	/*simpletreesitter-requirements*
 simpletreesitter-selection	simpletreesitter.txt	/*simpletreesitter-selection*
 simpletreesitter-simplecore	simpletreesitter.txt	/*simpletreesitter-simplecore*
+simpletreesitter-simpleremote	simpletreesitter.txt	/*simpletreesitter-simpleremote*
 simpletreesitter-textobject-cold	simpletreesitter.txt	/*simpletreesitter-textobject-cold*
 simpletreesitter-textobjects	simpletreesitter.txt	/*simpletreesitter-textobjects*
 simpletreesitter-troubleshooting	simpletreesitter.txt	/*simpletreesitter-troubleshooting*

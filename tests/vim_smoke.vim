@@ -86,6 +86,20 @@ for s:prop in s:props
   call assert_match('^SimpleTreeSitter_', get(s:prop, 'type', ''))
 endfor
 
+" The buftype gate: a file some plugin reads and writes itself (acwrite --
+" SimpleRemote's remote:// buffers, netrw's scp://) is a source file like any
+" other; scratch buftypes stay out.  tests/vim_remote.vim drives the full
+" remote pipeline; this pins the gate itself.
+call assert_true(s:CallPrivate('IsSupportedLang', [s:source]))
+setlocal buftype=acwrite
+call assert_true(s:CallPrivate('IsSupportedLang', [s:source]),
+      \ 'an acwrite rust buffer must be supported')
+setlocal buftype=nofile
+call assert_false(s:CallPrivate('IsSupportedLang', [s:source]),
+      \ 'a nofile rust buffer must stay unsupported')
+setlocal buftype=
+call assert_true(s:CallPrivate('IsSupportedLang', [s:source]))
+
 call simpletreesitter#OutlineOpen()
 sleep 300m
 let s:window_count = winnr('$')
