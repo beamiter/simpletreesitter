@@ -57,15 +57,52 @@ var s_applied_types: dict<list<string>> = {}
 # user's own 'winbar' is blanked by the next UpdateBreadcrumb() and stays blank
 # until an edit or a BufEnter.
 #
-# win_execute() switches windows with 'noautocmd', so BufEnter, WinEnter and
-# CursorMoved never fire inside it: a window id fed only by those three always
-# names the user's own window.  The buffer is read back out of that window
+# win_execute() switches windows with 'noautocmd', so the WinEnter of that
+# switch cannot fire inside it, and CursorMoved -- checked in the main loop,
+# which win_execute() never reaches -- cannot either: a window id fed by those
+# two always names the user's own window.  BufEnter is the exception, because
+# win_execute() blocks the autocommands of its own window switch and not the
+# ones the command it runs triggers; it may only bootstrap the anchor, see
+# NoteCursorContext().  The buffer is read back out of the tracked window
 # instead of being tracked separately, so :bufdo -- and anything else that
 # swaps the buffer of the cursor's window -- stays correct for free.
 var s_cursor_win: number = 0
 
-export def NoteCursorContext()
-  s_cursor_win = win_getid()
+# False in a window the user's cursor can never reach.  Besides win_execute(),
+# Vim conjures a hidden "autocommand window" whenever it must make a buffer
+# current for an autocmd and no window shows it -- bufload(), a `:doautocmd`
+# aimed at another buffer, and setbufvar(buf, '&filetype', ...) all go through
+# it -- and fires BufEnter and FileType inside it.  win_gettype() names it
+# 'autocmd'; popups are just as unreachable.  Quickfix, location and command
+# line windows are left alone: the cursor really can sit in those.
+def RealWin(): bool
+  if !exists('*win_gettype')
+    return true
+  endif
+  return index(['autocmd', 'popup', 'unknown'], win_gettype()) < 0
+enddef
+
+# Record the window the cursor is in.
+#
+# `authoritative` is false for BufEnter, the one of the three feeding events
+# that can fire in a window the user is not in.  win_execute() only blocks the
+# autocommands of its own window switch, so a command that enters a buffer
+# inside it fires BufEnter there: `win_execute(winid, 'silent! edit')` is how
+# SimpleRemote re-reads every visible remote:// buffer after a reconnect
+# (ReloadRemoteBuffersAfterConnect), and `win_execute(winid, 'buffer N')` is
+# how any number of plugins put a file in a target window.  bufload() fires it
+# in the autocommand window.  A BufEnter may therefore only bootstrap an anchor
+# that does not exist yet -- WinEnter does not fire for the first window of a
+# session, so something has to -- and never move one: entering another buffer
+# without entering another window cannot have changed which window the cursor
+# is in.
+export def NoteCursorContext(authoritative: bool = true)
+  if !RealWin()
+    return
+  endif
+  if authoritative || s_cursor_win == 0 || empty(getwininfo(s_cursor_win))
+    s_cursor_win = win_getid()
+  endif
 enddef
 
 def CursorWin(): number
@@ -77,11 +114,18 @@ def CursorWin(): number
   return win_getid()
 enddef
 
-# True when this event is about the buffer under the user's cursor, in the
-# user's own window -- the only case in which cursor-owned state (the Outline
-# source, the breadcrumb target, this window's indent guides) may move.
+# True while the current window is the user's own -- the only case in which
+# cursor-owned state (the Outline source and its per-tabpage context, the
+# breadcrumb target, this window's indent guides) may move.  RealWin() also
+# covers the fallback above: in the autocommand window, with nothing tracked
+# yet, CursorWin() would otherwise agree with win_getid() and answer yes.
+def InCursorWin(): bool
+  return RealWin() && win_getid() == CursorWin()
+enddef
+
+# ... and the event is about the buffer that window is showing.
 def IsCursorBuf(buf: number): bool
-  return win_getid() == CursorWin() && bufnr('%') == buf
+  return InCursorWin() && bufnr('%') == buf
 enddef
 
 # =============== 侧边栏状态 ===============
@@ -2576,7 +2620,16 @@ def ShowOutlineMessage(message: string)
 enddef
 
 export def OnBufEvent(buf: number)
-  SyncOutlineContext()
+  # SyncOutlineContext() swaps the whole per-tabpage Outline working set to the
+  # sidebar of the *current* window's tabpage, and tabpagenr() is as much a lie
+  # inside win_execute() as bufnr('%') is: win_execute() takes a window id, and
+  # that window may live in another tabpage.  Doing the swap for a background
+  # event leaves the cursor's own tabpage believing it has no sidebar at all --
+  # s_outline_win 0 -- until the next CursorMoved swaps it back, and any daemon
+  # reply landing in that gap is dropped with nothing left to ask again.
+  if InCursorWin()
+    SyncOutlineContext()
+  endif
   if bufexists(buf) && bufloaded(buf) && has_key(s_closed_bufs, buf)
     remove(s_closed_bufs, string(buf))
   endif

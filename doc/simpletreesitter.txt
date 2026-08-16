@@ -360,11 +360,16 @@ optional and detected at runtime:
   text arrives asynchronously; the FileType event that follows attaches the
   buffer as usual.  When the read lands in a window the cursor is not in,
   SimpleRemote detects the filetype with win_execute(), which makes that
-  window and buffer current while FileType runs.  The plugin tracks the
-  cursor's own window through BufEnter/WinEnter/CursorMoved -- none of which
-  can fire inside win_execute() -- so such a read attaches and highlights the
-  background buffer without moving the Outline, the breadcrumb or the indent
-  guides away from the buffer you are actually editing.
+  window and buffer current while FileType runs; a reconnect re-reads every
+  visible remote:// buffer with win_execute(winid, 'silent! edit'), which
+  fires BufEnter there as well; and a buffer that is in no window at all is
+  brought up in Vim's hidden autocommand window.  The plugin anchors itself
+  to the cursor's own window through WinEnter and CursorMoved -- neither can
+  fire inside win_execute() -- and ignores anchoring events from windows the
+  cursor cannot be in, so any of those reads attaches and highlights the
+  background buffer without moving the Outline, the breadcrumb, the Outline's
+  per-tabpage context or the indent guides away from the buffer you are
+  actually editing.
 - The plugin listens for `User SimpleRemoteBufferRead`, which SimpleRemote
   fires with the buffer number in g:simpleremote_event once a remote://
   buffer has been (re)filled.  For the current buffer this resyncs the fresh

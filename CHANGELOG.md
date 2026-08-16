@@ -2,6 +2,42 @@
 
 ## Unreleased - 2026-08-16
 
+### 修复：`win_execute()` 里的 BufEnter、autocommand window 与另一个 tabpage
+
+- 上一条改动只堵住了 `win_execute()` 三扇门里的一扇。`win_execute()` 屏蔽的是它自己
+  那次切窗口的自动命令，不是它执行的命令所触发的自动命令 —— 所以
+  `win_execute(winid, 'silent! edit')` 会在**后台窗口里**触发 BufEnter，而这正是
+  SimpleRemote 重连（`ReloadRemoteBuffersAfterConnect()`）对每个可见 `remote://`
+  buffer 所做的事，`win_execute(winid, 'buffer N')` 也一样。BufEnter 恰恰是插件用来
+  记录「光标在哪个窗口」的事件之一，于是锚点被挪进后台窗口，`IsCursorBuf()` 随即
+  对后台 buffer 答「是」，`s_bc_buf`、`s_outline_src_buf`、`s_outline_src_win` 又一次
+  全部改指过去 —— 症状与上一条一模一样：下一次 CursorMoved 把光标窗口的 winbar
+  清空，直到下一次编辑或切窗口才回来。
+- 第二扇门是 Vim 的 autocommand window：当 Vim 必须让某个 buffer 成为「当前」才能
+  跑自动命令、而没有任何窗口显示它时，它会临时开一个隐藏窗口（`win_gettype()` 叫它
+  `'autocmd'`）。`bufload()` 在里面触发 BufEnter，`setbufvar(buf, '&filetype', ...)`
+  在里面触发 FileType。光标永远不可能在那个窗口里，可锚点照样会被它带走。
+- 第三扇门是 tabpage：`win_execute()` 收的是窗口 id，那个窗口可以在别的 tabpage 里，
+  `tabpagenr()` 在它内部与 `bufnr('%')` 一样是假的。`OnBufEvent()` 开头的
+  `SyncOutlineContext()` 会把整套 `s_outline_*` 工作集换成「当前」tabpage 的侧边栏，
+  于是光标所在的 tabpage 会认为自己没有 Outline（`s_outline_win` 为 0），直到下一次
+  CursorMoved 才换回来 —— 这段空窗期里到达的 daemon 回包会被丢掉，而载荷摘要已经
+  记下，下一次请求只会拿到 `unchanged`，侧边栏就此停在旧内容上。
+- 修法：`NoteCursorContext()` 增加一个 `authoritative` 参数。WinEnter 与 CursorMoved
+  无条件更新锚点（前者的 `noautocmd` 切窗口在 `win_execute()` 内不触发，后者在主循环
+  里检查，而 `win_execute()` 根本到不了主循环）；BufEnter 只在还没有锚点时兜底
+  （一次会话的第一个窗口不会有 WinEnter），此后一律不动它 —— 进入另一个 buffer 而
+  没有进入另一个窗口，本来就不可能改变「光标在哪个窗口」。同时新增 `RealWin()`，
+  在 `'autocmd'`/`'popup'` 一类光标到不了的窗口里既不记锚点、也不认 `InCursorWin()`
+  （quickfix、location list 与命令行窗口不在此列，光标确实可以在那里）。
+  `OnBufEvent()` 里的 `SyncOutlineContext()` 也改为只在光标所在窗口里才跑。
+- `tests/vim_remote.vim` 补三节：第 6 节按 `ReloadRemoteBuffersAfterConnect()` 的样子
+  对后台窗口跑 `win_execute(win, 'silent! edit')`（配一个同步的 `BufReadCmd` 桩），
+  第 7 节用 `bufload()` 与 `setbufvar(&filetype)` 走 autocommand window，第 8 节把
+  后台窗口放到第二个 tabpage 里再跑 `filetype detect`，三节都断言锚点、breadcrumb、
+  Outline（含 `s_outline_ctx`/`s_outline_win`）留在光标这一侧，且后台 buffer 依旧被
+  挂载高亮。三节在上一条提交上全部失败。
+
 ### 修复：后台窗口里的一次 `filetype detect` 会把 breadcrumb 和 Outline 拽走
 
 - 上一条改动放开 `acwrite` 之后，SimpleRemote 真正的后台读取路径第一次能走到我们

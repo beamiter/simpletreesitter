@@ -310,10 +310,140 @@ call assert_match('beta', simpletreesitter#Breadcrumb(),
 call s:WaitFor({-> s:HasProps(s:fresh2, 2)},
       \ 'the second freshly read background remote buffer was not highlighted')
 
+" ---------------------------------------------------------------------------
+" 6. The other half of win_execute(): it blocks the autocommands of its own
+"    window switch, not the ones the command it runs triggers.  `:edit` inside
+"    it therefore fires BufEnter *in the background window* -- and
+"    `win_execute(winid, 'silent! edit')` is exactly what simpleremote's
+"    ReloadRemoteBuffersAfterConnect() runs for every visible remote:// buffer
+"    after a reconnect or a workspace switch.  BufEnter is how the plugin
+"    learns where the cursor is; believing this one moves the anchor into the
+"    background window and everything cursor-owned follows it there.
+" ---------------------------------------------------------------------------
+" simpleremote reads a remote:// buffer through a BufReadCmd; without one,
+" `:edit` on such a name would just fail.  This is that contract, synchronous.
+function! s:FakeRemoteRead() abort
+  let l:name = substitute(expand('<afile>'), '^.*/\([^/]*\)\.rs$', '\1', '')
+  call setline(1, ['pub fn ' . l:name . '() {', '    let x = 1;', '    let y = 2;', '}'])
+  setlocal buftype=acwrite noswapfile
+  setlocal nomodified
+endfunction
+augroup SimpleTreesitterTestRemoteRead
+  autocmd!
+  autocmd BufReadCmd remote://* call s:FakeRemoteRead()
+augroup END
+
+call assert_equal(s:local_win, win_getid())
+call assert_equal(s:local_win, s:State().s_cursor_win,
+      \ 'the cursor anchor is not the window the cursor is in')
+call win_execute(s:fresh2_win, 'silent! edit')
+call assert_equal(s:local, bufnr(), 'the background re-read switched buffers')
+call assert_equal(s:local_win, win_getid(), 'the background re-read switched windows')
+call assert_equal(s:local_win, s:State().s_cursor_win,
+      \ 'a BufEnter inside win_execute() moved the cursor anchor to a background window')
+call assert_equal(s:local, s:State().s_bc_buf,
+      \ 'a background re-read stole the breadcrumb')
+call assert_equal(s:local_win, s:State().s_outline_src_win,
+      \ 'a background re-read stole the Outline source window')
+" Again the damage only shows one cursor move later.
+call simpletreesitter#OnScroll(s:local)
+sleep 300m
+call assert_match('beta', simpletreesitter#Breadcrumb(),
+      \ 'a background re-read blanked the breadcrumb of the cursor window')
+" And the background buffer is still attached and highlighted.
+call s:WaitFor({-> s:HasProps(s:fresh2, 2)},
+      \ 'the re-read background remote buffer lost its highlights')
+
+" ---------------------------------------------------------------------------
+" 7. The autocommand window.  When Vim has to make a buffer current for an
+"    autocmd and no window shows it, it uses a hidden window -- win_gettype()
+"    calls it 'autocmd' -- and fires the event there: bufload() fires BufEnter
+"    in it, setbufvar(buf, '&filetype', ...) fires FileType in it.
+"    simpleremote reaches it by :bunload-ing the off-screen remote:// buffers
+"    of a workspace it is reconnecting, and any plugin that preloads a buffer
+"    does the same.  The cursor can never be in that window.
+" ---------------------------------------------------------------------------
+call assert_equal(s:local_win, win_getid())
+badd remote:///work/src/theta.rs
+let s:theta = bufnr('remote:///work/src/theta.rs')
+call assert_true(s:theta > 0, 'the off-screen remote buffer was not added')
+call bufload(s:theta)
+call assert_true(empty(win_findbuf(s:theta)), 'the off-screen buffer got a window')
+call assert_equal(s:local_win, s:State().s_cursor_win,
+      \ 'bufload() moved the cursor anchor into the autocommand window')
+call assert_equal(s:local, s:State().s_bc_buf,
+      \ 'bufload() of an off-screen buffer stole the breadcrumb')
+" A filetype set from the outside is the FileType half of the same window.
+call setbufvar(s:theta, '&filetype', 'rust')
+call assert_equal(s:local_win, s:State().s_cursor_win,
+      \ 'setbufvar(&filetype) moved the cursor anchor into the autocommand window')
+call assert_equal(s:local, s:State().s_bc_buf,
+      \ 'setbufvar(&filetype) on an off-screen buffer stole the breadcrumb')
+call assert_equal(s:local_win, s:State().s_outline_src_win,
+      \ 'an off-screen buffer stole the Outline source window')
+call simpletreesitter#OnScroll(s:local)
+sleep 300m
+call assert_match('beta', simpletreesitter#Breadcrumb(),
+      \ 'an off-screen buffer blanked the breadcrumb of the cursor window')
+autocmd! SimpleTreesitterTestRemoteRead
+augroup! SimpleTreesitterTestRemoteRead
+
+" ---------------------------------------------------------------------------
+" 8. win_execute() takes a window id, and that window may live in another
+"    tabpage -- tabpagenr() is as much a lie inside it as bufnr('%') is.  The
+"    Outline is one sidebar per tabpage and every entry point swaps the whole
+"    s_outline_* working set to the current tabpage's; doing that for a
+"    background event leaves the cursor's own tabpage believing it has no
+"    sidebar at all until the next CursorMoved swaps it back, and a daemon
+"    reply landing in that gap is dropped with nothing left to ask again.
+" ---------------------------------------------------------------------------
+call simpletreesitter#OutlineOpen()
+let s:outline = bufnr('ts-hl-outline')
+call s:WaitFor({-> s:State().s_outline_src_buf == s:local
+      \ && join(getbufline(s:outline, 1, '$'), "\n") =~# 'beta'},
+      \ 'the Outline never came back for the tabpage test')
+call assert_equal(s:local_win, win_getid(), 'OutlineOpen moved the cursor')
+let s:ctx_before = s:State().s_outline_ctx
+let s:outline_win_before = s:State().s_outline_win
+call assert_true(s:outline_win_before > 0)
+
+tabnew
+execute 'file remote:///work/src/iota.rs'
+let s:iota = bufnr()
+let s:iota_win = win_getid()
+tabprevious
+call assert_equal(1, tabpagenr(), 'the test did not come back to the first tabpage')
+call assert_equal(s:local_win, win_getid(), 'the test did not come back to the cursor window')
+call assert_equal(s:ctx_before, s:State().s_outline_ctx,
+      \ 'walking through the second tabpage lost the first tabpage Outline context')
+
+call setbufline(s:iota, 1, ['pub fn iota() {', '    let i = 9;', '}'])
+call setbufvar(s:iota, '&buftype', 'acwrite')
+call setbufvar(s:iota, '&swapfile', 0)
+call setbufvar(s:iota, '&modified', 0)
+call win_execute(s:iota_win, 'filetype detect')
+call assert_equal('rust', getbufvar(s:iota, '&filetype'),
+      \ '`filetype detect` did not reach the other tabpage')
+call assert_equal(1, tabpagenr(), 'the background detect switched tabpages')
+call assert_equal(s:ctx_before, s:State().s_outline_ctx,
+      \ 'a background `filetype detect` in another tabpage swapped the Outline context')
+call assert_equal(s:outline_win_before, s:State().s_outline_win,
+      \ 'the cursor tabpage lost its sidebar to an event in another tabpage')
+call assert_equal(s:local, s:State().s_outline_src_buf,
+      \ 'a background `filetype detect` in another tabpage retargeted the Outline')
+call assert_equal(s:local, s:State().s_bc_buf,
+      \ 'a background `filetype detect` in another tabpage stole the breadcrumb')
+call simpletreesitter#OnScroll(s:local)
+sleep 300m
+call assert_match('beta', simpletreesitter#Breadcrumb(),
+      \ 'a background `filetype detect` in another tabpage blanked the breadcrumb')
+silent! 2tabclose
+call assert_equal(1, tabpagenr('$'), 'the second tabpage was not closed')
+
 let g:simpletreesitter_breadcrumb = 0
 
 " ---------------------------------------------------------------------------
-" 6. A hidden buffer is left to BufEnter, which resyncs by changedtick.  A
+" 9. A hidden buffer is left to BufEnter, which resyncs by changedtick.  A
 "    buffer nobody can see is not worth a highlight round trip.
 " ---------------------------------------------------------------------------
 call simpletreesitter#OutlineClose()
@@ -343,9 +473,9 @@ call s:WaitFor({-> s:HasProps(s:hidden, 3)},
       \ 'entering the hidden remote buffer did not resync it')
 
 " ---------------------------------------------------------------------------
-" 7. Robustness: the handler swallows garbage and never reaches into the
-"    emitter -- an unknown buffer, a non-numeric bufnr, a nofile buffer, and
-"    a fire with no payload at all.
+" 10. Robustness: the handler swallows garbage and never reaches into the
+"     emitter -- an unknown buffer, a non-numeric bufnr, a nofile buffer, and
+"     a fire with no payload at all.
 " ---------------------------------------------------------------------------
 let v:errmsg = ''
 let g:simpleremote_event = {'event': 'SimpleRemoteBufferRead', 'bufnr': 987654}

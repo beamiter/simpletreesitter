@@ -237,10 +237,17 @@ augroup TsHlAutoStart
   # OnBufEvent() below runs for the same BufEnter.  win_execute() -- how
   # SimpleRemote runs `filetype detect` for a remote:// buffer whose read
   # finished in a background window -- switches windows with 'noautocmd', so
-  # neither of these two events can fire inside it and what is recorded here
-  # stays the window the cursor is really in.  Without it the FileType that
-  # win_execute() does fire looks exactly like the user entering that buffer.
-  autocmd BufEnter,WinEnter * call simpletreesitter#NoteCursorContext()
+  # WinEnter cannot fire inside it and what is recorded here stays the window
+  # the cursor is really in.  Without it the FileType that win_execute() does
+  # fire looks exactly like the user entering that buffer.
+  autocmd WinEnter * call simpletreesitter#NoteCursorContext()
+  # BufEnter can fire in a window the cursor is not in -- win_execute() blocks
+  # the autocommands of its own window switch, not the ones the command it runs
+  # triggers, and `win_execute(winid, 'silent! edit')` is exactly how
+  # SimpleRemote re-reads visible remote:// buffers after a reconnect -- so it
+  # may only bootstrap the anchor (WinEnter does not fire for the first window
+  # of a session), never move it.
+  autocmd BufEnter * call simpletreesitter#NoteCursorContext(v:false)
   autocmd BufEnter,FileType * call simpletreesitter#OnBufEvent(bufnr())
   # Registered unconditionally: without SimpleRemote nothing ever fires it.
   autocmd User SimpleRemoteBufferRead call OnRemoteBufferRead()
