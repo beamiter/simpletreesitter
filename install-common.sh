@@ -120,7 +120,10 @@ destination="lib/$SIMPLECORE_BINARY$suffix"
 temporary="$(mktemp "lib/.$SIMPLECORE_BINARY.XXXXXX")"
 trap 'rm -f -- "$temporary"' EXIT
 cp -- "$source_binary" "$temporary"
-chmod 0755 -- "$temporary"
+# No `--` for chmod: BSD chmod (which is what macOS ships) takes it as a file
+# name and fails.  Every path here begins with `lib/`, so there is nothing for
+# the terminator to protect against.
+chmod 0755 "$temporary"
 mv -f -- "$temporary" "$destination"
 trap - EXIT
 
