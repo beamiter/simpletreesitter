@@ -1,6 +1,18 @@
-.PHONY: check fmt clippy test daemon vim-test vim-remote vim-indent vim-core defcompile core-verify
+.PHONY: check fmt clippy test daemon vim-test vim-remote vim-indent vim-core defcompile core-verify doc-tags
 
-check: core-verify fmt clippy test defcompile vim-core vim-indent vim-test vim-remote
+check: core-verify doc-tags fmt clippy test defcompile vim-core vim-indent vim-test vim-remote
+
+doc-tags:
+	@tmp=$$(mktemp -d) && cp doc/*.txt $$tmp/ && \
+	vim -Nu NONE -n -i NONE -es -c "helptags $$tmp" -c 'qa!' </dev/null && \
+	status=0; \
+	foreign=$$(awk -F'\t' '$$1 !~ /^(simpletreesitter|g:simpletreesitter|:TsHl|<Plug>\(simpletreesitter)/ { print $$1 }' $$tmp/tags); \
+	if [ -n "$$foreign" ]; then \
+	  echo "doc: *word* in prose defined a global help tag: $$foreign" >&2; status=1; fi; \
+	if ! diff -u doc/tags $$tmp/tags >&2; then \
+	  echo "doc/tags is stale; regenerate with :helptags doc" >&2; status=1; fi; \
+	rm -rf $$tmp; \
+	[ $$status -eq 0 ] && echo "doc: help tags are current and plugin-scoped"
 
 fmt:
 	cargo fmt --all -- --check

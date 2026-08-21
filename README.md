@@ -170,7 +170,8 @@ g:simpletreesitter_auto_enable_filetypes = [
   'rust', 'c', 'cpp', 'cc', 'javascript', 'javascriptreact', 'jsx',
   'typescript', 'typescriptreact',
   'python', 'go', 'sh', 'bash', 'zsh', 'vim', 'vimrc',
-  'json', 'jsonc', 'yaml', 'toml', 'lua', 'html', 'css', 'markdown'
+  'json', 'jsonc', 'yaml', 'toml', 'lua', 'html', 'css', 'markdown',
+  'julia', 'haskell'
 ]
 g:simpletreesitter_auto_stop = 1
 g:simpletreesitter_daemon_path = ''
