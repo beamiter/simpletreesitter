@@ -1058,6 +1058,78 @@ fn byte_offset_to_point(text: &str, offset: usize) -> tree_sitter::Point {
     tree_sitter::Point { row, column }
 }
 
+/// The largest JSON record the request loop will materialise.
+///
+/// `set_text` carries a whole buffer body in one JSONL record, and the daemon
+/// accepts a body of up to `MAX_SOURCE_BYTES`.  `serde_json` expands every
+/// control byte to six ASCII bytes (`\u00xx`), so a buffer at that documented
+/// maximum can legitimately encode to six times its length; `edit_lines` stays
+/// under the same ceiling because each line's `","` separator is paid for by
+/// the newline that line contributes to the source it replaces.  A kilobyte
+/// covers the request envelope around it.
+///
+/// Deriving the bound from `MAX_SOURCE_BYTES` rather than picking a round
+/// number keeps the reader from rejecting a request `set_text` would have
+/// accepted, while still putting a ceiling in front of the allocation that
+/// `MAX_SOURCE_BYTES` exists to prevent.
+const MAX_REQUEST_LINE_BYTES: usize = MAX_SOURCE_BYTES * 6 + 1024;
+
+fn finish_request_line(mut bytes: Vec<u8>, too_long: bool, limit: usize) -> Result<String, String> {
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if too_long || bytes.len() > limit {
+        return Err(format!("request line exceeds {limit} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| "request line is not valid UTF-8".to_string())
+}
+
+/// Read one bounded JSONL record and, after rejecting an oversized one, resume
+/// exactly at the next newline.  `BufRead::lines()` has no size limit: it grows
+/// a single `String` until the newline arrives, so a client that loses its
+/// newline grows the daemon until the machine runs out of memory, and
+/// `MAX_SOURCE_BYTES` never gets to speak because `set_text` is never reached.
+/// `lines()` also cannot skip a bad record, so one oversized line would
+/// desynchronise the stream for every request behind it.
+fn read_request_line<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<Result<String, String>>> {
+    let mut bytes = Vec::new();
+    let mut too_long = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if bytes.is_empty() && !too_long {
+                Ok(None)
+            } else {
+                Ok(Some(finish_request_line(bytes, too_long, limit)))
+            };
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+
+        if !too_long {
+            // Keep one extra byte until the record ends: for CRLF that byte is
+            // the framing CR, not part of the JSON line's documented limit.
+            if bytes.len().saturating_add(content_len) > limit.saturating_add(1) {
+                bytes.clear();
+                too_long = true;
+            } else {
+                bytes.extend_from_slice(&available[..content_len]);
+            }
+        }
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            return Ok(Some(finish_request_line(bytes, too_long, limit)));
+        }
+    }
+}
+
 const USAGE: &str = "\
 Usage: ts-hl-daemon [OPTION]
 
@@ -1118,14 +1190,27 @@ fn main() -> Result<()> {
 
 fn serve() -> Result<()> {
     let stdin = std::io::stdin();
-    let lines = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin);
     let mut out = std::io::stdout();
     let mut server = Server::new();
 
-    for line in lines {
-        let line = match line {
-            Ok(s) => s,
-            Err(_) => break,
+    // A read error on stdin ends the session the same way end-of-stream does:
+    // the editor is gone, and there is nobody left to report it to.
+    while let Ok(Some(record)) = read_request_line(&mut reader, MAX_REQUEST_LINE_BYTES) {
+        let line = match record {
+            Ok(line) => line,
+            Err(message) => {
+                send(
+                    &mut out,
+                    &Event::Error {
+                        message,
+                        buf: None,
+                        op: None,
+                        request_id: None,
+                    },
+                )?;
+                continue;
+            }
         };
         if line.trim().is_empty() {
             continue;
@@ -3818,6 +3903,123 @@ fn vim_func_name(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `set_text` advertises a `MAX_SOURCE_BYTES` ceiling, but that check runs
+    /// only after the record has been read into a `String` and serde has parsed
+    /// a second copy of `text` out of it -- so it can only protect the daemon if
+    /// something bounds the request line *before* it is materialised.  Reverting
+    /// `serve()` to `BufReader::lines()` fails every assertion here: that reader
+    /// has no cap at all, so it grows one `String` to whatever arrives and hands
+    /// it back as a perfectly valid line.
+    #[test]
+    fn stdin_is_bounded_before_the_request_is_materialized() {
+        // No newline anywhere -- the shape that never reaches `set_text`.  The
+        // bound is answered from the bytes seen so far, not from a finished
+        // record, so the reader refuses long before EOF would arrive.
+        let unterminated = vec![b'x'; 6400];
+        let mut reader = BufReader::new(unterminated.as_slice());
+        assert_eq!(
+            read_request_line(&mut reader, 64)
+                .unwrap()
+                .unwrap()
+                .unwrap_err(),
+            "request line exceeds 64 bytes"
+        );
+
+        // An oversized record is discarded, not retained: nothing of it is
+        // carried into the reply, and no allocation of its size outlives it.
+        let mut with_newline = BufReader::new(&b"aaaaaaaaaaaaaaaaaaaaaaaa\n"[..]);
+        assert!(
+            read_request_line(&mut with_newline, 8)
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+
+        // Invalid UTF-8 is a rejected record, not a dead daemon.  `lines()`
+        // surfaced it as an io::Error, which the request loop could only treat
+        // as end-of-stream.
+        let mut invalid = BufReader::new(&b"\xff\xfe\n{\"type\":\"status\"}\n"[..]);
+        assert_eq!(
+            read_request_line(&mut invalid, 64).unwrap().unwrap(),
+            Err("request line is not valid UTF-8".to_string())
+        );
+        assert_eq!(
+            read_request_line(&mut invalid, 64).unwrap().unwrap(),
+            Ok(r#"{"type":"status"}"#.to_string())
+        );
+    }
+
+    /// One oversized record must not desynchronise the stream behind it: the
+    /// reader resumes at the next newline and the request after it is served.
+    #[test]
+    fn bounded_request_reader_recovers_at_the_next_record() {
+        let input = b"0123456789\n{\"type\":\"status\"}\r\n";
+        let mut reader = BufReader::new(&input[..]);
+
+        let oversized = read_request_line(&mut reader, 8)
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(oversized, "request line exceeds 8 bytes");
+
+        let next = read_request_line(&mut reader, 64)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(next, r#"{"type":"status"}"#);
+        assert!(matches!(
+            serde_json::from_str::<Request>(&next).unwrap(),
+            Request::Status
+        ));
+        assert!(read_request_line(&mut reader, 64).unwrap().is_none());
+
+        // A record of exactly the limit is not over it, and the CRLF framing
+        // byte is not charged against the JSON line's documented length.
+        let mut exact_crlf = BufReader::new(&b"12345678\r\n"[..]);
+        assert_eq!(
+            read_request_line(&mut exact_crlf, 8)
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "12345678"
+        );
+    }
+
+    /// The reader must not reject a request `set_text` would have accepted, so
+    /// the limit is derived from `MAX_SOURCE_BYTES` and the widest expansion
+    /// `serde_json` can apply to a buffer body.
+    #[test]
+    fn request_line_limit_admits_a_worst_case_body_at_the_source_limit() {
+        // A control byte is the widest escape serde_json emits: six ASCII bytes
+        // for one source byte.  Nothing else expands further.
+        let sample = "\u{1}".repeat(4096);
+        let encoded = serde_json::to_string(&sample).unwrap();
+        assert_eq!(encoded.len(), sample.len() * 6 + 2);
+
+        let envelope = serde_json::to_string(&serde_json::json!({
+            "type": "set_text",
+            "buf": i64::MIN,
+            "lang": "typescript",
+            "revision": u64::MAX,
+            "text": "",
+        }))
+        .unwrap()
+        .len();
+        assert!(
+            envelope < 1024,
+            "set_text envelope grew to {envelope} bytes"
+        );
+        assert!(MAX_REQUEST_LINE_BYTES >= MAX_SOURCE_BYTES * 6 + envelope);
+
+        // `edit_lines` splits the same body across a JSON array.  Its worst
+        // ratio is all-empty lines, where each `","` costs three bytes for the
+        // one source byte (the newline) that line contributes -- still inside
+        // the same six-fold ceiling, so one constant covers both requests.
+        let lines = vec![String::new(); 4096];
+        let source_bytes: usize = lines.iter().map(|line| line.len() + 1).sum();
+        assert!(serde_json::to_string(&lines).unwrap().len() <= source_bytes * 6);
+    }
 
     #[test]
     fn symbol_request_ids_are_additive_and_echoed_on_success_and_error() {
