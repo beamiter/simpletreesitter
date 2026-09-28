@@ -36,6 +36,7 @@ daemon:
 
 vim-test: daemon
 	vim -Nu NONE -n -i NONE -es -S tests/vim_smoke.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_reload.vim
 
 # SimpleRemote integration: remote:// buffers ('buftype' acwrite) and the
 # User SimpleRemoteBufferRead event, against the same real daemon.  simpleremote

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased - 2026-09-28
+
+### 修复：重新 source 一次 vimrc 之后，`User SimpleRemoteBufferRead` 的处理函数就没了
+
+- 插件管理器在 vimrc 被重新 source 时会把 `plugin/` 再 source 一遍。
+  `plugin/simpletreesitter.vim` 有 `g:loaded_simpletreesitter` 守卫，什么都不会
+  重新定义 —— 但普通的 `vim9script` 在走到守卫的 `finish` 之前，就已经把脚本里
+  所有的 script-local 函数和变量删掉了，而第一次加载时装上的自动命令还在。
+  `OnRemoteBufferRead()`、`TextObjectPlug()` 和 `TEXTOBJECT_SPECS` 因此全部消失，
+  之后 SimpleRemote 每读完一个 `remote://` buffer 都以 E117 收场。首行改为
+  `vim9script noclear`。
+- 新增 `tests/vim_reload.vim`：把脚本 source 两遍，断言 script-local 的函数和
+  变量一个不少。
+
 ## Unreleased - 2026-08-16
 
 ### 修复：`win_execute()` 里的 BufEnter、autocommand window 与另一个 tabpage

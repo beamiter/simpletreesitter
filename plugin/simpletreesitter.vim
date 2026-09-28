@@ -1,4 +1,8 @@
-vim9script
+vim9script noclear
+# noclear: a plugin manager sources plugin/ again when the vimrc is reloaded.
+# Without it Vim deletes every script-local function and variable below before
+# the guard gets to `finish`, while the commands, autocommands and g: functions
+# that use them stay defined -- and fail with E933/E117 from then on.
 
 if exists('g:loaded_simpletreesitter')
   finish
