@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased - 2026-10-04
+
+### 修复：`:TsHlHealth` 仍声称插件讲 protocol v6
+
+- daemon 已是 `PROTOCOL_VERSION = 7`，Health 却写 `plugin speaks v6`，
+  并用 `>= 6` 判 OK。v7 握手被说成「插件还停在上一版」。改成 v7，
+  且只有 `>= 7` 才 `[OK]`。
+- `tests/vim_options.vim` 注入 hello v7 后读 Health 文案。
+
+### 修复：v6 daemon 的 hello 不再提示该重建
+
+- 版本通知停在 v5。接到 v6 时静默把 `s_protocol_version` 写成 6，
+  便宜的 unchanged-payload 路径不会出现，用户只看到「偶尔全量 set_text」。
+  补上 v6 的 `run install.sh` 警告。
+
+### 修复：非数字的 debounce 在第一次编辑就 E1013
+
+- `timer_start(g:simpletreesitter_debounce)` 以及 scroll / symbols /
+  scope 的 delay 都假定是数字。vimrc 写 `'off'` / `'fast'` 时 catch
+  分支会**立刻**同步，等于 debounce 被关掉。抽出 `ConfNumber()`。
+
+### 修复：`g:simpletreesitter_folds = '0'` 会打开折叠
+
+- `get(...) ? true : false` 对非空字符串为真。`'0'` / `'off'` 把
+  `foldmethod` 抢过去。`FoldsEnabled()` 改 `ConfFlag()`。
+
+### 修复：`indent_guides = '0'` 仍改 `listchars`
+
+- 同一套真值。开参考线会改当前窗口的 `'list'` / `'listchars'`，关不掉。
+
+### 修复：`incremental_sync = 'off'` 仍挂 `listener_add`
+
+- `EnsureListener()` 与真正发 splice 的那条路径都只 `get()`。字符串
+  `'off'` 仍走增量，关不干净。两处改 `ConfFlag()`。
+
+### 修复：`max_buffer_bytes = 'off'` 在 `SyncBufferNow` 抛 E1013
+
+- `BufferTextExceedsLimit(buf, max_bytes)` 的第二参数是 `number`。
+  字符串天花板让超大 buffer 的保护路径直接编译失败，文本仍会全量送出。
+  `MaxBufferBytes()` 类型不对回落到 5MiB。
+
+### 修复：`auto_enable_filetypes = 'rust'` 永远对不上 rust
+
+- `index()` 对字符串按字符找，`'rust'` 里找不到 `"rust"`。单字符串
+  当单元素列表。
+
+### 修复：`rainbow_brackets = 'off'` 仍向 daemon 要彩虹括号
+
+- highlight 请求里 `get() ? true : false`，非空字符串恒 true。
+  `ConfFlag()` 同时管 Health 用不到的那条发送路径。
+
+### 修复：`match_words = 'off'` 时 Health 仍去警告缺 matchit
+
+- `'off'` 被当成开，没有 matchit 就 `[WARN]`。Health 改读 `ConfFlag()`。
+
 ## Unreleased - 2026-09-28
 
 ### 修复：重新 source 一次 vimrc 之后，`User SimpleRemoteBufferRead` 的处理函数就没了

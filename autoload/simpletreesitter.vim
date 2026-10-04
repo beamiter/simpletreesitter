@@ -1,5 +1,42 @@
 vim9script
 
+def ConfNumber(name: string, default_val: number, minimum: number = 0): number
+  var value = get(g:, name, default_val)
+  if type(value) != v:t_number
+    return default_val
+  endif
+  return max([minimum, value])
+enddef
+
+def ConfFlag(name: string, default_val: bool): bool
+  var value = get(g:, name, default_val)
+  if type(value) == v:t_bool
+    return value
+  endif
+  if type(value) == v:t_number
+    return value != 0
+  endif
+  if type(value) == v:t_string
+    var folded = tolower(trim(value))
+    if index(['1', 'true', 'on', 'yes'], folded) >= 0
+      return true
+    endif
+    if index(['0', 'false', 'off', 'no'], folded) >= 0
+      return false
+    endif
+  endif
+  return default_val
+enddef
+
+def MaxBufferBytes(buf: number): number
+  var value = getbufvar(buf, 'simpletreesitter_max_buffer_bytes',
+    get(g:, 'simpletreesitter_max_buffer_bytes', 5242880))
+  if type(value) != v:t_number
+    return 5242880
+  endif
+  return value
+enddef
+
 # =============== 状态 ===============
 var s_enabled: bool = false
 var s_daemon_generation: number = 0
@@ -724,7 +761,7 @@ def ApplyHighlights(buf: number, ev: dict<any>)
 
   var applied = 0
   var max_props = get(g:, 'simpletreesitter_max_props', 20000)
-  var rainbow = get(g:, 'simpletreesitter_rainbow_brackets', 1) ? true : false
+  var rainbow = ConfFlag('simpletreesitter_rainbow_brackets', true)
 
   # 按类型分桶，最后用 prop_add_list 一次性提交，省去逐 span 调用 prop_add 的开销。
   var by_type: dict<list<list<number>>> = {}
@@ -1135,7 +1172,7 @@ def OnDaemonEvent(ev: dict<any>)
     elseif s_protocol_version == 6 && !s_protocol_notice_shown
       s_protocol_notice_shown = true
       echohl WarningMsg
-      echom '[ts-hl] daemon protocol is v6; run install.sh for a cheaper edit loop'
+      echom '[ts-hl] daemon protocol is v6; run install.sh for unchanged-payload skips'
       echohl None
     endif
   elseif ev.type ==# 'status'
@@ -1352,7 +1389,7 @@ def OnBufLines(buf: number, _start: number, _lend: number, _added: number, chang
 enddef
 
 def EnsureListener(buf: number)
-  if !get(g:, 'simpletreesitter_incremental_sync', 1)
+  if !ConfFlag('simpletreesitter_incremental_sync', true)
     return
   endif
   if get(s_listener_ids, buf, 0) != 0
@@ -1433,8 +1470,7 @@ def SyncBufferNow(buf: number)
     remove(s_full_symbol_cache, string(buf))
   endif
 
-  var max_bytes = getbufvar(buf, 'simpletreesitter_max_buffer_bytes',
-    get(g:, 'simpletreesitter_max_buffer_bytes', 5242880))
+  var max_bytes = MaxBufferBytes(buf)
   if BufferTextExceedsLimit(buf, max_bytes)
     if get(s_skipped_changedtick, buf, -1) != ct
       Log('Skipped oversized buffer ' .. buf .. ' (limit=' .. max_bytes .. ' bytes)')
@@ -1474,7 +1510,7 @@ def SyncBufferNow(buf: number)
   # 增量路径：daemon 已持有上次发送的快照，只传变更的行区间。
   # daemon 会校验总行数，任何失配都会触发一次全量重同步。
   if s_protocol_version >= 3
-      && get(g:, 'simpletreesitter_incremental_sync', 1)
+      && ConfFlag('simpletreesitter_incremental_sync', true)
       && last_ct >= 0
       && has_key(s_pending_splice, buf)
     var sp = s_pending_splice[buf]
@@ -1538,7 +1574,7 @@ def ScheduleSync(buf: number)
   endif
 
   StopSyncTimer(buf)
-  var ms = get(g:, 'simpletreesitter_debounce', 120)
+  var ms = ConfNumber('simpletreesitter_debounce', 120)
   if exists('*timer_start')
     try
       s_sync_timers[buf] = timer_start(ms, (id) => {
@@ -1576,7 +1612,9 @@ def ScheduleRequest(buf: number, reason: string = 'edit')
   endif
 
   StopBufTimer(buf)
-  var ms = reason ==# 'scroll' ? get(g:, 'simpletreesitter_scroll_debounce', 300) : get(g:, 'simpletreesitter_debounce', 120)
+  var ms = reason ==# 'scroll'
+    ? ConfNumber('simpletreesitter_scroll_debounce', 300)
+    : ConfNumber('simpletreesitter_debounce', 120)
 
   if exists('*timer_start')
     try
@@ -1592,6 +1630,17 @@ def ScheduleRequest(buf: number, reason: string = 'edit')
   endif
 enddef
 
+def AutoEnableFiletypes(): list<string>
+  var value = get(g:, 'simpletreesitter_auto_enable_filetypes', [])
+  if type(value) == v:t_string
+    return value ==# '' ? [] : [value]
+  endif
+  if type(value) != v:t_list
+    return []
+  endif
+  return value
+enddef
+
 def AutoEnableForBuffer(buf: number)
   if !bufexists(buf)
     return
@@ -1602,8 +1651,8 @@ def AutoEnableForBuffer(buf: number)
     return
   endif
 
-  var auto_enable_ft = get(g:, 'simpletreesitter_auto_enable_filetypes', [])
-  if type(auto_enable_ft) != v:t_list || len(auto_enable_ft) == 0
+  var auto_enable_ft = AutoEnableFiletypes()
+  if len(auto_enable_ft) == 0
     return
   endif
 
@@ -1707,7 +1756,7 @@ def DisableIndentGuides()
 enddef
 
 def ApplyIndentGuidesForBuf()
-  if !get(g:, 'simpletreesitter_indent_guides', 0)
+  if !ConfFlag('simpletreesitter_indent_guides', false)
     return
   endif
   var wid = win_getid()
@@ -1729,7 +1778,7 @@ enddef
 
 # =============== Tree-sitter 折叠 ===============
 def FoldsEnabled(): bool
-  return get(g:, 'simpletreesitter_folds', 0) ? true : false
+  return ConfFlag('simpletreesitter_folds', false)
 enddef
 
 def ScheduleFolds(buf: number)
@@ -2489,14 +2538,14 @@ export def Health()
   for line in simpletreesitter#core#HealthLines()
     echo '  ' .. line
   endfor
-  echo printf('  [%s] protocol: v%d (plugin speaks v6)',
-    s_protocol_version >= 6 ? 'OK' : 'WARN', s_protocol_version)
+  echo printf('  [%s] protocol: v%d (plugin speaks v7)',
+    s_protocol_version >= 7 ? 'OK' : 'WARN', s_protocol_version)
   echo printf('  [%s] text properties: %s',
     has('textprop') ? 'OK' : 'ERROR',
     has('textprop') ? 'available' : 'missing +textprop — highlighting disabled')
   echo printf('  [%s] match words: %s',
-    !get(g:, 'simpletreesitter_match_words', 1) || exists('g:loaded_matchit') ? 'OK' : 'WARN',
-    !get(g:, 'simpletreesitter_match_words', 1) ? 'disabled' :
+    !ConfFlag('simpletreesitter_match_words', true) || exists('g:loaded_matchit') ? 'OK' : 'WARN',
+    !ConfFlag('simpletreesitter_match_words', true) ? 'disabled' :
       (exists('g:loaded_matchit') ? 'Vim matchit active' : 'matchit unavailable'))
   echo printf('  [INFO] enabled: %s, active buffers: %d',
     s_enabled ? 'yes' : 'no', len(s_active_bufs))
@@ -3176,7 +3225,7 @@ def ScheduleSymbols(buf: number)
   endif
   if exists('*timer_start')
     try
-      var ms = get(g:, 'simpletreesitter_debounce', 120)
+      var ms = ConfNumber('simpletreesitter_debounce', 120)
       s_sym_timer = timer_start(ms, (id) => {
         s_sym_timer = 0
         RequestSymbolsNow(buf)
@@ -3533,7 +3582,7 @@ def ScheduleScopePrefetch()
     try | timer_stop(s_scope_timer) | catch | endtry
     s_scope_timer = 0
   endif
-  var delay = get(g:, 'simpletreesitter_scope_debounce', 50)
+  var delay = ConfNumber('simpletreesitter_scope_debounce', 50)
   s_scope_timer = timer_start(delay > 0 ? delay : 1, (_) => {
     s_scope_timer = 0
     RequestScopeNow(bufnr(), line('.'), col('.'))
@@ -4414,8 +4463,8 @@ def RequestNow(buf: number)
     lang: lang,
     lstart: hstart,
     lend: hend,
-    rainbow: get(g:, 'simpletreesitter_rainbow_brackets', 1) ? true : false,
-    max_spans: get(g:, 'simpletreesitter_max_props', 20000),
+    rainbow: ConfFlag('simpletreesitter_rainbow_brackets', true),
+    max_spans: ConfNumber('simpletreesitter_max_props', 20000),
     compact: get(s_daemon_capabilities, 'compact_spans', false),
   })
     # 未发出的请求不会有响应来清 inflight 标记，此后本 buffer 再也不会重绘。
