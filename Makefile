@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test daemon vim-test vim-remote vim-indent vim-core defcompile core-verify doc-tags
+.PHONY: check fmt clippy test daemon vim-test vim-remote vim-indent vim-core vim-scroll defcompile core-verify doc-tags
 
-check: core-verify doc-tags fmt clippy test defcompile vim-core vim-indent vim-test vim-remote
+check: core-verify doc-tags fmt clippy test defcompile vim-core vim-indent vim-test vim-remote vim-scroll
 
 doc-tags:
 	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' 0; \
@@ -39,6 +39,11 @@ vim-test: daemon
 	vim -Nu NONE -n -i NONE -es -S tests/vim_smoke.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_options.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_reload.vim
+
+# Real Normal-mode event loop: WinScrolled cannot be tested by a sourced -es
+# script. The PTY driver uses the same real debug daemon as vim-test.
+vim-scroll: daemon
+	python3 tests/viewport_scroll.py
 
 # SimpleRemote integration: remote:// buffers ('buftype' acwrite) and the
 # User SimpleRemoteBufferRead event, against the same real daemon.  simpleremote

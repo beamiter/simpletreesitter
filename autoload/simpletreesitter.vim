@@ -2505,6 +2505,11 @@ export def Enable()
     autocmd!
     autocmd TextChanged,TextChangedI * call simpletreesitter#OnBufEvent(bufnr())
     autocmd CursorMoved,CursorMovedI * call simpletreesitter#OnScroll(bufnr())
+    # Scrolling can leave the cursor stationary (zt, mouse wheel, win_execute).
+    # v:event names every affected window, not necessarily the current one.
+    if exists('##WinScrolled')
+      autocmd WinScrolled * call simpletreesitter#OnWinScrolled(v:event)
+    endif
     autocmd BufWinLeave * call simpletreesitter#OnBufWinLeave(str2nr(expand('<abuf>')))
     autocmd BufUnload,BufDelete,BufWipeout * call simpletreesitter#OnBufClose(str2nr(expand('<abuf>')))
     autocmd ColorScheme * call simpletreesitter#RefreshHighlightGroups()
@@ -2784,6 +2789,33 @@ export def OnBufWinLeave(buf: number)
   if exists('*timer_start')
     timer_start(100, (_) => CheckAndStopDaemon())
   endif
+enddef
+
+# A viewport notification is not a cursor move.  Refresh each affected buffer
+# once, retaining the existing per-buffer debounce/inflight guards.  Do not
+# call OnScroll(): it re-anchors the user's cursor and retargets cursor UI,
+# which is incorrect when a non-current split was scrolled.
+export def OnWinScrolled(event: dict<any>)
+  var seen: dict<bool> = {}
+  for key in keys(event)
+    if key ==# 'all'
+      continue
+    endif
+    var wid = str2nr(key)
+    if wid <= 0
+      continue
+    endif
+    var info = getwininfo(wid)
+    if empty(info)
+      continue
+    endif
+    var buf = info[0].bufnr
+    if !bufloaded(buf) || has_key(seen, buf)
+      continue
+    endif
+    seen[buf] = true
+    ScheduleRequest(buf, 'scroll')
+  endfor
 enddef
 
 export def OnScroll(buf: number)
