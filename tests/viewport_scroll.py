@@ -4,6 +4,7 @@
 WinScrolled is not emitted by :doautocmd or a sourced -es script. Drive actual
 Normal-mode keys and allow Vim to return to its event loop between steps.
 """
+import argparse
 import fcntl
 import json
 import os
@@ -16,6 +17,15 @@ import subprocess
 import tempfile
 import termios
 import time
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--pressure', action='store_true',
+                    help='report default-config continuous-scroll and distant-split diagnostics')
+parser.add_argument('--strict', action='store_true',
+                    help='with --pressure, fail on missing mid-scroll refresh or visible properties')
+args = parser.parse_args()
+if args.strict and not args.pressure:
+    parser.error('--strict requires --pressure')
 
 ROOT = Path(__file__).resolve().parent.parent
 VIM = os.environ.get('VIM_TEST_BIN') or shutil.which('vim')
@@ -56,6 +66,16 @@ function! Snapshot(wid) abort
        \\ 'anchor': l:state.s_cursor_win, 'events': g:scroll_events}
 endfunction
 ''')
+    if args.pressure:
+        # Remove test overrides, not production defaults. Keep UI and scheduling
+        # options exactly as the plugin initializes them.
+        text = setup.read_text()
+        for name in ('view_margin', 'debounce', 'scroll_debounce',
+                     'scope_prefetch', 'outline_fancy'):
+            text = '\n'.join(line for line in text.split('\n')
+                             if not line.startswith('let g:simpletreesitter_' + name + ' ='))
+        setup.write_text(text)
+
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
     env = dict(os.environ, TERM='xterm-256color')
@@ -98,6 +118,74 @@ endfunction
         command("call writefile([string(win_getid())], " + repr(str(output)) + ")")
         current = int(output.read_text())
         before = highlighted(current)
+        if args.pressure:
+            # Each input returns to the real event loop. Polling snapshots does
+            # not itself move the cursor or invoke plugin refresh functions.
+            command("call writefile([json_encode([g:simpletreesitter_scroll_debounce, g:simpletreesitter_view_margin, g:simpletreesitter_max_props])], " + repr(str(output)) + ")")
+            defaults = json.loads(output.read_text())
+            assert defaults == [300, 120, 20000], 'update diagnostic baseline for changed defaults'
+            samples = []
+            started = time.monotonic()
+            for _ in range(60):
+                os.write(master, b'5\x05')  # five CTRL-E lines, not a direct autocmd call
+                until = time.monotonic() + .04
+                while time.monotonic() < until:
+                    pump(max(0, min(.01, until - time.monotonic())))
+                state = snapshot(current)
+                samples.append((time.monotonic() - started, state))
+            stopped = time.monotonic()
+            final = highlighted(current)
+            tail_ms = round((time.monotonic() - stopped) * 1000, 1)
+            assert samples[-1][1]['top'] > before['top'] + defaults[1], 'fixture did not leave prefetched margin'
+            assert samples[-1][1]['events'] > before['events'], 'no real scroll events'
+            refreshes = sum(a['range'] != b['range'] for a, b in
+                            zip([before] + [s for _, s in samples[:-1]], [s for _, s in samples]))
+
+            # Widely separated windows on the *same* buffer. Check all visible
+            # lines, not only a claimed range endpoint or one bottom token.
+            command("execute 'normal! 100Gzz' | vsplit | execute 'normal! 19000Gzz'")
+            command("call writefile([string(win_getid())], " + repr(str(output)) + ")")
+            distant = int(output.read_text())
+            deadline = time.monotonic() + 10
+            while True:
+                command("call writefile([json_encode([getscriptinfo({'sid': getscriptinfo({'name': 'autoload/simpletreesitter.vim'})[0].sid})[0].variables.s_inflight_hl, getscriptinfo({'sid': getscriptinfo({'name': 'autoload/simpletreesitter.vim'})[0].sid})[0].variables.s_req_timers])], " + repr(str(output)) + ")")
+                inflight, timers = json.loads(output.read_text())
+                if not any(inflight.values()) and not any(timers.values()):
+                    break
+                assert time.monotonic() < deadline, 'distant split request did not settle'
+                pump(.02)
+            coverage = []
+            for wid in (current, distant):
+                state = snapshot(wid)
+                command("call writefile([json_encode(map(range(" + str(state['top']) + ", " + str(state['bottom']) + "), {_, l -> len(filter(prop_list(l, {'bufnr': " + str(state['buf']) + "}), 'v:val.type =~# \"^SimpleTreeSitter_\"'))}))], " + repr(str(output)) + ")")
+                counts = json.loads(output.read_text())
+                coverage.append({'top': state['top'], 'bottom': state['bottom'],
+                                 'applied_range_envelope': state['range'],
+                                 'highlighted_lines': sum(n > 0 for n in counts),
+                                 'visible_lines': len(counts)})
+            # Control: the same distant source must highlight when the large
+            # between-window gap is removed. This excludes unsupported syntax
+            # and a dead daemon as explanations for missing distant properties.
+            command('only')
+            control = highlighted(distant)
+            assert control['top'] >= 18000 and control['props'] > 0
+            findings = {'single_distant_window_bottom_props': control['props'], 'defaults': defaults, 'scroll_duration_ms': round(samples[-1][0] * 1000, 1),
+                        'observed_refreshes_during_scroll': refreshes,
+                        'settle_after_last_sample_ms': tail_ms, 'distant_split_coverage': coverage}
+            print(json.dumps(findings, indent=2))
+            failures = []
+            if refreshes == 0:
+                failures.append('no observed refresh during continuous scrolling')
+            if any(x['highlighted_lines'] != x['visible_lines'] for x in coverage):
+                failures.append('distant split has unhighlighted visible lines')
+            print('DIAGNOSTIC FINDINGS: ' + ('; '.join(failures) or 'none'))
+            if args.strict:
+                assert not failures, '; '.join(failures)
+            command('call simpletreesitter#Disable()')
+            os.write(master, b':qa!\r')
+            proc.wait(timeout=5)
+            assert proc.returncode == 0
+            raise SystemExit(0)
         started = time.monotonic()
         os.write(master, b'zt')
         after = highlighted(current, 2)
