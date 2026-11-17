@@ -263,7 +263,7 @@ g:simpletreesitter_auto_enable_filetypes     List of auto-start filetypes.
 g:simpletreesitter_auto_stop                 1
 g:simpletreesitter_daemon_path               ''
 g:simpletreesitter_debounce                  120
-g:simpletreesitter_scroll_debounce           300
+g:simpletreesitter_scroll_debounce           300 (scroll coalescing interval in ms)
 g:simpletreesitter_max_buffer_bytes          5242880 (0 means unlimited)
 g:simpletreesitter_clear_props_on_disable    1
 g:simpletreesitter_incremental_sync          1 (line-delta sync, protocol v3)
@@ -292,6 +292,13 @@ g:simpletreesitter_outline_exclude_patterns  []
 g:simpletreesitter_symbol_jump_kinds         function, method, class, struct,
                                              enum, namespace, type, module,
                                              macro ([] means all)
+
+Scroll events keep an already scheduled refresh rather than restarting its
+wait. Continuous scrolling therefore refreshes periodically at the configured
+interval when the daemon keeps up; it does not wait indefinitely for scrolling
+to stop. Requests still coalesce while another highlight is in flight. Editing
+retains its separate trailing debounce and is not delayed by later scrolls.
+This interval is not a hard end-to-end latency guarantee.
 
 Navigation kind filtering is performed by a protocol-v4-or-newer daemon before
 its bounded result limit. Protocol v5 additionally correlates every symbols
@@ -431,6 +438,17 @@ group-name table plus one fixed-width list per span instead of an object with
 six keys, which is roughly a third of the bytes and a cheaper decode.  Both are
 negotiated per request, so an older daemon keeps receiving and answering the
 protocol-v6 shape.
+
+A daemon advertising "highlight_ranges" accepts disjoint visible line ranges.
+Same-buffer splits query their own viewports plus margins, not the invisible
+text between distant windows. Overlapping/adjacent intervals are merged; the
+configured total span budget is shared equally between remaining intervals.
+Dense viewports can still reach that budget. More than 64 genuinely disjoint
+intervals fall back to the historical bounding range to keep query work bounded;
+that fallback can still exhaust the budget before later windows. Repeated or
+overlapping windows are merged before this limit. Older daemons keep the single
+bounding-range behavior; rebuild the daemon to obtain the split-view fix.
+
 
 ===============================================================================
 7. TROUBLESHOOTING                          *simpletreesitter-troubleshooting*

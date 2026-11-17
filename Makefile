@@ -1,6 +1,6 @@
 .PHONY: check fmt clippy test daemon vim-test vim-remote vim-indent vim-core vim-scroll defcompile core-verify doc-tags
 
-check: core-verify doc-tags fmt clippy test defcompile vim-core vim-indent vim-test vim-remote vim-scroll
+check: core-verify doc-tags fmt clippy test defcompile vim-core vim-indent vim-test vim-remote vim-scroll vim-scroll-pressure-strict
 
 doc-tags:
 	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' 0; \
@@ -44,6 +44,16 @@ vim-test: daemon
 # script. The PTY driver uses the same real debug daemon as vim-test.
 vim-scroll: daemon
 	python3 tests/viewport_scroll.py
+
+# Diagnostic-only measurement; findings do not change its exit status.
+# The strict target below asserts progress and visible-line coverage.
+.PHONY: vim-scroll-pressure
+vim-scroll-pressure: daemon
+	python3 tests/viewport_scroll.py --pressure
+
+.PHONY: vim-scroll-pressure-strict
+vim-scroll-pressure-strict: daemon
+	python3 tests/viewport_scroll.py --pressure --strict
 
 # SimpleRemote integration: remote:// buffers ('buftype' acwrite) and the
 # User SimpleRemoteBufferRead event, against the same real daemon.  simpleremote

@@ -1643,6 +1643,12 @@ def ScheduleRequest(buf: number, reason: string = 'edit')
     return
   endif
 
+  # Scrolling is a bounded coalescing window, not trailing debounce: repeated
+  # events must not postpone the same request forever. Keep an existing edit
+  # timer too; a scroll must not delay a more urgent text refresh.
+  if reason ==# 'scroll' && get(s_req_timers, buf, 0) != 0
+    return
+  endif
   StopBufTimer(buf)
   var ms = reason ==# 'scroll'
     ? ConfNumber('simpletreesitter_scroll_debounce', 300)
