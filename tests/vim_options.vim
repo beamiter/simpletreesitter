@@ -80,6 +80,14 @@ call s:Call('OnDaemonEvent', [{'type': 'hello', 'protocol_version': 6}])
 call assert_true(execute('messages') =~# 'daemon protocol is v6',
       \ 'a v6 hello must still warn that install.sh is needed')
 
+" More than 64 same/overlapping views must normalize before the wire limit.
+call assert_equal([[1, 100]], s:Call('BoundedHighlightRanges', [repeat([[1, 100]], 65)]))
+call assert_equal([[1, 30]], s:Call('BoundedHighlightRanges', [[[20, 30], [1, 10], [11, 20]]]))
+let s:many = map(range(65), {_, n -> [n * 10 + 1, n * 10 + 2]})
+call assert_equal([], s:Call('BoundedHighlightRanges', [s:many]),
+      \ 'overflow must omit ranges and use the legacy envelope, not a rejected RPC')
+call assert_equal(64, len(s:Call('BoundedHighlightRanges', [s:many[0:63]])))
+
 if len(v:errors) > 0
   call writefile(v:errors, '/tmp/simpletreesitter-vim-options-errors.log')
   for error in v:errors

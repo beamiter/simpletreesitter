@@ -736,6 +736,38 @@ def VisibleRangeForBufWithMargin(buf: number, margin: number): list<number>
   return [start, stop]
 enddef
 
+# Normalize before the wire limit: many windows may show the same interval.
+# More than 64 genuinely disjoint intervals use the old envelope fallback;
+# never send an invalid request or permit thousands of repeated tree queries.
+def BoundedHighlightRanges(ranges: list<list<number>>): list<list<number>>
+  var merged: list<list<number>> = []
+  for span in sort(copy(ranges), (a, b) => a[0] - b[0])
+    if !empty(merged) && span[0] <= merged[-1][1] + 1
+      merged[-1][1] = max([merged[-1][1], span[1]])
+    else
+      merged->add([span[0], span[1]])
+    endif
+  endfor
+  return len(merged) <= 64 ? merged : []
+enddef
+
+# The daemon merges overlap and divides the span budget across disjoint views.
+# Preserve the old envelope for old daemons, but do not send invisible gaps to
+# a daemon that advertises highlight_ranges.
+def VisibleHighlightRanges(buf: number): list<list<number>>
+  var margin = max([0, ConfNumber('simpletreesitter_view_margin', 120)])
+  var last = BufLineCount(buf)
+  var ranges: list<list<number>> = []
+  for wid in win_findbuf(buf)
+    var info = getwininfo(wid)
+    if !empty(info)
+      ranges->add([max([1, info[0].topline - margin]),
+        min([last, info[0].botline + margin])])
+    endif
+  endfor
+  return BoundedHighlightRanges(empty(ranges) ? [[1, last]] : ranges)
+enddef
+
 def VisibleRangeForBuf(buf: number): list<number>
   var margin = get(g:, 'simpletreesitter_view_margin', 120)
   return VisibleRangeForBufWithMargin(buf, margin)
@@ -4489,7 +4521,7 @@ def RequestNow(buf: number)
   s_pending_hl[buf] = false
 
   var [hstart, hend] = VisibleRangeForBuf(buf)
-  if !Send({
+  var request = {
     type: 'highlight',
     buf: buf,
     lang: lang,
@@ -4498,7 +4530,14 @@ def RequestNow(buf: number)
     rainbow: ConfFlag('simpletreesitter_rainbow_brackets', true),
     max_spans: ConfNumber('simpletreesitter_max_props', 20000),
     compact: get(s_daemon_capabilities, 'compact_spans', false),
-  })
+  }
+  if get(s_daemon_capabilities, 'highlight_ranges', false)
+    var ranges = VisibleHighlightRanges(buf)
+    if !empty(ranges)
+      request.ranges = ranges
+    endif
+  endif
+  if !Send(request)
     # 未发出的请求不会有响应来清 inflight 标记，此后本 buffer 再也不会重绘。
     s_inflight_hl[buf] = false
     return

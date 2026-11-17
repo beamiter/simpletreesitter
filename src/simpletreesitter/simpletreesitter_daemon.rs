@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::ops;
 use tree_sitter::StreamingIterator;
@@ -191,6 +191,9 @@ enum Request {
         rainbow: bool,
         #[serde(default)]
         max_spans: Option<usize>,
+        /// Optional disjoint visible intervals. Omitted by older clients.
+        #[serde(default)]
+        ranges: Option<Vec<(u32, u32)>>,
         /// Ask for the protocol-v7 compact span encoding. Opt-in per request
         /// rather than negotiated in `hello`, so a client that downgrades mid
         /// session (or a second client on the same daemon) cannot be handed an
@@ -1299,10 +1302,19 @@ fn serve() -> Result<()> {
                 lend,
                 rainbow,
                 max_spans,
+                ranges,
                 compact,
             } => {
                 let lrange = lstart.zip(lend);
-                match run_highlight_cached(&mut server, buf, &lang, lrange, rainbow, max_spans) {
+                match run_highlight_ranges_cached(
+                    &mut server,
+                    buf,
+                    &lang,
+                    lrange,
+                    ranges,
+                    rainbow,
+                    max_spans,
+                ) {
                     Ok((revision, spans)) => {
                         let (groups, cspans) = if compact {
                             let (groups, rows) = compact_spans(&spans);
@@ -1530,6 +1542,7 @@ fn serve() -> Result<()> {
                             "injections",
                             "payload_digest",
                             "compact_spans",
+                            "highlight_ranges",
                         ],
                     },
                 )?;
@@ -1666,6 +1679,61 @@ fn expand_range_for_multiline_token(
         node = parent;
     }
     range
+}
+
+// Keep the old single-interval path for old clients. New clients query only
+// disjoint visible regions: a hidden gap must not consume the visible budget.
+// Split the bounded budget fairly so an early dense viewport cannot starve a
+// later one. Overlapping/adjacent regions are merged before budget allocation.
+fn run_highlight_ranges_cached(
+    server: &mut Server,
+    buf: i64,
+    lang: &str,
+    fallback: Option<(u32, u32)>,
+    ranges: Option<Vec<(u32, u32)>>,
+    rainbow: bool,
+    max_spans: Option<usize>,
+) -> Result<(u64, Vec<Span>)> {
+    let Some(mut ranges) = ranges else {
+        return run_highlight_cached(server, buf, lang, fallback, rainbow, max_spans);
+    };
+    if ranges.is_empty() || ranges.len() > 64 {
+        anyhow::bail!("highlight ranges must contain 1..64 intervals");
+    }
+    if ranges.iter().any(|&(a, b)| a == 0 || b < a) {
+        anyhow::bail!("invalid highlight interval");
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (a, b) in ranges {
+        if let Some(last) = merged.last_mut()
+            && a <= last.1.saturating_add(1)
+        {
+            last.1 = last.1.max(b);
+        } else {
+            merged.push((a, b));
+        }
+    }
+    let limit = max_spans
+        .unwrap_or(MAX_HIGHLIGHT_SPANS)
+        .min(MAX_HIGHLIGHT_SPANS);
+    let count = merged.len();
+    let mut result = Vec::new();
+    let mut revision = 0;
+    let mut seen = HashSet::new();
+    for (index, interval) in merged.into_iter().enumerate() {
+        let budget = limit / count + usize::from(index < limit % count);
+        let (rev, spans) =
+            run_highlight_cached(server, buf, lang, Some(interval), rainbow, Some(budget))?;
+        revision = rev;
+        for span in spans {
+            // A multiline token can intersect two separated viewports.
+            if seen.insert((span.lnum, span.col, span.end_lnum, span.end_col, span.group)) {
+                result.push(span);
+            }
+        }
+    }
+    Ok((revision, result))
 }
 
 // 复用缓存的 Tree + bytes 做高亮
@@ -5494,5 +5562,85 @@ mod tests {
         let names: Vec<(&str, &str)> = symbols.iter().map(|s| (s.kind, s.name.as_str())).collect();
         assert!(names.contains(&("class", ".card, #hero")), "{names:?}");
         assert!(names.contains(&("function", "spin")), "{names:?}");
+    }
+    #[test]
+    fn disjoint_highlights_preserve_distant_viewports_and_budget() {
+        let mut server = Server::new();
+        server
+            .set_text(
+                1,
+                "rust",
+                "fn main() { let answer = 42; }\n".repeat(20000),
+                1,
+            )
+            .unwrap();
+        let (_, spans) = run_highlight_ranges_cached(
+            &mut server,
+            1,
+            "rust",
+            None,
+            Some(vec![(1, 250), (18800, 19200)]),
+            true,
+            Some(20000),
+        )
+        .unwrap();
+        assert!(spans.iter().any(|s| s.lnum == 100));
+        assert!(spans.iter().any(|s| s.lnum == 19000));
+        assert!(spans.len() <= 20000);
+        assert!(spans.iter().all(|s| s.lnum <= 250 || s.end_lnum >= 18800));
+        let (_, capped) = run_highlight_ranges_cached(
+            &mut server,
+            1,
+            "rust",
+            None,
+            Some(vec![(1, 250), (18800, 19200)]),
+            true,
+            Some(8),
+        )
+        .unwrap();
+        assert!(capped.len() <= 8);
+        assert!(capped.iter().any(|s| s.lnum >= 18800));
+        let (_, zero) = run_highlight_ranges_cached(
+            &mut server,
+            1,
+            "rust",
+            None,
+            Some(vec![(1, 250), (18800, 19200)]),
+            true,
+            Some(0),
+        )
+        .unwrap();
+        assert!(zero.is_empty());
+        let (_, overlap) = run_highlight_ranges_cached(
+            &mut server,
+            1,
+            "rust",
+            None,
+            Some(vec![(10, 30), (1, 20)]),
+            false,
+            Some(20000),
+        )
+        .unwrap();
+        let (_, single) =
+            run_highlight_cached(&mut server, 1, "rust", Some((1, 30)), false, Some(20000))
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(overlap).unwrap(),
+            serde_json::to_value(single).unwrap()
+        );
+        for invalid in [vec![], vec![(0, 10)], vec![(10, 1)], vec![(1, 1); 65]] {
+            assert!(
+                run_highlight_ranges_cached(
+                    &mut server,
+                    1,
+                    "rust",
+                    None,
+                    Some(invalid),
+                    true,
+                    None
+                )
+                .is_err()
+            );
+        }
     }
 }
