@@ -81,7 +81,10 @@ call assert_true(execute('messages') =~# 'daemon protocol is v6',
       \ 'a v6 hello must still warn that install.sh is needed')
 
 " More than 64 same/overlapping views must normalize before the wire limit.
-call assert_equal([[1, 100]], s:Call('BoundedHighlightRanges', [repeat([[1, 100]], 65)]))
+" repeat() retains list<list<any>> on Vim 9.1, unlike the typed production list.
+" Build independent numeric pairs as the real window collector does.
+let s:duplicates = map(range(65), {_, n -> [1, 100]})
+call assert_equal([[1, 100]], s:Call('BoundedHighlightRanges', [s:duplicates]))
 call assert_equal([[1, 30]], s:Call('BoundedHighlightRanges', [[[20, 30], [1, 10], [11, 20]]]))
 let s:many = map(range(65), {_, n -> [n * 10 + 1, n * 10 + 2]})
 call assert_equal([], s:Call('BoundedHighlightRanges', [s:many]),
